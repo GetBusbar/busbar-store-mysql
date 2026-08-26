@@ -25,3 +25,76 @@ jobs:
       # with an unreadable git error on EVERY pull request to this repo.
       # Same-branch intent is unchanged: qa builds core qa, dev builds core dev, never a
       # stale main or tag.
+
+  # ── coverage (llvm-cov · codecov) ─────────────────────────────────────────────────────────────
+  # ADDITIVE, NON-GATING coverage reporting for the README badge + per-PR line context. It is a
+  # SEPARATE job from the `ci` reusable-workflow call above and is deliberately NOT a required check:
+  #   * fail_ci_if_error: false — a Codecov outage / tokenless rate-limit is a no-op, never a red job.
+  #   * codecov.yml marks the statuses informational and comment:false, so a coverage delta can never
+  #     block a PR or turn dev/qa/main red. The correctness gate is the `ci` reusable workflow.
+  # It MIRRORS plugin-ci.yml's real MySQL 8 service container EXACTLY (same digest pin, env, ports,
+  # health options) plus the same strict `sql_mode` setup and BUSBAR_TEST_MYSQL_URL, so this plugin's
+  # live-DB roundtrip tests run UNDER coverage here rather than being skipped. This repo is a
+  # same-repo Cargo workspace whose only sibling-checkout deps are busbar-api / busbar-plugin-sdk /
+  # busbar-plugin-loader, so busbar is checked out at ../busbarAI exactly as plugin-ci.yml does, with
+  # the same base_ref-first ref selection as the `ci` job above.
+  coverage:
+    name: coverage (llvm-cov · codecov)
+    runs-on: ubuntu-latest
+    if: github.event_name != 'push' || contains(fromJSON('["refs/heads/main", "refs/heads/dev", "refs/heads/qa"]'), github.ref)
+    services:
+      mysql:
+        image: mysql:8@sha256:b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb
+        env:
+          MYSQL_ROOT_PASSWORD: busbar
+          MYSQL_USER: busbar
+          MYSQL_PASSWORD: busbar
+          MYSQL_DATABASE: busbar_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h localhost -ubusbar -pbusbar"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Checkout the plugin
+        uses: actions/checkout@v7
+        with:
+          path: plugin
+      - name: Checkout busbar (sibling path dependency)
+        uses: actions/checkout@v7
+        with:
+          repository: GetBusbar/busbar
+          # base_ref FIRST, same reasoning as the `ci` job above: on a pull_request github.ref_name is
+          # '<number>/merge', not a branch name, which would ask busbar for a non-existent branch.
+          ref: ${{ github.base_ref || github.ref_name }}
+          path: busbarAI
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Both Cargo workspaces live under path: checkouts (plugin/ and busbarAI/), nothing at the
+          # workspace root — the action would otherwise silently miss the cache. Same as plugin-ci.yml.
+          workspaces: |
+            plugin
+            busbarAI
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: mysql — set strict sql_mode (dynamic variable, no restart needed)
+        # SET GLOBAL requires SUPER, which the image's MYSQL_USER account (busbar) lacks by design —
+        # only root has it. Mirrors plugin-ci.yml's strict-mode step so the live-DB tests see the
+        # same server behaviour under coverage as they do under `ci`.
+        run: mysql -h 127.0.0.1 -uroot -pbusbar -e "SET GLOBAL sql_mode='STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION';"
+      - name: Collect coverage (workspace, live MySQL tests wired)
+        working-directory: plugin
+        env:
+          BUSBAR_TEST_MYSQL_URL: mysql://busbar:busbar@127.0.0.1:3306/busbar_test
+        run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
+      - name: Upload to Codecov (tokenless; never fails the build)
+        uses: codecov/codecov-action@v5
+        with:
+          files: plugin/lcov.info
+          slug: GetBusbar/store-mysql
+          fail_ci_if_error: false

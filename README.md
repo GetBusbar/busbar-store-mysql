@@ -1,5 +1,7 @@
 # busbar-store-mysql
 
+[![Coverage](https://codecov.io/gh/GetBusbar/store-mysql/branch/dev/graph/badge.svg)](https://codecov.io/gh/GetBusbar/store-mysql)
+
 The MySQL/MariaDB backend for busbar's durable governance store — a `kind: store` plugin.
 
 Targets the common SQL subset supported by MySQL 8.0.16+, MariaDB, and Aurora MySQL: one plugin,
