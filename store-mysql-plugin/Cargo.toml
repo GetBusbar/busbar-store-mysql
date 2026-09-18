@@ -22,9 +22,9 @@ crate-type = ["cdylib", "rlib"]
 # real logic lives here, not in busbarAI). Only busbar-api/busbar-plugin-sdk still reach into
 # busbarAI — INTERIM local path dependencies into a sibling checkout, since busbarAI isn't public
 # yet; once it ships publicly these become git (pinned rev/tag) or crates.io dependencies instead.
-busbar-api = { path = "../../busbarAI/crates/api" }
+busbar-api = { path = "../../busbar/crates/api" }
 busbar-store-mysql = { path = "../store-mysql" }
-busbar-plugin-sdk = { path = "../../busbarAI/crates/plugin-sdk" }
+busbar-plugin-sdk = { path = "../../busbar/crates/plugin-sdk" }
 serde_json = "1"
 
 [dev-dependencies]
@@ -32,7 +32,7 @@ serde_json = "1"
 # load the built cdylib over the real loader ABI seam, and admin_api_e2e.rs independently re-verifies
 # persistence via the plain MysqlStore — already a normal dependency above — bypassing the cdylib/ABI
 # entirely), never shipped in the plugin artifact itself.
-busbar-plugin-loader = { path = "../../busbarAI/crates/plugin-loader" }
+busbar-plugin-loader = { path = "../../busbar/crates/plugin-loader" }
 mysql = { version = "26", default-features = false, features = ["minimal"] }
 # For admin_api_e2e.rs: drives the real busbar admin HTTP API (install/mint) against an
 # OUT-OF-PROCESS busbar, fully synchronous (no tokio runtime — matches store-postgres-plugin's own
