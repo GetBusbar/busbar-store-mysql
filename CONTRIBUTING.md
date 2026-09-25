@@ -16,7 +16,7 @@ how to build, test, and submit changes.
 This repo is a 2-crate Rust workspace: `store-mysql/` is the library crate holding
 the SQL and schema logic, and `store-mysql-plugin/` is the `cdylib` the engine
 loads. You need a recent stable toolchain
-(`rustup` recommended), and — until [busbarAI](https://github.com/GetBusbar/busbar)
+(`rustup` recommended), and — until [busbar](https://github.com/GetBusbar/busbar)
 ships publicly — a sibling checkout of it at `../busbar`, since this crate's
 `Cargo.toml` points at busbar's crates as local path dependencies. See the
 README's [Dependencies](README.md#dependencies) section for the exact layout;
@@ -58,7 +58,7 @@ This repo is a 2-crate Cargo workspace and brings everything it needs:
   which emits the C ABI symbols the loader resolves.
 - `store-mysql/` is the real library crate: all the SQL, the schema, the
   migrations and their tests live here, in THIS repository. Most substantive
-  changes belong here, not in the `busbarAI` monorepo.
+  changes belong here, not in the `busbar` monorepo.
 
 ## Commit & PR conventions
 

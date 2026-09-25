@@ -5,7 +5,7 @@
 # Same 5-target matrix, same busbar-plugin-pack pack/sign step (built from a sibling busbar
 # checkout), same BUSBAR_SIGN_KEY-or-`--allow-unsigned` fallback, same `gh release upload` +
 # build-provenance attestation pattern busbar's own plugins use — but every plugin (including this
-# one) now releases from its own repo; busbarAI no longer has a combined `store-plugins` release
+# one) now releases from its own repo; busbar no longer has a combined `store-plugins` release
 # job to mirror.
 #
 # This plugin's own version (the `v*` tag pushed here) is NOT tied to busbar's version number —
@@ -126,7 +126,7 @@ jobs:
   # signed with the busbar release PRIVATE key (BUSBAR_SIGN_KEY secret) so it verifies as
   # first-party against the PUBLIC key embedded in busbar's own release binaries. If that secret
   # isn't provisioned on this repo, falls back to an UNSIGNED tarball (loadable only under
-  # plugins.trust.allow_unsigned) rather than blocking the release — same seam busbarAI's own
+  # plugins.trust.allow_unsigned) rather than blocking the release — same seam busbar's own
   # release.yml documents (TODO(release-keys)).
   store-plugin:
     needs: create-release
@@ -186,7 +186,7 @@ jobs:
 
       - name: Build busbar-plugin-pack (from the sibling busbar checkout)
         working-directory: busbar
-        run: cargo build --release --target ${{ matrix.target }} -p busbar-plugin-pack
+        run: cargo build --release --target ${{ matrix.target }} -p busbar-plugin-sdk --features pack --bin busbar-plugin-pack
         shell: bash
 
       - name: Package + sign the plugin tarball
@@ -201,7 +201,7 @@ jobs:
           [ -x "$pack" ] || pack="busbar/target/${target}/release/busbar-plugin-pack.exe"
           unsigned_flag=""
           if [ -z "${BUSBAR_SIGN_KEY:-}" ]; then
-            echo "::warning::BUSBAR_SIGN_KEY secret is not provisioned — packaging an UNSIGNED plugin tarball (loadable only under plugins.trust.allow_unsigned). See busbarAI's release.yml TODO(release-keys) seam."
+            echo "::warning::BUSBAR_SIGN_KEY secret is not provisioned — packaging an UNSIGNED plugin tarball (loadable only under plugins.trust.allow_unsigned). See busbar's release.yml TODO(release-keys) seam."
             unsigned_flag="--allow-unsigned"
           fi
           lib="store-mysql/target/${target}/release/${{ matrix.libprefix }}busbar_store_mysql_plugin.${{ matrix.libext }}"
