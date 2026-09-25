@@ -17,7 +17,7 @@ This repo is a 2-crate Rust workspace: `store-mysql/` is the library crate holdi
 the SQL and schema logic, and `store-mysql-plugin/` is the `cdylib` the engine
 loads. You need a recent stable toolchain
 (`rustup` recommended), and — until [busbarAI](https://github.com/GetBusbar/busbar)
-ships publicly — a sibling checkout of it at `../busbarAI`, since this crate's
+ships publicly — a sibling checkout of it at `../busbar`, since this crate's
 `Cargo.toml` points at busbar's crates as local path dependencies. See the
 README's [Dependencies](README.md#dependencies) section for the exact layout;
 CI checks out `GetBusbar/busbar` at the branch named in the reusable

@@ -1479,9 +1479,15 @@ fn tombstone_and_credential_destruction_are_never_observed_apart() {
     );
 }
 
-/// The shared `Store` contract conformance suite (`busbar-plugin-testkit`) — the four behaviours the
-/// fleet used to settle differently per backend. Kept in the testkit rather than written out here so
-/// a future ruling reaches every backend at once instead of being hand-copied and drifting again.
+/// The `Store` contract conformance suite — THIS crate's own copy, at `src/tests/store_conformance.rs`.
+/// It used to arrive as `busbar-plugin-testkit`; the owner ruled that crate deleted on 2026-09-22 and
+/// #2/#31 forbid a shared test util between plugins, so every backend owns its copy. See that file's
+/// module doc for the full provenance and for what the shared crate was buying: a new ruling no
+/// longer reaches this backend on a dependency bump, it has to be written in here by hand.
+mod store_conformance;
+
+/// The cross-backend `Store` conformance checks, answered by this backend — the four behaviours the
+/// fleet used to settle differently per backend.
 ///
 /// Fixtures are namespaced per process AND per check, and hard-reset first. Per-process because this
 /// suite runs against a SHARED live database that is not reset between tests and CI can point more
@@ -1489,8 +1495,8 @@ fn tombstone_and_credential_destruction_are_never_observed_apart() {
 /// namespace it is given, so one shared namespace would have each check deleting the others' rows
 /// mid-run.
 mod conformance {
+    use super::store_conformance as conf;
     use super::{test_url, MysqlStore};
-    use busbar_plugin_testkit::store_conformance as conf;
     use mysql::params;
     use mysql::prelude::Queryable;
 

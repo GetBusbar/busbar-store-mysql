@@ -224,9 +224,9 @@ fn plugin_path() -> PathBuf {
 
 fn busbarai_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../busbarAI")
+        .join("../../busbar")
         .canonicalize()
-        .expect("sibling busbarAI checkout must exist (see Cargo.toml path deps)")
+        .expect("sibling busbar checkout must exist (see Cargo.toml path deps)")
 }
 
 fn build_real_binaries() -> (PathBuf, PathBuf) {

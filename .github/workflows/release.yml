@@ -87,10 +87,10 @@ jobs:
         with:
           repository: GetBusbar/busbar
           ref: ${{ needs.resolve-busbar-ref.outputs.sha }}
-          path: busbarAI
+          path: busbar
 
       - name: Every Store method implemented here must be routed by the pinned ABI
-        run: bash store-mysql/.github/scripts/verify-abi-completeness.sh store-mysql busbarAI
+        run: bash store-mysql/.github/scripts/verify-abi-completeness.sh store-mysql busbar
         shell: bash
 
   # Create the Release first so the parallel per-target upload jobs have something to attach to
@@ -172,7 +172,7 @@ jobs:
         with:
           repository: GetBusbar/busbar
           ref: ${{ steps.ref.outputs.sha }}
-          path: busbarAI
+          path: busbar
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -185,7 +185,7 @@ jobs:
         shell: bash
 
       - name: Build busbar-plugin-pack (from the sibling busbar checkout)
-        working-directory: busbarAI
+        working-directory: busbar
         run: cargo build --release --target ${{ matrix.target }} -p busbar-plugin-pack
         shell: bash
 
@@ -197,8 +197,8 @@ jobs:
           ver="${GITHUB_REF_NAME#v}"
           target="${{ matrix.target }}"
           outdir="plugin-dist"; mkdir -p "$outdir"
-          pack="busbarAI/target/${target}/release/busbar-plugin-pack"
-          [ -x "$pack" ] || pack="busbarAI/target/${target}/release/busbar-plugin-pack.exe"
+          pack="busbar/target/${target}/release/busbar-plugin-pack"
+          [ -x "$pack" ] || pack="busbar/target/${target}/release/busbar-plugin-pack.exe"
           unsigned_flag=""
           if [ -z "${BUSBAR_SIGN_KEY:-}" ]; then
             echo "::warning::BUSBAR_SIGN_KEY secret is not provisioned — packaging an UNSIGNED plugin tarball (loadable only under plugins.trust.allow_unsigned). See busbarAI's release.yml TODO(release-keys) seam."

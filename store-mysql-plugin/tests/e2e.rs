@@ -193,16 +193,16 @@ fn cleanup(url: &str, id: &str) {
     }
 }
 
-/// The sibling busbarAI checkout's root (same convention this repo already uses for its path deps).
+/// The sibling busbar checkout's root (same convention this repo already uses for its path deps).
 fn busbarai_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../busbarAI")
+        .join("../../busbar")
         .canonicalize()
-        .expect("sibling busbarAI checkout must exist (see Cargo.toml path deps)")
+        .expect("sibling busbar checkout must exist (see Cargo.toml path deps)")
 }
 
 /// Build (once, cached by cargo) and return the path to the real `busbar` binary and the real
-/// `busbar-plugin-pack` binary, both from the sibling busbarAI checkout — never a fixture, never a
+/// `busbar-plugin-pack` binary, both from the sibling busbar checkout — never a fixture, never a
 /// stub, the exact binaries a real release ships.
 fn build_real_binaries() -> (PathBuf, PathBuf) {
     let root = busbarai_root();

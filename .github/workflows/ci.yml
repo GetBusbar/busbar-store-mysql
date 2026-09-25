@@ -36,7 +36,7 @@ jobs:
   # health options) plus the same strict `sql_mode` setup and BUSBAR_TEST_MYSQL_URL, so this plugin's
   # live-DB roundtrip tests run UNDER coverage here rather than being skipped. This repo is a
   # same-repo Cargo workspace whose only sibling-checkout deps are busbar-api / busbar-plugin-sdk /
-  # busbar-plugin-loader, so busbar is checked out at ../busbarAI exactly as plugin-ci.yml does, with
+  # busbar-plugin-loader, so busbar is checked out at ../busbar (the path those deps name), with
   # the same base_ref-first ref selection as the `ci` job above.
   coverage:
     name: coverage (llvm-cov · codecov)
@@ -69,17 +69,17 @@ jobs:
           # base_ref FIRST, same reasoning as the `ci` job above: on a pull_request github.ref_name is
           # '<number>/merge', not a branch name, which would ask busbar for a non-existent branch.
           ref: ${{ github.base_ref || github.ref_name }}
-          path: busbarAI
+          path: busbar
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
         with:
-          # Both Cargo workspaces live under path: checkouts (plugin/ and busbarAI/), nothing at the
+          # Both Cargo workspaces live under path: checkouts (plugin/ and busbar/), nothing at the
           # workspace root — the action would otherwise silently miss the cache. Same as plugin-ci.yml.
           workspaces: |
             plugin
-            busbarAI
+            busbar
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: mysql — set strict sql_mode (dynamic variable, no restart needed)
