@@ -2,10 +2,14 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 use super::*;
-use busbar_api::{
-    McpCallRecord, McpDemotionRow, ModelTokensDelta, TaskEventRow, TaskRow, TierTokensDelta,
-};
+use busbar_api::ModelTokensDelta;
 use std::collections::BTreeMap;
+
+/// A name-keyed `usage_units` map from literal pairs — the 1.6.0 shape of what used to be the four
+/// `TierTokens`/`TierTokensDelta` fields.
+fn units<V: Copy>(pairs: &[(&str, V)]) -> BTreeMap<String, V> {
+    pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+}
 
 fn test_url() -> Option<String> {
     match std::env::var("BUSBAR_TEST_MYSQL_URL") {
@@ -61,7 +65,9 @@ fn ensure_reset(store: &MysqlStore) {
             "api_keys",
             "denylist",
             "usage_windows",
+            "usage_window_units",
             "usage_metering",
+            "usage_metering_units",
             "audit_log",
         ] {
             conn.query_drop("SET FOREIGN_KEY_CHECKS=0").unwrap();
@@ -113,6 +119,9 @@ fn sample_key(id: &str, generation: &str) -> VirtualKey {
         expires_at: None,
         deleted_at: None,
         revision: 0,
+        idp_subject: None,
+        binding_mode: None,
+        minted_by: None,
     }
 }
 
@@ -397,19 +406,14 @@ fn put_and_get_usage_roundtrips() {
         billable_requests: 4,
         models: vec![ModelTokens {
             model: "gpt-x".to_string(),
-            tokens: TierTokens {
-                input: 100,
-                output: 50,
-                cache_read: 0,
-                cache_write: 0,
-            },
+            usage_units: units(&[(UNIT_INPUT, 100), (UNIT_OUTPUT, 50)]),
         }],
     };
     s.put_usage("vk_u", 1000, &ledger).unwrap();
     let back = s.get_usage("vk_u", 1000).unwrap();
     assert_eq!(back.requests, 5);
     assert_eq!(back.billable_requests, 4);
-    assert_eq!(back.models[0].tokens.input, 100);
+    assert_eq!(back.models[0].tier(UNIT_INPUT), 100);
 }
 
 /// The request counters are per-WINDOW, not per-model, and must round-trip as themselves whatever
@@ -425,12 +429,7 @@ fn usage_request_counters_do_not_multiply_with_the_model_count() {
     let Some(s) = fresh_store() else { return };
     let model = |name: &str| ModelTokens {
         model: name.to_string(),
-        tokens: TierTokens {
-            input: 10,
-            output: 5,
-            cache_read: 0,
-            cache_write: 0,
-        },
+        usage_units: units(&[(UNIT_INPUT, 10), (UNIT_OUTPUT, 5)]),
     };
     let ledger = UsageLedger {
         requests: 7,
@@ -458,21 +457,11 @@ fn usage_request_counters_do_not_multiply_with_the_model_count() {
             models: vec![
                 busbar_api::ModelTokensDelta {
                     model: "gpt-x".to_string(),
-                    tokens: busbar_api::TierTokensDelta {
-                        input: 1,
-                        output: 1,
-                        cache_read: 0,
-                        cache_write: 0,
-                    },
+                    usage_units: units(&[(UNIT_INPUT, 1), (UNIT_OUTPUT, 1)]),
                 },
                 busbar_api::ModelTokensDelta {
                     model: "gpt-y".to_string(),
-                    tokens: busbar_api::TierTokensDelta {
-                        input: 1,
-                        output: 1,
-                        cache_read: 0,
-                        cache_write: 0,
-                    },
+                    usage_units: units(&[(UNIT_INPUT, 1), (UNIT_OUTPUT, 1)]),
                 },
             ],
         },
@@ -531,6 +520,8 @@ fn purge_metering_before_matches_the_padding_the_write_path_uses() {
         billable_requests: 1,
         key_group_at_use: String::new(),
         pricing_version: String::new(),
+        priced_from_ms: 0,
+        usage_units: BTreeMap::new(),
     })
     .unwrap();
     assert!(
@@ -624,19 +615,14 @@ fn add_usage_accumulates_and_floors_at_zero() {
         billable_requests: 3,
         models: vec![ModelTokensDelta {
             model: "m".to_string(),
-            tokens: TierTokensDelta {
-                input: 10,
-                output: 5,
-                cache_read: 0,
-                cache_write: 0,
-            },
+            usage_units: units(&[(UNIT_INPUT, 10), (UNIT_OUTPUT, 5)]),
         }],
     };
     s.add_usage("vk_add", 2000, &delta).unwrap();
     s.add_usage("vk_add", 2000, &delta).unwrap();
     let ledger = s.get_usage("vk_add", 2000).unwrap();
     assert_eq!(ledger.requests, 6);
-    assert_eq!(ledger.models[0].tokens.input, 20);
+    assert_eq!(ledger.models[0].tier(UNIT_INPUT), 20);
 
     // A large negative refund must floor at 0, never wrap/go negative.
     let refund = UsageDelta {
@@ -644,12 +630,7 @@ fn add_usage_accumulates_and_floors_at_zero() {
         billable_requests: -100,
         models: vec![ModelTokensDelta {
             model: "m".to_string(),
-            tokens: TierTokensDelta {
-                input: -1000,
-                output: 0,
-                cache_read: 0,
-                cache_write: 0,
-            },
+            usage_units: units(&[(UNIT_INPUT, -1000), (UNIT_OUTPUT, 0)]),
         }],
     };
     s.add_usage("vk_add", 2000, &refund).unwrap();
@@ -658,7 +639,7 @@ fn add_usage_accumulates_and_floors_at_zero() {
         ledger.requests, 0,
         "requests must floor at 0, never underflow"
     );
-    assert_eq!(ledger.models[0].tokens.input, 0);
+    assert_eq!(ledger.models[0].tier(UNIT_INPUT), 0);
 }
 
 #[test]
@@ -678,6 +659,8 @@ fn add_metering_upserts_and_accumulates() {
         billable_requests: 1,
         key_group_at_use: "team-a".to_string(),
         pricing_version: "v1".to_string(),
+        priced_from_ms: 0,
+        usage_units: BTreeMap::new(),
     };
     s.add_metering(&d).unwrap();
     s.add_metering(&d).unwrap();
@@ -1486,8 +1469,9 @@ fn tombstone_and_credential_destruction_are_never_observed_apart() {
 /// longer reaches this backend on a dependency bump, it has to be written in here by hand.
 mod store_conformance;
 
-/// The cross-backend `Store` conformance checks, answered by this backend — the four behaviours the
-/// fleet used to settle differently per backend.
+/// The cross-backend `Store` conformance checks, answered by this backend — EVERY check the suite
+/// offers, including the plane-record battery and the two interleaved-run regressions busbar's own
+/// reference backend runs.
 ///
 /// Fixtures are namespaced per process AND per check, and hard-reset first. Per-process because this
 /// suite runs against a SHARED live database that is not reset between tests and CI can point more
@@ -1496,7 +1480,7 @@ mod store_conformance;
 /// mid-run.
 mod conformance {
     use super::store_conformance as conf;
-    use super::{test_url, MysqlStore};
+    use super::{lock_plane_purge, test_url, MysqlStore};
     use mysql::params;
     use mysql::prelude::Queryable;
 
@@ -1526,13 +1510,25 @@ mod conformance {
             "DELETE FROM audit_log WHERE seq = :seq",
             params! { "seq" => seq },
         );
+        // Every plane record and token the battery derives from `ns` (`{ns}_ptask_*`, `{ns}_pchain`,
+        // `{ns}_prinA`, `{ns}_srvA`, `{ns}_asknonce`, ...). A prefix test rather than LIKE, because
+        // `ns` itself contains `_`, which LIKE would read as a wildcard.
+        let prefix = format!("{ns}_");
+        let _ = conn.exec_drop(
+            "DELETE FROM plane_records WHERE LEFT(ident, CHAR_LENGTH(:p)) = :p",
+            params! { "p" => &prefix },
+        );
+        let _ = conn.exec_drop(
+            "DELETE FROM plane_tokens WHERE LEFT(token, CHAR_LENGTH(:p)) = :p",
+            params! { "p" => &prefix },
+        );
     }
 
-    /// ONE store shared by all four checks.
+    /// ONE store shared by every check.
     ///
     /// `MysqlStore::connect` re-runs the schema DDL and the invariant probes on EVERY call, and this
     /// module's checks run in parallel with sibling tests that hold `SELECT ... FOR UPDATE`
-    /// transactions open. Connecting four more times mid-suite made those siblings fail with
+    /// transactions open. Connecting once per check mid-suite made those siblings fail with
     /// `ERROR 1412 (Table definition has changed, please retry transaction)` about one run in six.
     /// Connecting once, behind a `OnceLock`, removes the extra DDL entirely; the checks stay
     /// isolated from each other through their per-check namespaces, not through separate
@@ -1583,12 +1579,127 @@ mod conformance {
     }
 
     #[test]
+    fn put_credential_requires_a_live_key() {
+        let Some((store, ns)) = setup("pcl", 0) else {
+            return;
+        };
+        conf::assert_put_credential_requires_a_live_key(store, &ns);
+    }
+
+    #[test]
+    fn put_key_with_credential_is_atomic() {
+        let Some((store, ns)) = setup("pkc", 0) else {
+            return;
+        };
+        conf::assert_put_key_with_credential_is_atomic(store, &ns);
+    }
+
+    #[test]
     fn append_audit_duplicate_seq_is_ok_when_identical_and_an_error_when_different() {
         let seq = 910_000_000u64 + (std::process::id() as u64 % 1_000_000);
         let Some((store, _ns)) = setup("aud", seq) else {
             return;
         };
         conf::assert_append_audit_duplicate_seq(store, seq);
+    }
+
+    #[test]
+    fn plane_task_upsert_get_list() {
+        let Some((store, ns)) = setup("ptk", 0) else {
+            return;
+        };
+        conf::assert_plane_task_upsert_get_list(store, &ns);
+    }
+
+    #[test]
+    fn plane_event_chain_is_ordered_by_seq() {
+        let Some((store, ns)) = setup("pev", 0) else {
+            return;
+        };
+        conf::assert_plane_event_chain_is_ordered_by_seq(store, &ns);
+    }
+
+    #[test]
+    fn plane_call_parents_enumerated() {
+        let Some((store, ns)) = setup("pcp", 0) else {
+            return;
+        };
+        conf::assert_plane_call_parents_enumerated(store, &ns);
+    }
+
+    #[test]
+    fn plane_demotion_upsert_list_delete() {
+        let Some((store, ns)) = setup("pdm", 0) else {
+            return;
+        };
+        conf::assert_plane_demotion_upsert_list_delete(store, &ns);
+    }
+
+    // The two purge checks sweep a KIND-WIDE cutoff. The suite's own `ns_purge_window` keeps two
+    // conformance runs out of each other's way, but this binary's own exact-count purge tests
+    // (`purge_calls_*`, `purge_tasks_*`) sweep wider cutoffs over the same kinds, so every purge in
+    // the binary takes the one `PLANE_PURGE_LOCK`.
+
+    #[test]
+    fn plane_purge_honours_the_cutoff() {
+        let _guard = lock_plane_purge();
+        let Some((store, ns)) = setup("ppc", 0) else {
+            return;
+        };
+        conf::assert_plane_purge_honours_the_cutoff(store, &ns);
+    }
+
+    #[test]
+    fn plane_purge_task_keeps_active_rows() {
+        let _guard = lock_plane_purge();
+        let Some((store, ns)) = setup("ppt", 0) else {
+            return;
+        };
+        conf::assert_plane_purge_task_keeps_active_rows(store, &ns);
+    }
+
+    #[test]
+    fn plane_token_is_single_use() {
+        let Some((store, ns)) = setup("ptu", 0) else {
+            return;
+        };
+        conf::assert_plane_token_is_single_use(store, &ns);
+    }
+
+    // The suite's kind-wide purge-collision regression, the same one busbar's reference backend runs:
+    // two conformance runs against ONE live database, each sweeping the other's kind while it works.
+    // Here that is literal — two namespaces, two threads, one shared MySQL.
+
+    #[test]
+    fn plane_purge_honours_the_cutoff_survives_two_interleaved_runs() {
+        let _guard = lock_plane_purge();
+        let Some((store, ns_a)) = setup("ppcA", 0) else {
+            return;
+        };
+        let ns_b = ns("ppcB");
+        reset(store, &ns_b, 0);
+        std::thread::scope(|scope| {
+            let a = scope.spawn(|| conf::assert_plane_purge_honours_the_cutoff(store, &ns_a));
+            let b = scope.spawn(|| conf::assert_plane_purge_honours_the_cutoff(store, &ns_b));
+            a.join().expect("run A must not panic");
+            b.join().expect("run B must not panic");
+        });
+    }
+
+    #[test]
+    fn plane_purge_task_keeps_active_rows_survives_two_interleaved_runs() {
+        let _guard = lock_plane_purge();
+        let Some((store, ns_a)) = setup("pptA", 0) else {
+            return;
+        };
+        let ns_b = ns("pptB");
+        reset(store, &ns_b, 0);
+        std::thread::scope(|scope| {
+            let a = scope.spawn(|| conf::assert_plane_purge_task_keeps_active_rows(store, &ns_a));
+            let b = scope.spawn(|| conf::assert_plane_purge_task_keeps_active_rows(store, &ns_b));
+            a.join().expect("run A must not panic");
+            b.join().expect("run B must not panic");
+        });
     }
 }
 
@@ -1676,42 +1787,81 @@ fn concurrent_appends_of_distinct_seqs_never_deadlock() {
     );
 }
 
-// ── THE DURABLE MCP TOOL-CALL LOG ────────────────────────────────────────────────────────────
+// ── THE NEUTRAL PLANE-RECORD STORE (busbar 1.6.0) ─────────────────────────────────────────────
 //
-// The property under test is not "the write returned Ok" — the trait's default `append_mcp_call`
-// returns `Ok(())` and keeps nothing, so a write's return value is worthless as evidence of
-// durability. The only honest way to know a deployment has durable call evidence is to READ IT
-// BACK, and the only honest way to know it survives a deploy is to read it back on a NEW
-// CONNECTION after the writing store is gone.
+// busbar 1.6.0 replaced the per-protocol durable methods (`append_mcp_call`, `put_task`,
+// `put_mcp_demotion`, `redeem_ask_state`, ...) with eight kind-tagged verbs over an opaque
+// `PlaneRecord` envelope. Every property the per-protocol tests below used to pin is still owed —
+// durability through a reconnect, ordering, enumeration, retention with a real count, fork refusal,
+// byte-exact identity, the full u64 range — so each is re-pinned here through the verb that now
+// carries it, with the kind string that used to be a method name.
+//
+// The property under test is never "the write returned Ok": the trait DEFAULTS every one of these
+// verbs to accept-and-keep-nothing, so a write's return value is worthless as evidence of
+// durability. The only honest proof is to READ IT BACK, and the only honest proof that it survives
+// a deploy is to read it back on a NEW CONNECTION after the writing store is gone.
 
-fn sample_call(principal: &str, seq: u64, ts: u64, prev_hash: &str, hash: &str) -> McpCallRecord {
-    McpCallRecord {
-        principal: principal.to_string(),
-        seq,
-        ts,
-        server: "srv".to_string(),
-        tool: "srv_read_file".to_string(),
-        outcome: "dispatched".to_string(),
-        reason: String::new(),
-        tool_digest: format!("sha256:tool{seq}"),
-        pin_generation: 3,
-        request_id: format!("req-{seq}"),
-        prev_hash: prev_hash.to_string(),
-        hash: hash.to_string(),
+/// Every plane-record purge in this binary takes this ONE lock. `purge_plane_records_before` is
+/// KIND-WIDE by contract (no namespace), so a purge test's cutoff sweeps every other test's rows of
+/// that kind below it — including the conformance battery's. Only the purge tests and the two
+/// conformance purge checks hold it; everything else writes above every cutoff used here and stays
+/// parallel.
+static PLANE_PURGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_plane_purge() -> std::sync::MutexGuard<'static, ()> {
+    PLANE_PURGE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Delete every row of `kind` under each identity (a `call` principal, a `task` id, a
+/// `task_event`'s task, a `demotion` server) — this test's own rows and no one else's.
+fn reset_plane(store: &MysqlStore, kind: &str, idents: &[&str]) {
+    let mut conn = store.conn().expect("conn");
+    for i in idents {
+        conn.exec_drop(
+            "DELETE FROM plane_records WHERE kind = :k AND ident = :i",
+            params! { "k" => kind, "i" => *i },
+        )
+        .expect("clear this test's own plane rows");
     }
 }
 
-/// The live MySQL server is SHARED across tests, so each test owns its own principal ids and clears
-/// them first — the isolation-by-unique-id discipline the rest of this file uses.
-fn reset_calls(store: &MysqlStore, principals: &[&str]) {
-    let mut conn = store.conn().expect("conn");
-    for p in principals {
-        conn.exec_drop(
-            "DELETE FROM mcp_calls WHERE principal = :p",
-            params! { "p" => *p },
-        )
-        .expect("clear this test's own rows");
+fn json_body(v: serde_json::Value) -> Vec<u8> {
+    serde_json::to_vec(&v).expect("serialize a test body")
+}
+
+fn decode(body: &[u8]) -> serde_json::Value {
+    serde_json::from_slice(body).expect("a body this suite wrote decodes")
+}
+
+// ── the `call` kind: the durable MCP tool-call log ─────────────────────────────────────────────
+
+/// A `call` record in the envelope the engine writes: parent = the principal, keyed by `seq`, the
+/// body a neutral journal body. Its `content` stands in for the plane's pre-framed digest suffix —
+/// opaque to this store either way.
+fn call_rec(principal: &str, seq: u64, ts: u64, prev_hash: &str, hash: &str) -> PlaneRecord {
+    PlaneRecord {
+        kind: "call".into(),
+        id: principal.into(),
+        parent: Some(principal.into()),
+        seq,
+        ts,
+        disposition: PlaneDisposition::Active,
+        body: json_body(serde_json::json!({
+            "seq": seq,
+            "prev_hash": prev_hash,
+            "hash": hash,
+            "content": format!("srv|srv_read_file|dispatched|sha256:tool{seq}|3"),
+        })),
     }
+}
+
+fn calls_of(store: &MysqlStore, principal: &str) -> Vec<serde_json::Value> {
+    store
+        .list_plane_records("call", &PlaneSelector::Parent(principal.into()))
+        .unwrap()
+        .iter()
+        .map(|b| decode(b))
+        .collect()
 }
 
 /// THE TEST THAT MATTERS. A round-trip on one live handle cannot distinguish a backend that wrote
@@ -1719,78 +1869,78 @@ fn reset_calls(store: &MysqlStore, principals: &[&str]) {
 /// closing its pool entirely — then connects a genuinely new one and verifies the per-principal
 /// hash chain still links from the rows the server hands back.
 #[test]
-fn an_mcp_call_chain_survives_dropping_the_store_and_reconnecting() {
+fn a_call_chain_survives_dropping_the_store_and_reconnecting() {
     let Some(url) = test_url() else { return };
     let p = "vk_mcp_restart";
+    let written = [
+        call_rec(p, 1, 2_000_000_100, "", "h1"),
+        call_rec(p, 2, 2_000_000_200, "h1", "h2"),
+        call_rec(p, 3, 2_000_000_300, "h2", "h3"),
+    ];
     {
         let store = MysqlStore::connect(&url).expect("connect");
-        reset_calls(&store, &[p]);
-        store
-            .append_mcp_call(&sample_call(p, 1, 2_000_000_100, "", "h1"))
-            .unwrap();
-        store
-            .append_mcp_call(&sample_call(p, 2, 2_000_000_200, "h1", "h2"))
-            .unwrap();
-        store
-            .append_mcp_call(&sample_call(p, 3, 2_000_000_300, "h2", "h3"))
-            .unwrap();
+        reset_plane(&store, "call", &[p]);
+        for r in &written {
+            store.append_plane_record(r).unwrap();
+        }
         drop(store);
     }
 
     // A genuinely new store and pool — nothing carried over in this process.
     let reopened = MysqlStore::connect(&url).expect("reconnect");
-    let got = reopened.list_mcp_calls(p).unwrap();
-
+    let raw = reopened
+        .list_plane_records("call", &PlaneSelector::Parent(p.into()))
+        .unwrap();
     assert_eq!(
-        got.len(),
+        raw.len(),
         3,
         "the call log must survive a reconnect; got {} records back, which is the \
          accept-and-keep-nothing behaviour this backend exists to replace",
-        got.len()
+        raw.len()
     );
-    assert_eq!(
-        got[0].prev_hash, "",
-        "seq 1 opens the chain with an empty prev_hash"
-    );
+    // The body is OPAQUE: it must come back BYTE-FOR-BYTE, not merely decode to the same value.
+    for (got, want) in raw.iter().zip(written.iter()) {
+        assert_eq!(got, &want.body, "a plane body must round-trip verbatim");
+    }
+    let got = calls_of(&reopened, p);
+    assert_eq!(got[0]["prev_hash"], "", "seq 1 opens the chain");
     for w in got.windows(2) {
         assert_eq!(
-            w[1].prev_hash, w[0].hash,
-            "the per-principal chain must still link after a reconnect: seq {} carries prev_hash \
-             {:?} but seq {} persisted hash {:?}",
-            w[1].seq, w[1].prev_hash, w[0].seq, w[0].hash
+            w[1]["prev_hash"], w[0]["hash"],
+            "the per-principal chain must still link after a reconnect"
         );
     }
-    assert_eq!(got.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![1, 2, 3]);
-    // The non-indexed payload must round-trip verbatim too.
-    assert_eq!(got[2].tool_digest, "sha256:tool3");
-    assert_eq!(got[2].request_id, "req-3");
-    assert_eq!(got[1].tool, "srv_read_file");
-    assert_eq!(got[1].pin_generation, 3);
-    reset_calls(&reopened, &[p]);
+    assert_eq!(
+        got.iter()
+            .map(|r| r["seq"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    reset_plane(&reopened, "call", &[p]);
 }
 
 /// The boot enumeration: a restart has to resume a chain for a principal this process has not yet
 /// seen, so the store must be able to name every principal holding records.
 #[test]
-fn mcp_call_principals_are_enumerable_after_a_reconnect() {
+fn call_principals_are_enumerable_after_a_reconnect() {
     let Some(url) = test_url() else { return };
     let (a, b) = ("vk_mcp_enum_a", "vk_mcp_enum_b");
     {
         let store = MysqlStore::connect(&url).expect("connect");
-        reset_calls(&store, &[a, b]);
+        reset_plane(&store, "call", &[a, b]);
         store
-            .append_mcp_call(&sample_call(a, 1, 2_000_000_100, "", "a1"))
+            .append_plane_record(&call_rec(a, 1, 2_000_000_100, "", "a1"))
             .unwrap();
         store
-            .append_mcp_call(&sample_call(b, 1, 2_000_000_100, "", "b1"))
+            .append_plane_record(&call_rec(b, 1, 2_000_000_100, "", "b1"))
             .unwrap();
         store
-            .append_mcp_call(&sample_call(a, 2, 2_000_000_101, "a1", "a2"))
+            .append_plane_record(&call_rec(a, 2, 2_000_000_101, "a1", "a2"))
             .unwrap();
         drop(store);
     }
     let reopened = MysqlStore::connect(&url).expect("reconnect");
-    let principals = reopened.list_mcp_call_principals().unwrap();
+    let principals = reopened.list_plane_record_parents("call").unwrap();
     for want in [a, b] {
         assert_eq!(
             principals.iter().filter(|p| p.as_str() == want).count(),
@@ -1799,153 +1949,178 @@ fn mcp_call_principals_are_enumerable_after_a_reconnect() {
         );
     }
     // The chain scope is the principal: a scoped read returns only its own.
-    assert_eq!(reopened.list_mcp_calls(a).unwrap().len(), 2);
-    assert_eq!(reopened.list_mcp_calls(b).unwrap().len(), 1);
+    assert_eq!(calls_of(&reopened, a).len(), 2);
+    assert_eq!(calls_of(&reopened, b).len(), 1);
     assert!(
-        reopened
-            .list_mcp_calls("vk_mcp_nonexistent")
-            .unwrap()
-            .is_empty(),
+        calls_of(&reopened, "vk_mcp_nonexistent").is_empty(),
         "a principal with no records reads back empty, not an error"
     );
-    reset_calls(&reopened, &[a, b]);
+    // A kind is its own namespace: the call principals are not `task_event` parents.
+    assert!(!reopened
+        .list_plane_record_parents("task_event")
+        .unwrap()
+        .iter()
+        .any(|p| p == a || p == b));
+    reset_plane(&reopened, "call", &[a, b]);
 }
 
 /// Retention must ACTUALLY DELETE and report a real count — a purge that returns a number it did
-/// not perform is worse than one that reports nothing purged.
+/// not perform is worse than one that reports nothing purged. The `call` kind drops ALL rows older
+/// than the cutoff (no terminal-only rule), strictly less-than.
 #[test]
-fn purge_mcp_calls_before_deletes_and_returns_a_real_count() {
+fn purge_calls_before_deletes_and_returns_a_real_count() {
     let Some(url) = test_url() else { return };
+    let _guard = lock_plane_purge();
     let store = MysqlStore::connect(&url).expect("connect");
     let p = "vk_mcp_purge";
-    reset_calls(&store, &[p]);
-    // Retention is GLOBAL by `ts` — it is not scoped to a principal, and cannot be. Against the
-    // SHARED live server that means this test's cutoffs would delete every other test's rows if the
-    // timestamps overlapped, so the suite bands them: this test owns the low band and every other
-    // test sits ABOVE the highest cutoff used here.
+    reset_plane(&store, "call", &[p]);
+    // Retention is KIND-WIDE by `ts`, so this test owns the low band under `PLANE_PURGE_LOCK` and
+    // every other call test sits ABOVE the highest cutoff used here.
     store
-        .append_mcp_call(&sample_call(p, 1, 1_000_000_100, "", "h1"))
+        .append_plane_record(&call_rec(p, 1, 1_000_000_100, "", "h1"))
         .unwrap();
     store
-        .append_mcp_call(&sample_call(p, 2, 1_000_000_200, "h1", "h2"))
+        .append_plane_record(&call_rec(p, 2, 1_000_000_200, "h1", "h2"))
         .unwrap();
     store
-        .append_mcp_call(&sample_call(p, 3, 1_000_000_300, "h2", "h3"))
+        .append_plane_record(&call_rec(p, 3, 1_000_000_300, "h2", "h3"))
         .unwrap();
 
-    let purged = store.purge_mcp_calls_before(1_000_000_200).unwrap();
+    let purged = store
+        .purge_plane_records_before("call", 1_000_000_200)
+        .unwrap();
     assert!(
         purged >= 1,
         "purge must report rows it actually removed; got {purged}"
     );
     assert_eq!(
-        store
-            .list_mcp_calls(p)
-            .unwrap()
+        calls_of(&store, p)
             .iter()
-            .map(|r| r.seq)
+            .map(|r| r["seq"].as_u64().unwrap())
             .collect::<Vec<_>>(),
         vec![2, 3],
         "rows at or after the cutoff must remain — `before` is strictly less-than, so the row \
          exactly at the cutoff is kept"
     );
-    let rest = store.purge_mcp_calls_before(1_000_001_000).unwrap();
+    let rest = store
+        .purge_plane_records_before("call", 1_000_001_000)
+        .unwrap();
     assert!(
         rest >= 2,
         "the remaining two rows must actually be removed; got {rest}"
     );
-    assert!(store.list_mcp_calls(p).unwrap().is_empty());
+    assert!(calls_of(&store, p).is_empty());
+}
+
+/// A purge of one kind never touches another kind's rows, however old — retention is part of each
+/// kind's contract, not a table-wide sweep.
+#[test]
+fn a_purge_is_confined_to_its_own_kind() {
+    let Some(url) = test_url() else { return };
+    let _guard = lock_plane_purge();
+    let store = MysqlStore::connect(&url).expect("connect");
+    let (p, s) = ("vk_kind_confined", "srv_kind_confined");
+    reset_plane(&store, "call", &[p]);
+    reset_plane(&store, "demotion", &[s]);
+    let mut demotion = demotion_rec(s, "tool-drift", 5);
+    demotion.ts = 5;
+    store.upsert_plane_record(&demotion).unwrap();
+    store
+        .append_plane_record(&call_rec(p, 1, 5, "", "h1"))
+        .unwrap();
+    store
+        .purge_plane_records_before("call", 1_000_000_000)
+        .unwrap();
+    assert!(calls_of(&store, p).is_empty(), "the old call row is swept");
+    assert!(
+        demotion_servers(&store).contains(&s.to_string()),
+        "a `call` purge must not reach a `demotion` row, however old"
+    );
+    reset_plane(&store, "demotion", &[s]);
 }
 
 /// A record arriving on a `(principal, seq)` that already has one is settled the way the contract
-/// settles it: BYTE-IDENTICAL is the retry and succeeds; DIFFERENT is a forked or tampered log and
-/// is an error. Overwriting would destroy the second case instead of reporting it.
+/// settles it: IDENTICAL is the retry and succeeds; DIFFERENT is a forked or tampered log and is an
+/// error. Overwriting would destroy the second case instead of reporting it.
 #[test]
-fn a_replayed_mcp_call_is_idempotent_but_a_forked_one_is_refused() {
+fn a_replayed_call_is_idempotent_but_a_forked_one_is_refused() {
     let Some(url) = test_url() else { return };
     let store = MysqlStore::connect(&url).expect("connect");
     let p = "vk_mcp_replay";
-    reset_calls(&store, &[p]);
+    reset_plane(&store, "call", &[p]);
 
-    let rec = sample_call(p, 1, 2_000_000_100, "", "h1");
-    store.append_mcp_call(&rec).unwrap();
+    let rec = call_rec(p, 1, 2_000_000_100, "", "h1");
+    store.append_plane_record(&rec).unwrap();
     store
-        .append_mcp_call(&rec)
+        .append_plane_record(&rec)
         .expect("an identical replay is the at-least-once retry and must succeed");
     assert_eq!(
-        store.list_mcp_calls(p).unwrap().len(),
+        calls_of(&store, p).len(),
         1,
         "a replay must not duplicate the row"
     );
 
-    let forked = sample_call(p, 1, 2_000_000_100, "", "DIFFERENT");
+    let forked = call_rec(p, 1, 2_000_000_100, "", "DIFFERENT");
     let err = store
-        .append_mcp_call(&forked)
+        .append_plane_record(&forked)
         .expect_err("a different record at an occupied (principal, seq) is a fork and must error");
     assert!(
         !format!("{err}").contains("DIFFERENT"),
-        "the error must not echo stored content back"
+        "the error must not echo stored or caller content back"
     );
     assert_eq!(
-        store.list_mcp_calls(p).unwrap()[0].hash,
+        calls_of(&store, p)[0]["hash"],
         "h1",
         "the refused fork must not have overwritten the record already on record"
     );
 
-    // A differing non-indexed payload under an identical digest is a fork too, not a silent accept.
-    let mut tampered = sample_call(p, 1, 2_000_000_100, "", "h1");
-    tampered.tool = "srv_other_tool".to_string();
+    // Identical body, different envelope: a different `ts` at the same position is a fork too.
+    let mut moved = rec.clone();
+    moved.ts += 1;
     store
-        .append_mcp_call(&tampered)
-        .expect_err("a payload that differs under an identical digest is a fork and must error");
-    reset_calls(&store, &[p]);
+        .append_plane_record(&moved)
+        .expect_err("a record that differs only in its envelope is still a fork and must error");
+    reset_plane(&store, "call", &[p]);
 }
 
-/// THE CROSS-PRINCIPAL READ. `mcp_calls.principal` is half of the PRIMARY KEY and the ONLY predicate
-/// `list_mcp_calls` filters on, and this schema's default collation is `utf8mb4_0900_ai_ci` — case-
-/// AND accent-insensitive. Under that collation two busbar key ids differing only in case are the
-/// SAME key: one principal's `list_mcp_calls` hands back another principal's tool-call evidence, and
-/// the second principal's first `append_mcp_call` collides on the primary key and is reported back
-/// as a "fork" of a chain it has never written to.
-///
-/// This is the same defect `task_ids_differing_only_in_case_are_distinct_tasks` pins for `tasks` —
-/// which is why `tasks.task_id` and `tasks.state` carry `COLLATE utf8mb4_bin` and this column must
-/// too. A key id is an opaque identifier, never a word, and nothing in the contract makes `vk_A` and
-/// `vk_a` the same caller.
+/// THE CROSS-PRINCIPAL READ. The identity column is half of the PRIMARY KEY and the only predicate
+/// a scoped read filters on, and this schema's default collation is `utf8mb4_0900_ai_ci` — case- AND
+/// accent-insensitive. Under that collation two key ids differing only in case are the SAME key: one
+/// principal's read hands back another principal's tool-call evidence, and the second principal's
+/// first append collides and is reported as a "fork" of a chain it never wrote. `utf8mb4_bin` on the
+/// key columns is what stops it.
 #[test]
 fn principals_differing_only_in_case_are_distinct_chains() {
     let Some(url) = test_url() else { return };
     let store = MysqlStore::connect(&url).expect("connect");
     let (lower, upper) = ("vk_mcp_case_variant", "VK_MCP_CASE_VARIANT");
-    reset_calls(&store, &[lower, upper]);
+    reset_plane(&store, "call", &[lower, upper]);
 
     store
-        .append_mcp_call(&sample_call(lower, 1, 2_000_000_100, "", "lower1"))
+        .append_plane_record(&call_rec(lower, 1, 2_000_000_100, "", "lower1"))
         .unwrap();
     store
-        .append_mcp_call(&sample_call(upper, 1, 2_000_000_100, "", "upper1"))
+        .append_plane_record(&call_rec(upper, 1, 2_000_000_100, "", "upper1"))
         .expect(
             "a case-different principal is a DIFFERENT caller opening its own chain, never a fork \
              of the first caller's",
         );
 
-    let a = store.list_mcp_calls(lower).unwrap();
-    let b = store.list_mcp_calls(upper).unwrap();
+    let a = calls_of(&store, lower);
+    let b = calls_of(&store, upper);
     assert_eq!(
         a.len(),
         1,
-        "a scoped read must return this principal's records and no other's"
+        "a scoped read returns this principal's records and no other's"
     );
     assert_eq!(b.len(), 1);
     assert_eq!(
-        a[0].hash, "lower1",
-        "an exact-match scoped read must not case-fold into another principal's chain"
+        a[0]["hash"], "lower1",
+        "an exact-match read must not case-fold"
     );
-    assert_eq!(b[0].hash, "upper1");
-    assert_eq!(a[0].principal, lower);
-    assert_eq!(b[0].principal, upper);
+    assert_eq!(b[0]["hash"], "upper1");
 
-    let principals = store.list_mcp_call_principals().unwrap();
+    let principals = store.list_plane_record_parents("call").unwrap();
     for want in [lower, upper] {
         assert_eq!(
             principals.iter().filter(|p| p.as_str() == want).count(),
@@ -1953,169 +2128,175 @@ fn principals_differing_only_in_case_are_distinct_chains() {
             "{want} must be enumerated in its own right, not collapsed into its case variant"
         );
     }
-
-    reset_calls(&store, &[lower, upper]);
+    reset_plane(&store, "call", &[lower, upper]);
 }
 
-// ── THE DURABLE A2A TASK STORE ────────────────────────────────────────────────────────────────
+// ── the `task` / `task_event` kinds: the durable A2A task store ────────────────────────────────
 //
 // A2A is async by design: a task spans turns, can sit interrupted waiting on a human, and can
-// outlive the process that started it. So the property under test is not "put_task returned Ok" —
-// the trait's default `put_task` returns `Ok(())` and keeps nothing, and `get_task` answers `None`
-// for everything, which is a backend that accepts every in-flight task and loses all of them on the
-// next deploy. The only honest proof is to READ THE TASK BACK THROUGH A RESTART, and against a live
-// server "a restart" means dropping the store — closing its pool entirely — and connecting a
-// genuinely new one.
+// outlive the process that started it. The only honest proof of a durable task store is to READ
+// THE TASK BACK THROUGH A RESTART.
 
-/// Timestamps are BANDED, for the same reason the MCP call-log tests band theirs. `purge_tasks_before`
-/// is GLOBAL by `(state, updated_at)` and cannot be scoped to a task or a principal, so against the
-/// SHARED live server a purge test's cutoff would delete every other test's terminal rows if the
-/// timestamps overlapped. Everything below the top of this band belongs to the purge tests; every
-/// other task test writes ABOVE it.
+/// Timestamps are BANDED. Retention is KIND-WIDE, so everything below the top of this band belongs
+/// to the purge tests (under `PLANE_PURGE_LOCK`) and every other task test writes ABOVE it.
 const TASK_PURGE_BAND_TOP: u64 = 1_000_100_000;
 const TASK_LIVE_TS: u64 = 2_000_000_000;
 
-/// The two purge tests share the low band and both assert EXACT counts, so they cannot run at the
-/// same time as each other — the same unscoped-retention problem `USAGE_WINDOWS_LOCK` exists for.
-/// One lock held by the handful of tests that care keeps the rest of the suite parallel.
-static TASK_PURGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn lock_task_purge() -> std::sync::MutexGuard<'static, ()> {
-    TASK_PURGE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-fn sample_task(task_id: &str, state: &str, updated_at: u64) -> TaskRow {
-    TaskRow {
-        task_id: task_id.to_string(),
-        context_id: format!("ctx-{task_id}"),
-        principal: "vk_a".to_string(),
-        direction: "inbound".to_string(),
-        state: state.to_string(),
-        agent_id: "planner".to_string(),
-        artifact_cursor: 7,
-        push_callback: "https://example.test/push".to_string(),
-        created_at: 100,
-        updated_at,
+/// A `task` record in the envelope the engine writes: upsert by id, `ts` = the task's `updated_at`,
+/// the terminal/active verdict on the typed `disposition` — the ENGINE decides it; the store only
+/// reads the column.
+fn task_rec(
+    task_id: &str,
+    state: &str,
+    updated_at: u64,
+    disposition: PlaneDisposition,
+) -> PlaneRecord {
+    PlaneRecord {
+        kind: "task".into(),
+        id: task_id.into(),
+        parent: None,
+        seq: 0,
+        ts: updated_at,
+        disposition,
+        body: json_body(serde_json::json!({
+            "task_id": task_id,
+            "context_id": format!("ctx-{task_id}"),
+            "principal": "vk_a",
+            "direction": "inbound",
+            "state": state,
+            "agent_id": "planner",
+            "artifact_cursor": 7,
+            "push_callback": "https://example.test/push",
+            "created_at": 100,
+            "updated_at": updated_at,
+        })),
     }
 }
 
-fn sample_event(task_id: &str, seq: u64, kind: &str, prev_hash: &str, hash: &str) -> TaskEventRow {
-    TaskEventRow {
-        task_id: task_id.to_string(),
+fn active_task(task_id: &str, state: &str, updated_at: u64) -> PlaneRecord {
+    task_rec(task_id, state, updated_at, PlaneDisposition::Active)
+}
+
+fn terminal_task(task_id: &str, state: &str, updated_at: u64) -> PlaneRecord {
+    task_rec(task_id, state, updated_at, PlaneDisposition::Terminal)
+}
+
+fn event_rec(task_id: &str, seq: u64, kind: &str, prev_hash: &str, hash: &str) -> PlaneRecord {
+    // Saturating: the full-range test deliberately passes `u64::MAX` as `seq`.
+    let ts = seq.saturating_add(TASK_LIVE_TS);
+    PlaneRecord {
+        kind: "task_event".into(),
+        id: task_id.into(),
+        parent: Some(task_id.into()),
         seq,
-        // Saturating: the full-range test deliberately passes `u64::MAX` as `seq`, and a helper that
-        // panicked on its own arithmetic would hide the behaviour under test.
-        ts: seq.saturating_add(TASK_LIVE_TS),
-        kind: kind.to_string(),
-        context_id: format!("ctx-{task_id}"),
-        principal: "vk_a".to_string(),
-        agent_id: "planner".to_string(),
-        state: "working".to_string(),
-        request_id: format!("req-{seq}"),
-        prev_hash: prev_hash.to_string(),
-        hash: hash.to_string(),
+        ts,
+        disposition: PlaneDisposition::Active,
+        body: json_body(serde_json::json!({
+            "task_id": task_id,
+            "seq": seq,
+            "ts": ts,
+            "kind": kind,
+            "context_id": format!("ctx-{task_id}"),
+            "principal": "vk_a",
+            "agent_id": "planner",
+            "state": "working",
+            "request_id": format!("req-{seq}"),
+            "prev_hash": prev_hash,
+            "hash": hash,
+        })),
     }
 }
 
-/// The live MySQL server is SHARED across tests, so each test owns its own task ids and clears them
-/// first — the isolation-by-unique-id discipline the rest of this file uses.
+fn get_task(store: &MysqlStore, id: &str) -> Option<serde_json::Value> {
+    store
+        .get_plane_record("task", id)
+        .unwrap()
+        .map(|b| decode(&b))
+}
+
+fn events_of(store: &MysqlStore, task_id: &str) -> Vec<serde_json::Value> {
+    store
+        .list_plane_records("task_event", &PlaneSelector::Parent(task_id.into()))
+        .unwrap()
+        .iter()
+        .map(|b| decode(b))
+        .collect()
+}
+
+fn all_task_ids(store: &MysqlStore) -> Vec<String> {
+    store
+        .list_plane_records("task", &PlaneSelector::All)
+        .unwrap()
+        .iter()
+        .filter_map(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
+        .filter_map(|v| v["task_id"].as_str().map(str::to_string))
+        .collect()
+}
+
 fn reset_tasks(store: &MysqlStore, task_ids: &[&str]) {
-    let mut conn = store.conn().expect("conn");
-    for id in task_ids {
-        conn.exec_drop(
-            "DELETE FROM task_events WHERE task_id = :id",
-            params! { "id" => *id },
-        )
-        .expect("clear this test's own events");
-        conn.exec_drop(
-            "DELETE FROM tasks WHERE task_id = :id",
-            params! { "id" => *id },
-        )
-        .expect("clear this test's own tasks");
-    }
+    reset_plane(store, "task_event", task_ids);
+    reset_plane(store, "task", task_ids);
 }
 
-/// THE TEST THAT MATTERS. A round-trip on one live handle cannot distinguish a backend that wrote to
-/// the server from one holding a HashMap behind the same trait, and it cannot distinguish either
-/// from the trait's accept-and-keep-nothing defaults. So this DROPS the store — closing its pool
-/// entirely — then connects a genuinely new one and reads the task back off the server.
 #[test]
 fn an_in_flight_task_survives_dropping_the_store_and_reconnecting() {
     let Some(url) = test_url() else { return };
     let (t1, t2) = ("t_restart_1", "t_restart_2");
+    let interrupted = active_task(t1, "input-required", TASK_LIVE_TS + 300);
     {
         let store = MysqlStore::connect(&url).expect("connect");
         reset_tasks(&store, &[t1, t2]);
         store
-            .put_task(&sample_task(t1, "working", TASK_LIVE_TS + 200))
+            .upsert_plane_record(&active_task(t1, "working", TASK_LIVE_TS + 200))
             .unwrap();
         // The write-through on a state transition REPLACES the row rather than appending a second
         // one — an interrupted task waiting on a human is what a restart has to find.
-        let mut interrupted = sample_task(t1, "input-required", TASK_LIVE_TS + 300);
-        interrupted.artifact_cursor = 12;
-        store.put_task(&interrupted).unwrap();
+        store.upsert_plane_record(&interrupted).unwrap();
         store
-            .put_task(&sample_task(t2, "submitted", TASK_LIVE_TS + 210))
+            .upsert_plane_record(&active_task(t2, "submitted", TASK_LIVE_TS + 210))
             .unwrap();
         drop(store);
     }
 
-    // A genuinely new store and pool — nothing carried over in this process.
     let reopened = MysqlStore::connect(&url).expect("reconnect");
-    let got = reopened.get_task(t1).unwrap().expect(
+    let got = reopened.get_plane_record("task", t1).unwrap().expect(
         "an in-flight task must survive a restart; got None back after reconnecting, which is the \
          accept-and-keep-nothing default this backend exists to replace",
     );
-
-    // Every field a resume reads has to come back verbatim — not merely a row with the right id.
-    assert_eq!(got.state, "input-required", "the LAST state must win");
     assert_eq!(
-        got.artifact_cursor, 12,
-        "the artifact cursor is where a resubscribe resumes; a stale one replays or loses the gap"
+        got, interrupted.body,
+        "the LAST write must win, and its body must come back byte-for-byte"
     );
-    assert_eq!(
-        got.context_id,
-        format!("ctx-{t1}"),
-        "the resume key is the context id"
-    );
-    assert_eq!(got.principal, "vk_a");
-    assert_eq!(got.direction, "inbound");
-    assert_eq!(got.agent_id, "planner");
-    assert_eq!(got.push_callback, "https://example.test/push");
-    assert_eq!(got.created_at, 100);
-    assert_eq!(got.updated_at, TASK_LIVE_TS + 300);
 
-    // UPSERT, not append: two writes for one task_id leave ONE row.
-    let mine = reopened
-        .list_tasks()
-        .unwrap()
+    // UPSERT, not append: two writes for one id leave ONE row.
+    let mine: Vec<String> = all_task_ids(&reopened)
         .into_iter()
-        .filter(|t| t.task_id == t1 || t.task_id == t2)
-        .map(|t| t.task_id)
-        .collect::<std::collections::BTreeSet<_>>();
+        .filter(|id| id == t1 || id == t2)
+        .collect();
     assert_eq!(
-        mine.into_iter().collect::<Vec<_>>(),
-        vec![t1.to_string(), t2.to_string()],
-        "put_task upserts by task_id; a second write for the same id must replace, never append"
+        mine.iter().filter(|id| id.as_str() == t1).count(),
+        1,
+        "an upsert replaces; a second write for the same id must never append: {mine:?}"
     );
+    assert!(mine.iter().any(|id| id == t2));
 
     assert!(
-        reopened.get_task("t_nonexistent_task").unwrap().is_none(),
+        reopened
+            .get_plane_record("task", "t_nonexistent_task")
+            .unwrap()
+            .is_none(),
         "an unknown task id reads back None, not an error"
     );
+    // A kind is its own namespace: the same id under another kind is not this task.
+    assert!(reopened.get_plane_record("demotion", t1).unwrap().is_none());
     reset_tasks(&reopened, &[t1, t2]);
 }
 
-/// `list_tasks` is deliberately UNFILTERED. The boot rehydrate wants the active rows, the retention
-/// sweep wants the terminal ones and the scoped listing wants one principal's; a store that
-/// pre-filtered for any one of those would break the other two. Pinned across a reconnect because
-/// the boot rehydrate is precisely the caller that only ever sees the post-restart answer.
-///
-/// Filtered to this test's OWN ids on the way out, not asserted as the whole table: the live server
-/// is shared and `list_tasks` is genuinely global, so an exact-set assertion here would be an
-/// assertion about what every other concurrently-running test happens to have written.
+/// `list_plane_records(All)` is deliberately UNFILTERED. The boot rehydrate wants the active rows,
+/// the retention sweep wants the terminal ones and the scoped listing wants one principal's; a store
+/// that pre-filtered for any one of those would break the other two.
 #[test]
-fn list_tasks_returns_every_row_including_terminal_ones_after_a_reconnect() {
+fn listing_tasks_returns_every_row_including_terminal_ones_after_a_reconnect() {
     let Some(url) = test_url() else { return };
     let ids = [
         "t_list_active",
@@ -2127,36 +2308,31 @@ fn list_tasks_returns_every_row_including_terminal_ones_after_a_reconnect() {
         let store = MysqlStore::connect(&url).expect("connect");
         reset_tasks(&store, &ids);
         store
-            .put_task(&sample_task(ids[0], "working", TASK_LIVE_TS + 200))
+            .upsert_plane_record(&active_task(ids[0], "working", TASK_LIVE_TS + 200))
             .unwrap();
         store
-            .put_task(&sample_task(ids[1], "input-required", TASK_LIVE_TS + 201))
+            .upsert_plane_record(&active_task(ids[1], "input-required", TASK_LIVE_TS + 201))
             .unwrap();
         store
-            .put_task(&sample_task(ids[2], "completed", TASK_LIVE_TS + 202))
+            .upsert_plane_record(&terminal_task(ids[2], "completed", TASK_LIVE_TS + 202))
             .unwrap();
         store
-            .put_task(&sample_task(ids[3], "failed", TASK_LIVE_TS + 203))
+            .upsert_plane_record(&terminal_task(ids[3], "failed", TASK_LIVE_TS + 203))
             .unwrap();
         drop(store);
     }
     let reopened = MysqlStore::connect(&url).expect("reconnect");
-    let all = reopened.list_tasks().unwrap();
-    let mut mine = all
-        .iter()
-        .filter(|t| ids.contains(&t.task_id.as_str()))
-        .map(|t| t.task_id.clone())
-        .collect::<Vec<_>>();
+    let mut mine: Vec<String> = all_task_ids(&reopened)
+        .into_iter()
+        .filter(|id| ids.contains(&id.as_str()))
+        .collect();
     mine.sort();
-    let mut want = ids.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let mut want: Vec<String> = ids.iter().map(|s| s.to_string()).collect();
     want.sort();
     assert_eq!(
-        mine,
-        want,
-        "list_tasks is unfiltered: terminal rows are returned too, and every row survives a \
-         reconnect. Got {} rows back in total, which is the accept-and-keep-nothing default this \
-         backend exists to replace",
-        all.len()
+        mine, want,
+        "the task listing is unfiltered: terminal rows are returned too, and every row survives a \
+         reconnect"
     );
     reset_tasks(&reopened, &ids);
 }
@@ -2164,10 +2340,9 @@ fn list_tasks_returns_every_row_including_terminal_ones_after_a_reconnect() {
 /// The per-task provenance chain, read back off the server after a reconnect. Per-TASK rather than
 /// one global chain, so the scope of a read is one task and the links have to hold within it.
 ///
-/// Note what this test does NOT do: it never calls `put_task`. That is deliberate. A `task.submitted`
-/// event and the first `put_task` are two independent write-throughs and the contract states no
-/// ordering between them, so appending an event for a task with no row yet has to WORK — which is
-/// why `task_events` carries no foreign key to `tasks` (see the schema).
+/// It never writes the task itself, deliberately: a `task.submitted` event and the first task upsert
+/// are two independent write-throughs with no stated order, so appending an event for a task with
+/// no row yet has to WORK — which is why the schema carries no foreign key between them.
 #[test]
 fn a_task_event_chain_survives_a_reconnect_and_still_links() {
     let Some(url) = test_url() else { return };
@@ -2175,229 +2350,243 @@ fn a_task_event_chain_survives_a_reconnect_and_still_links() {
     {
         let store = MysqlStore::connect(&url).expect("connect");
         reset_tasks(&store, &[t1, t2]);
+        // Appended OUT of order: the read must come back by `seq`, not by insertion.
         store
-            .append_task_event(&sample_event(t1, 1, "task.submitted", "", "e1"))
+            .append_plane_record(&event_rec(t1, 2, "task.working", "e1", "e2"))
             .unwrap();
         store
-            .append_task_event(&sample_event(t1, 2, "task.working", "e1", "e2"))
+            .append_plane_record(&event_rec(t1, 1, "task.submitted", "", "e1"))
             .unwrap();
         store
-            .append_task_event(&sample_event(t1, 3, "task.interrupted", "e2", "e3"))
+            .append_plane_record(&event_rec(t1, 3, "task.interrupted", "e2", "e3"))
             .unwrap();
         // A second task's chain is independent — it must not leak into the first one's read.
         store
-            .append_task_event(&sample_event(t2, 1, "task.submitted", "", "f1"))
+            .append_plane_record(&event_rec(t2, 1, "task.submitted", "", "f1"))
             .unwrap();
         drop(store);
     }
     let reopened = MysqlStore::connect(&url).expect("reconnect");
-    let got = reopened.list_task_events(t1).unwrap();
+    let got = events_of(&reopened, t1);
     assert_eq!(
         got.len(),
         3,
-        "the provenance chain must survive a reconnect; got {} events back, which is the \
-         accept-and-keep-nothing default this backend exists to replace",
+        "the provenance chain must survive a reconnect; got {} events back",
         got.len()
     );
     assert_eq!(
-        got.iter().map(|e| e.seq).collect::<Vec<_>>(),
+        got.iter()
+            .map(|e| e["seq"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
         vec![1, 2, 3],
         "oldest-first by seq, which is the order the chain verifier reads"
     );
-    assert_eq!(got[0].prev_hash, "", "seq 1 opens the chain");
+    assert_eq!(got[0]["prev_hash"], "", "seq 1 opens the chain");
     for w in got.windows(2) {
         assert_eq!(
-            w[1].prev_hash, w[0].hash,
-            "the per-task chain must still link after a reconnect: seq {} carries prev_hash {:?} \
-             but seq {} persisted hash {:?}",
-            w[1].seq, w[1].prev_hash, w[0].seq, w[0].hash
+            w[1]["prev_hash"], w[0]["hash"],
+            "the per-task chain must still link"
         );
     }
-    // Every field round-trips, including the join key that is deliberately NOT chained.
-    assert_eq!(got[2].kind, "task.interrupted");
-    assert_eq!(got[2].request_id, "req-3");
-    assert_eq!(got[1].context_id, format!("ctx-{t1}"));
-    assert_eq!(got[1].principal, "vk_a");
-    assert_eq!(got[1].agent_id, "planner");
-    assert_eq!(got[1].state, "working");
-    assert_eq!(got[1].ts, TASK_LIVE_TS + 2);
-    // The scope of a read is one task.
-    assert_eq!(reopened.list_task_events(t2).unwrap().len(), 1);
+    assert_eq!(got[2]["kind"], "task.interrupted");
+    assert_eq!(got[2]["request_id"], "req-3");
+    assert_eq!(
+        events_of(&reopened, t2).len(),
+        1,
+        "the scope of a read is one task"
+    );
     assert!(
-        reopened
-            .list_task_events("t_unknown_chain")
-            .unwrap()
-            .is_empty(),
+        events_of(&reopened, "t_unknown_chain").is_empty(),
         "a task with no events reads back empty, not an error"
     );
     reset_tasks(&reopened, &[t1, t2]);
 }
 
-/// A replayed `(task_id, seq)` UPSERTS. This is where the task-event contract genuinely DIFFERS from
-/// `append_mcp_call`'s, and a backend that copied the call log's fork check would be wrong in a way
-/// that looks right: the contract says a store "must upsert on that pair — the write-through is
-/// idempotent on replay, and rejecting or duplicating a replayed `seq` breaks the chain the engine
-/// will verify on read". So neither a duplicate row nor an error, on either an identical replay or a
-/// corrected one.
+/// A replayed `(task_id, seq)` is settled like every other append: IDENTICAL is the at-least-once
+/// retry and succeeds without duplicating the row; DIFFERENT is refused as a fork and the stored
+/// record stands.
+///
+/// BEHAVIOUR CHANGE from the pre-1.6.0 `append_task_event`, which UPSERTED a rewritten event over
+/// the stored one. busbar 1.6.0 carries task events through the one neutral `append_plane_record`,
+/// whose contract is an APPEND that "never recomputes any digest", and busbar's reference stores
+/// (store-memory, store-example-plugin) refuse a DIFFERENT record at an occupied position for every
+/// appended kind. Silently replacing a sealed chain link is the tamper shape the chain exists to
+/// expose, so this backend now refuses it too.
 #[test]
-fn a_replayed_task_event_upserts_rather_than_duplicating_or_erroring() {
+fn a_replayed_task_event_is_idempotent_but_a_rewritten_one_is_refused() {
     let Some(url) = test_url() else { return };
     let store = MysqlStore::connect(&url).expect("connect");
     let t = "t_replay_event";
     reset_tasks(&store, &[t]);
 
-    let e = sample_event(t, 1, "task.submitted", "", "e1");
-    store.append_task_event(&e).unwrap();
+    let e = event_rec(t, 1, "task.submitted", "", "e1");
+    store.append_plane_record(&e).unwrap();
     store
-        .append_task_event(&e)
+        .append_plane_record(&e)
         .expect("an identical replay must succeed, not be rejected as a fork");
     assert_eq!(
-        store.list_task_events(t).unwrap().len(),
+        events_of(&store, t).len(),
         1,
         "a replay must not duplicate the row"
     );
 
-    // A rewritten event at the same seq REPLACES, per the contract's "must upsert on that pair".
-    let mut corrected = sample_event(t, 1, "task.submitted", "", "e1-corrected");
-    corrected.state = "submitted".to_string();
-    store.append_task_event(&corrected).unwrap();
-    let got = store.list_task_events(t).unwrap();
-    assert_eq!(got.len(), 1, "an upsert replaces; it does not append");
-    assert_eq!(got[0].hash, "e1-corrected");
-    assert_eq!(got[0].state, "submitted");
+    let rewritten = event_rec(t, 1, "task.submitted", "", "e1-rewritten");
+    store
+        .append_plane_record(&rewritten)
+        .expect_err("a DIFFERENT event at an occupied (task, seq) is a fork and must be refused");
+    let got = events_of(&store, t);
+    assert_eq!(got.len(), 1);
+    assert_eq!(
+        got[0]["hash"], "e1",
+        "the refused rewrite must not replace the stored link"
+    );
     reset_tasks(&store, &[t]);
+}
+
+/// The band the purge tests own, cleared wholesale. Safe only under `PLANE_PURGE_LOCK`, and correct
+/// only because every non-purge task test writes above `TASK_PURGE_BAND_TOP`.
+fn clear_purge_band(store: &MysqlStore) {
+    let mut conn = store.conn().expect("conn");
+    conn.exec_drop(
+        "DELETE ev FROM plane_records ev JOIN plane_records t \
+           ON ev.kind = 'task_event' AND ev.ident = t.ident \
+         WHERE t.kind = 'task' AND t.ts < :top",
+        params! { "top" => TASK_PURGE_BAND_TOP },
+    )
+    .expect("clear the purge band's events");
+    conn.exec_drop(
+        "DELETE FROM plane_records WHERE kind = 'task' AND ts < :top",
+        params! { "top" => TASK_PURGE_BAND_TOP },
+    )
+    .expect("clear the purge band");
 }
 
 /// Retention drops TERMINAL rows only, strictly older than the cutoff, and returns a count it
 /// actually performed. An interrupted task waiting on a human is exactly the row that legitimately
 /// sits still for a long time; compacting it is losing the work, not reclaiming space.
+///
+/// Terminality is the envelope's typed `disposition`, decided by the engine. The store reads THAT
+/// COLUMN and never the body: the `t_purge_old_body_says_completed` row carries a body whose state
+/// reads `completed` under an ACTIVE disposition, and it must survive — a backend that decoded the
+/// body to decide would sweep it.
 #[test]
 fn purge_tasks_before_drops_only_terminal_rows_and_returns_a_real_count() {
     let Some(url) = test_url() else { return };
-    let _guard = lock_task_purge();
+    let _guard = lock_plane_purge();
     let store = MysqlStore::connect(&url).expect("connect");
-    // Own the whole low band for the duration of the lock: a previous run's leftovers would
-    // otherwise be counted by the exact-count assertions below.
     clear_purge_band(&store);
 
     let old = 1_000_000_100;
-    let terminal = ["completed", "failed", "canceled", "rejected"];
-    for state in terminal {
+    for state in ["completed", "failed", "canceled", "rejected"] {
         store
-            .put_task(&sample_task(&format!("t_purge_old_{state}"), state, old))
+            .upsert_plane_record(&terminal_task(&format!("t_purge_old_{state}"), state, old))
             .unwrap();
     }
-    // Old, and NOT terminal — never dropped, no matter how old. `unrecognised-state` stands in for a
-    // token a NEWER engine emits that this build has never heard of: the terminal set is CLOSED, so
-    // an unknown token is kept rather than swept.
-    // `Completed` (capital C) is NOT the terminal token `completed`, and the difference has to
-    // survive the SQL. Under this schema's default collation (utf8mb4_0900_ai_ci, case-insensitive)
-    // `'Completed' IN ('completed', ...)` is TRUE, so a state token a newer engine minted would be
-    // swept by a terminal set that never recognised it — which is what the utf8mb4_bin collation on
-    // `tasks.state` exists to stop.
-    for state in [
-        "input-required",
-        "auth-required",
-        "working",
-        "submitted",
-        "unrecognised-state",
-        "Completed",
-    ] {
+    for state in ["input-required", "auth-required", "working", "submitted"] {
         store
-            .put_task(&sample_task(&format!("t_purge_old_{state}"), state, old))
+            .upsert_plane_record(&active_task(&format!("t_purge_old_{state}"), state, old))
             .unwrap();
     }
+    store
+        .upsert_plane_record(&active_task(
+            "t_purge_old_body_says_completed",
+            "completed",
+            old,
+        ))
+        .unwrap();
     // Terminal but at the cutoff exactly, and terminal but newer — both kept.
     store
-        .put_task(&sample_task(
+        .upsert_plane_record(&terminal_task(
             "t_purge_at_cutoff",
             "completed",
             1_000_000_200,
         ))
         .unwrap();
     store
-        .put_task(&sample_task("t_purge_newer", "completed", 1_000_000_300))
+        .upsert_plane_record(&terminal_task("t_purge_newer", "completed", 1_000_000_300))
         .unwrap();
 
-    let purged = store.purge_tasks_before(1_000_000_200).unwrap();
+    let purged = store
+        .purge_plane_records_before("task", 1_000_000_200)
+        .unwrap();
     assert_eq!(
         purged, 4,
         "only the four TERMINAL rows strictly older than the cutoff go, and the count must be one \
          actually performed rather than a guess"
     );
-    let mut left = store
-        .list_tasks()
-        .unwrap()
+    let mut left: Vec<String> = all_task_ids(&store)
         .into_iter()
-        .filter(|t| t.updated_at < TASK_PURGE_BAND_TOP)
-        .map(|t| t.task_id)
-        .collect::<Vec<_>>();
+        .filter(|id| id.starts_with("t_purge_"))
+        .collect();
     left.sort();
     assert_eq!(
         left,
         vec![
             "t_purge_at_cutoff",
             "t_purge_newer",
-            "t_purge_old_Completed",
             "t_purge_old_auth-required",
+            "t_purge_old_body_says_completed",
             "t_purge_old_input-required",
             "t_purge_old_submitted",
-            "t_purge_old_unrecognised-state",
             "t_purge_old_working",
         ],
-        "an active or interrupted task is never dropped by retention, an unrecognised state token \
-         is never dropped at all (`Completed` is not `completed`), and `before` is strictly \
-         less-than so a row exactly at the cutoff is kept"
+        "an active or interrupted task is never dropped by retention, the store decides by the \
+         typed disposition and never by decoding the body, and `before` is strictly less-than so a \
+         row exactly at the cutoff is kept"
     );
     assert_eq!(
-        store.purge_tasks_before(1_000_000_200).unwrap(),
+        store
+            .purge_plane_records_before("task", 1_000_000_200)
+            .unwrap(),
         0,
         "re-running the same purge removes nothing"
     );
     clear_purge_band(&store);
 }
 
-/// Retention has to bound the EVENT table too. The trait offers no `purge_task_events_before`, so if
-/// purging a task left its provenance behind, `task_events` would grow without any bound the
-/// contract provides a way to apply. Dropping a task therefore drops the chain that belongs to it —
-/// and drops nothing belonging to any other task.
+/// Retention has to bound the EVENT chain too. Nothing else ever purges a `task_event` row, so if
+/// purging a task left its provenance behind the chains would grow without any bound the contract
+/// provides a way to apply. Dropping a task therefore drops the chain that belongs to it — and
+/// drops nothing belonging to any other task.
 #[test]
 fn purging_a_task_takes_its_provenance_chain_with_it_and_no_other() {
     let Some(url) = test_url() else { return };
-    let _guard = lock_task_purge();
+    let _guard = lock_plane_purge();
     let store = MysqlStore::connect(&url).expect("connect");
     clear_purge_band(&store);
 
     let (gone, stays) = ("t_cascade_gone", "t_cascade_stays");
+    reset_tasks(&store, &[gone, stays]);
     store
-        .put_task(&sample_task(gone, "completed", 1_000_000_100))
+        .upsert_plane_record(&terminal_task(gone, "completed", 1_000_000_100))
         .unwrap();
     store
-        .put_task(&sample_task(stays, "working", 1_000_000_100))
+        .upsert_plane_record(&active_task(stays, "working", 1_000_000_100))
         .unwrap();
     store
-        .append_task_event(&sample_event(gone, 1, "task.submitted", "", "g1"))
+        .append_plane_record(&event_rec(gone, 1, "task.submitted", "", "g1"))
         .unwrap();
     store
-        .append_task_event(&sample_event(gone, 2, "task.completed", "g1", "g2"))
+        .append_plane_record(&event_rec(gone, 2, "task.completed", "g1", "g2"))
         .unwrap();
     store
-        .append_task_event(&sample_event(stays, 1, "task.submitted", "", "s1"))
+        .append_plane_record(&event_rec(stays, 1, "task.submitted", "", "s1"))
         .unwrap();
 
     assert_eq!(
-        store.purge_tasks_before(1_000_000_200).unwrap(),
+        store
+            .purge_plane_records_before("task", 1_000_000_200)
+            .unwrap(),
         1,
         "exactly the one terminal task in this band is swept, and the count must be one actually \
          performed — 0 here is the accept-and-keep-nothing default this backend exists to replace"
     );
     assert!(
-        store.list_task_events(gone).unwrap().is_empty(),
-        "the purged task's events go with it; otherwise task_events grows unbounded, because the \
-         contract offers no other way to purge them"
+        events_of(&store, gone).is_empty(),
+        "the purged task's events go with it; otherwise the chain grows unbounded"
     );
     assert_eq!(
-        store.list_task_events(stays).unwrap().len(),
+        events_of(&store, stays).len(),
         1,
         "another task's chain must be untouched by that purge"
     );
@@ -2405,48 +2594,47 @@ fn purging_a_task_takes_its_provenance_chain_with_it_and_no_other() {
     clear_purge_band(&store);
 }
 
-/// Every `u64` field of both rows round-trips at the FULL range, `u64::MAX` included. That is a
-/// property of the schema, not an accident: these columns are `BIGINT UNSIGNED`, the same choice
-/// every other u64 in this store already gets, so there is no value the contract can hand this
-/// backend that it has to refuse or silently mangle. A signed `BIGINT` would have needed a
-/// range guard here, and an artifact cursor that wrapped negative and clamped back on read would
-/// either replay delivered artifacts or skip undelivered ones with no error ever reported.
+/// Every `u64` of the envelope round-trips at the FULL range, `u64::MAX` included — `seq` and `ts`
+/// are BIGINT UNSIGNED like every other u64 in this store, so there is no value the contract can
+/// hand this backend that it has to refuse or silently mangle.
 #[test]
-fn the_task_store_round_trips_the_full_u64_range() {
+fn the_plane_store_round_trips_the_full_u64_range() {
     let Some(url) = test_url() else { return };
     let store = MysqlStore::connect(&url).expect("connect");
     let t = "t_full_range";
     reset_tasks(&store, &[t]);
 
-    let mut task = sample_task(t, "working", u64::MAX);
-    task.artifact_cursor = u64::MAX;
-    task.created_at = u64::MAX;
+    let task = active_task(t, "working", u64::MAX);
     store
-        .put_task(&task)
+        .upsert_plane_record(&task)
         .expect("BIGINT UNSIGNED holds the whole u64 range; nothing here needs refusing");
-    let got = store.get_task(t).unwrap().expect(
-        "the task must read back at all before its range can be checked; None here is the \
-         accept-and-keep-nothing default this backend exists to replace",
+    let got = get_task(&store, t).expect("the task must read back at all");
+    assert_eq!(got["updated_at"].as_u64(), Some(u64::MAX));
+    assert!(
+        all_task_ids(&store).contains(&t.to_string()),
+        "a u64::MAX ts must not break the listing"
     );
-    assert_eq!(got.artifact_cursor, u64::MAX, "the cursor must not wrap");
-    assert_eq!(got.created_at, u64::MAX);
-    assert_eq!(got.updated_at, u64::MAX);
 
-    let mut ev = sample_event(t, u64::MAX, "task.submitted", "", "e1");
+    let mut ev = event_rec(t, u64::MAX, "task.submitted", "", "e1");
     ev.ts = u64::MAX;
-    store.append_task_event(&ev).expect("seq/ts hold u64::MAX");
-    let events = store.list_task_events(t).unwrap();
+    store
+        .append_plane_record(&ev)
+        .expect("seq/ts hold u64::MAX");
+    let events = events_of(&store, t);
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].seq, u64::MAX);
-    assert_eq!(events[0].ts, u64::MAX);
-
+    assert_eq!(events[0]["seq"].as_u64(), Some(u64::MAX));
+    // And the identical replay at that position is still recognised as identical — a column that
+    // wrapped would read back as a different `ts` and report a fork.
+    store
+        .append_plane_record(&ev)
+        .expect("the replay at u64::MAX must compare identical");
     reset_tasks(&store, &[t]);
 }
 
 /// Two task ids differing only in CASE are two different tasks, and the primary key has to agree.
-/// Under this schema's default collation (utf8mb4_0900_ai_ci) they compare EQUAL, so the second
-/// `put_task` would upsert onto the first one's row and one of the two tasks would simply be gone —
-/// silently, with the write reporting success. `tasks.task_id` is `utf8mb4_bin` to stop exactly that.
+/// Under this schema's default collation they compare EQUAL, so the second upsert would land on the
+/// first one's row and one of the two tasks would simply be gone — silently, with the write
+/// reporting success.
 #[test]
 fn task_ids_differing_only_in_case_are_distinct_tasks() {
     let Some(url) = test_url() else { return };
@@ -2455,160 +2643,58 @@ fn task_ids_differing_only_in_case_are_distinct_tasks() {
     reset_tasks(&store, &[lower, upper]);
 
     store
-        .put_task(&sample_task(lower, "working", TASK_LIVE_TS + 1))
+        .upsert_plane_record(&active_task(lower, "working", TASK_LIVE_TS + 1))
         .unwrap();
     store
-        .put_task(&sample_task(upper, "completed", TASK_LIVE_TS + 2))
+        .upsert_plane_record(&terminal_task(upper, "completed", TASK_LIVE_TS + 2))
         .expect("a case-different id is a different task, not an upsert onto the first");
-
-    let a = store.get_task(lower).unwrap().expect("the lower-case task");
-    let b = store.get_task(upper).unwrap().expect("the upper-case task");
-    assert_eq!(a.task_id, lower, "an exact-match lookup must not case-fold");
-    assert_eq!(b.task_id, upper);
+    let a = get_task(&store, lower).expect("the lower-case task");
+    let b = get_task(&store, upper).expect("the upper-case task");
     assert_eq!(
-        a.state, "working",
-        "the second put must not have overwritten the first task's row"
+        a["task_id"], lower,
+        "an exact-match lookup must not case-fold"
     );
-    assert_eq!(b.state, "completed");
-
-    // The per-task event chains are scoped just as exactly.
-    store
-        .append_task_event(&sample_event(lower, 1, "task.submitted", "", "l1"))
-        .unwrap();
-    store
-        .append_task_event(&sample_event(upper, 1, "task.submitted", "", "u1"))
-        .unwrap();
-    assert_eq!(store.list_task_events(lower).unwrap()[0].hash, "l1");
+    assert_eq!(b["task_id"], upper);
     assert_eq!(
-        store.list_task_events(upper).unwrap()[0].hash,
+        a["state"], "working",
+        "the second upsert must not have overwritten the first task's row"
+    );
+
+    store
+        .append_plane_record(&event_rec(lower, 1, "task.submitted", "", "l1"))
+        .unwrap();
+    store
+        .append_plane_record(&event_rec(upper, 1, "task.submitted", "", "u1"))
+        .unwrap();
+    assert_eq!(events_of(&store, lower)[0]["hash"], "l1");
+    assert_eq!(
+        events_of(&store, upper)[0]["hash"],
         "u1",
-        "a case-different task id is a different chain, not the same (task_id, seq) slot"
+        "a case-different task id is a different chain, not the same (task, seq) slot"
     );
-
     reset_tasks(&store, &[lower, upper]);
 }
 
-/// The band the purge tests own, cleared wholesale. Safe only under `lock_task_purge`, and correct
-/// only because every non-purge task test writes above `TASK_PURGE_BAND_TOP`.
-fn clear_purge_band(store: &MysqlStore) {
-    let mut conn = store.conn().expect("conn");
-    conn.exec_drop(
-        "DELETE FROM task_events WHERE task_id IN (SELECT task_id FROM tasks WHERE updated_at < :top)",
-        params! { "top" => TASK_PURGE_BAND_TOP },
-    )
-    .expect("clear the purge band's events");
-    conn.exec_drop(
-        "DELETE FROM tasks WHERE updated_at < :top",
-        params! { "top" => TASK_PURGE_BAND_TOP },
-    )
-    .expect("clear the purge band");
-}
-
-/// The v4 -> v5 crossing is additive: a real v4 database gains `tasks` and `task_events` and keeps
-/// every row it already had. Runs the REAL `MysqlStore::connect` wiring (real `store_meta` read,
-/// real table names) against a DEDICATED throwaway database, for the same reason
-/// `try_init_schema_real_wiring_backfills_a_genuinely_pre_v2_database` does: seeding a pre-v5
-/// `schema_version` marker in the shared `busbar_test` would race every other test's `connect()`.
-#[test]
-fn migrate_v4_to_v5_adds_the_task_store_without_wiping_data() {
-    let _ddl_guard = lock_fresh_database_ddl();
-    let Some(url) = test_url() else { return };
-    let db_name = format!(
-        "busbar_taskmig_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
-    let root_url = url.replacen("busbar:busbar@", "root:busbar@", 1);
-    let root_pool = Pool::new(Opts::from_url(&root_url).unwrap()).unwrap();
-    let mut root_conn = root_pool.get_conn().unwrap();
-    root_conn
-        .query_drop(format!("CREATE DATABASE {db_name}"))
-        .unwrap();
-    root_conn
-        .query_drop(format!(
-            "GRANT ALL PRIVILEGES ON {db_name}.* TO 'busbar'@'%'"
-        ))
-        .unwrap();
-    let dedicated_url = {
-        let cut = url
-            .rfind('/')
-            .expect("test_url() must be a mysql:// URL with a /database path");
-        format!("{}/{db_name}", &url[..cut])
-    };
-
-    // Boot once to build the real schema, then rewind this database to a genuine v4: drop the two
-    // new tables and put the marker back. Safe here — this database has no other concurrent user.
-    let store1 = MysqlStore::connect(&dedicated_url).expect("first boot must create the schema");
-    {
-        let mut conn = store1.pool.get_conn().unwrap();
-        conn.query_drop("DROP TABLE task_events").unwrap();
-        conn.query_drop("DROP TABLE tasks").unwrap();
-        conn.query_drop("UPDATE store_meta SET v = '4' WHERE k = 'schema_version'")
-            .unwrap();
-        conn.query_drop(
-            "INSERT INTO api_keys (id, name, key_group, allowed_pools, labels, enabled, \
-             generation_hash, created_at, updated_at, revision) \
-             VALUES ('vk_v4', 'n', '', NULL, '{}', 1, 'g1', 0, 0, 0)",
-        )
-        .unwrap();
-    }
-    drop(store1);
-
-    let store2 = MysqlStore::connect(&dedicated_url).expect("a v4 database must migrate to v5");
-    let survived = store2.get_key("vk_v4").unwrap().is_some();
-    store2
-        .put_task(&sample_task("t_v5", "working", TASK_LIVE_TS))
-        .expect("the newly created tasks table must be writable after the migration");
-    store2
-        .append_task_event(&sample_event("t_v5", 1, "task.submitted", "", "e1"))
-        .expect("the newly created task_events table must be writable after the migration");
-    let task_back = store2.get_task("t_v5").unwrap().is_some();
-    let events_back = store2.list_task_events("t_v5").unwrap().len();
-    drop(store2);
-
-    root_conn
-        .query_drop(format!("DROP DATABASE {db_name}"))
-        .unwrap();
-
-    assert!(
-        survived,
-        "a real v4 key must survive the v4->v5 crossing; the migration is purely additive"
-    );
-    assert!(task_back, "the migrated tasks table must read back");
-    assert_eq!(
-        events_back, 1,
-        "the migrated task_events table must read back"
-    );
-}
-
-// ── THE DURABLE MCP DEMOTION RECORD AND THE SPENT-APPROVAL LEDGER ────────────────────────────
+// ── the `demotion` kind and the single-use token ledger ────────────────────────────────────────
 //
-// Both are security state, and both arrived with the same hole: `busbar_api::Store` defaults
-// `put_mcp_demotion`/`list_mcp_demotions`/`clear_mcp_demotion` to accept-and-keep-nothing and
-// `redeem_ask_state` to `Ok(true)` — "yes, this call is the first redemption" — so a backend that
-// implements neither compiles, ships and reports every write successful while discarding it. What
-// that costs is a quarantined upstream that gets the operator's approval back at the next restart,
-// and a single-use human approval that a second node of the fleet redeems again.
-//
-// Every case below reads the state back through a RECONNECTED store, and the ledger cases include a
-// second, genuinely independent connection — which is what a second node of one deployment is.
+// Both are security state, and both arrived with the same hole: the trait defaults the neutral
+// verbs to accept-and-keep-nothing, so a backend that implements neither compiles, ships and reports
+// every write successful while discarding it. What that costs is a quarantined upstream that gets
+// the operator's approval back at the next restart, and a single-use human approval that a second
+// node of the fleet redeems again.
 
 /// THE LIVE URL, OR A FAILURE. Deliberately NOT `test_url()`, whose `None` arm lets a case return
 /// green having tested nothing: an unimplemented ledger and a test that never ran produce the same
-/// green, and these are exactly the two properties where that costs an operator something. A test
-/// that can skip is a test that will skip on the day it matters.
+/// green, and these are exactly the two properties where that costs an operator something.
 fn require_test_url() -> String {
     std::env::var("BUSBAR_TEST_MYSQL_URL").unwrap_or_else(|_| {
         panic!(
             "BUSBAR_TEST_MYSQL_URL is unset. These cases are the ONLY coverage of the durable MCP \
-             demotion record and the spent-approval ledger on this backend, and both fail SILENTLY \
-             when unimplemented — the trait defaults answer Ok(()) to a demotion and `true` to \
-             every redemption. Skipping them reports green over a quarantined upstream that comes \
-             back approved and an approval that is redeemable once per node. Point this at a live \
-             MySQL, e.g. mysql://busbar:busbar@127.0.0.1:3307/busbar_test"
+             demotion record and the single-use token ledger on this backend, and both fail \
+             SILENTLY when unimplemented — the trait defaults accept a demotion and keep nothing. \
+             Skipping them reports green over a quarantined upstream that comes back approved and \
+             an approval that is redeemable once per node. Point this at a live MySQL, e.g. \
+             mysql://busbar:busbar@127.0.0.1:3307/busbar_test"
         )
     })
 }
@@ -2619,40 +2705,56 @@ fn trust_ns(tag: &str) -> String {
     format!("{}_{}", tag, std::process::id())
 }
 
-const TRUST_NOW: u64 = 2_000_000_000;
+/// The ledger's eviction sweep is GLOBAL (`expires_at < now`, every kind), so the redemptions in
+/// this binary are placed where no sweep reaches another test's live token: every `now` below stays
+/// under `TRUST_NOW + 11`, and every token this file keeps live expires at or after `TRUST_NOW + 900`
+/// — both below the conformance battery's own expiry (`2_000_000_000`) and above its `now`
+/// (`1_700_000_000`), so the battery and these cases can never sweep each other's rows mid-check.
+const TRUST_NOW: u64 = 1_999_990_000;
 
-fn demotion(server: &str, reason: &str, recorded_at: u64) -> McpDemotionRow {
-    McpDemotionRow {
-        server: server.to_string(),
-        reason: reason.to_string(),
-        recorded_at,
+fn demotion_rec(server: &str, reason: &str, recorded_at: u64) -> PlaneRecord {
+    PlaneRecord {
+        kind: "demotion".into(),
+        id: server.into(),
+        parent: None,
+        seq: 0,
+        ts: recorded_at,
+        disposition: PlaneDisposition::Active,
+        body: json_body(serde_json::json!({
+            "server": server, "reason": reason, "recorded_at": recorded_at,
+        })),
     }
 }
 
-/// Drop exactly this suite's own rows, so a rerun (or a crashed prior run that left rows behind)
-/// starts where a first run does — and no other concurrently running test's rows are touched.
-fn reset_trust_state(store: &MysqlStore, servers: &[&str], nonces: &[&str]) {
+fn demotions(store: &MysqlStore) -> Vec<serde_json::Value> {
+    store
+        .list_plane_records("demotion", &PlaneSelector::All)
+        .unwrap()
+        .iter()
+        .map(|b| decode(b))
+        .collect()
+}
+
+fn demotion_servers(store: &MysqlStore) -> Vec<String> {
+    demotions(store)
+        .iter()
+        .filter_map(|d| d["server"].as_str().map(str::to_string))
+        .collect()
+}
+
+fn reset_tokens(store: &MysqlStore, kind: &str, tokens: &[&str]) {
     let mut conn = store.conn().expect("conn");
-    for s in servers {
+    for t in tokens {
         conn.exec_drop(
-            "DELETE FROM mcp_demotions WHERE server = :s",
-            params! { "s" => *s },
-        )
-        .expect("clear this test's own demotions");
-    }
-    for n in nonces {
-        conn.exec_drop(
-            "DELETE FROM spent_ask_states WHERE nonce = :n",
-            params! { "n" => *n },
+            "DELETE FROM plane_tokens WHERE kind = :k AND token = :t",
+            params! { "k" => kind, "t" => *t },
         )
         .expect("clear this test's own ledger rows");
     }
 }
 
-/// A DEMOTION OUTLIVES THE PROCESS THAT RECORDED IT. The engine derives a demotion from a live
-/// observation, and a process that has taken no observation has nothing to derive it from — it
-/// serves the upstream against the digest the operator approved. So without this row on the server,
-/// a restart hands a quarantined upstream its approval back.
+/// A DEMOTION OUTLIVES THE PROCESS THAT RECORDED IT. Without this row on the server, a restart
+/// hands a quarantined upstream its approval back.
 #[test]
 fn a_demotion_survives_dropping_the_store_and_reconnecting() {
     let url = require_test_url();
@@ -2663,111 +2765,96 @@ fn a_demotion_survives_dropping_the_store_and_reconnecting() {
     );
     {
         let store = MysqlStore::connect(&url).expect("connect");
-        reset_trust_state(&store, &[&a, &b, &c], &[]);
+        reset_plane(&store, "demotion", &[&a, &b, &c]);
         store
-            .put_mcp_demotion(&demotion(&a, "tool-drift", TRUST_NOW))
+            .upsert_plane_record(&demotion_rec(&a, "tool-drift", TRUST_NOW))
             .unwrap();
-        // UPSERT by `server`: a second demotion of one upstream REPLACES the row rather than
-        // standing a rival one beside it, so the boot read cannot hold two answers about one server.
+        // UPSERT by server: a second demotion of one upstream REPLACES the row rather than standing
+        // a rival one beside it, so the boot read cannot hold two answers about one server.
         store
-            .put_mcp_demotion(&demotion(&a, "digest-mismatch", TRUST_NOW + 10))
-            .unwrap();
-        store
-            .put_mcp_demotion(&demotion(&b, "tool-drift", TRUST_NOW + 20))
+            .upsert_plane_record(&demotion_rec(&a, "digest-mismatch", TRUST_NOW + 10))
             .unwrap();
         store
-            .put_mcp_demotion(&demotion(&c, "tool-drift", TRUST_NOW + 30))
+            .upsert_plane_record(&demotion_rec(&b, "tool-drift", TRUST_NOW + 20))
             .unwrap();
         store
-            .clear_mcp_demotion(&c)
+            .upsert_plane_record(&demotion_rec(&c, "tool-drift", TRUST_NOW + 30))
+            .unwrap();
+        store
+            .delete_plane_record("demotion", &c)
             .expect("a later observation that agrees with the approval clears the quarantine");
         store
-            .clear_mcp_demotion(&trust_ns("srv_never_demoted"))
+            .delete_plane_record("demotion", &trust_ns("srv_never_demoted"))
             .expect("clearing a row that is not there is a no-op, not an error");
         drop(store);
     }
 
-    // A genuinely new store and pool — nothing carried over in this process.
     let reopened = MysqlStore::connect(&url).expect("reconnect");
-    let mut mine = reopened
-        .list_mcp_demotions()
-        .unwrap()
+    let mut mine: Vec<serde_json::Value> = demotions(&reopened)
         .into_iter()
-        .filter(|r| r.server == a || r.server == b || r.server == c)
-        .collect::<Vec<_>>();
-    mine.sort_by(|x, y| x.server.cmp(&y.server));
+        .filter(|d| {
+            d["server"] == a.as_str() || d["server"] == b.as_str() || d["server"] == c.as_str()
+        })
+        .collect();
+    mine.sort_by(|x, y| x["server"].as_str().cmp(&y["server"].as_str()));
     let mut expect = vec![
-        demotion(&a, "digest-mismatch", TRUST_NOW + 10),
-        demotion(&b, "tool-drift", TRUST_NOW + 20),
+        decode(&demotion_rec(&a, "digest-mismatch", TRUST_NOW + 10).body),
+        decode(&demotion_rec(&b, "tool-drift", TRUST_NOW + 20).body),
     ];
-    expect.sort_by(|x, y| x.server.cmp(&y.server));
+    expect.sort_by(|x, y| x["server"].as_str().cmp(&y["server"].as_str()));
     assert_eq!(
         mine, expect,
-        "the boot read must put every recorded quarantine back in force before the first request is \
-         served — upserted to the LATEST reason, and WITHOUT the one a later agreeing observation \
-         cleared. An empty or stale answer here is the accept-and-keep-nothing trait default, and \
-         it means a restart hands a demoted upstream the operator's approval back"
+        "the boot read must put every recorded quarantine back in force — upserted to the LATEST \
+         reason, and WITHOUT the one a later agreeing observation cleared"
     );
-    reset_trust_state(&reopened, &[&a, &b, &c], &[]);
+    reset_plane(&reopened, "demotion", &[&a, &b, &c]);
 }
 
-/// SERVER IDS DIFFERING ONLY IN CASE ARE DISTINCT UPSTREAMS. This schema's default collation is
-/// utf8mb4_0900_ai_ci — CASE- AND ACCENT-INSENSITIVE — under which two distinct registrations
-/// COLLIDE ON THE PRIMARY KEY: quarantining one would silently overwrite the other's record, and
-/// clearing one would clear both. `COLLATE utf8mb4_bin` on the key column is what makes this pass;
-/// the same class of bug the v3 migration closed for `usage_metering.key_group_at_use`.
+/// SERVER IDS DIFFERING ONLY IN CASE ARE DISTINCT UPSTREAMS: quarantining one must not overwrite
+/// the other's record, and clearing one must not clear both.
 #[test]
 fn servers_differing_only_in_case_are_distinct_demotions() {
     let url = require_test_url();
     let (lower, upper) = (trust_ns("srv_case"), trust_ns("srv_CASE"));
     let store = MysqlStore::connect(&url).expect("connect");
-    reset_trust_state(&store, &[&lower, &upper], &[]);
+    reset_plane(&store, "demotion", &[&lower, &upper]);
 
     store
-        .put_mcp_demotion(&demotion(&lower, "tool-drift", TRUST_NOW))
+        .upsert_plane_record(&demotion_rec(&lower, "tool-drift", TRUST_NOW))
         .unwrap();
     store
-        .put_mcp_demotion(&demotion(&upper, "digest-mismatch", TRUST_NOW + 1))
+        .upsert_plane_record(&demotion_rec(&upper, "digest-mismatch", TRUST_NOW + 1))
         .unwrap();
-    let mine = store
-        .list_mcp_demotions()
-        .unwrap()
-        .into_iter()
-        .filter(|r| r.server == lower || r.server == upper)
-        .count();
+    let servers = demotion_servers(&store);
     assert_eq!(
-        mine, 2,
-        "two upstreams whose ids differ only in case are two upstreams. Under this schema's default \
-         case-insensitive collation they collide on the primary key and one quarantine silently \
-         overwrites the other's"
-    );
-    // And clearing one must not clear the other.
-    store.clear_mcp_demotion(&lower).unwrap();
-    assert!(
-        store
-            .list_mcp_demotions()
-            .unwrap()
+        servers
             .iter()
-            .any(|r| r.server == upper),
+            .filter(|s| **s == lower || **s == upper)
+            .count(),
+        2,
+        "two upstreams whose ids differ only in case are two upstreams"
+    );
+    store.delete_plane_record("demotion", &lower).unwrap();
+    assert!(
+        demotion_servers(&store).contains(&upper),
         "clearing one upstream's quarantine must not lift another's"
     );
-    reset_trust_state(&store, &[&lower, &upper], &[]);
+    reset_plane(&store, "demotion", &[&lower, &upper]);
 }
 
 /// THE SPENT-APPROVAL LEDGER ACROSS A RESTART. The seal that carries a single-use approval is valid
 /// bytes on its second presentation exactly as on its first; only a record that the first happened
-/// tells them apart. In process memory that record dies with the process while the approval it
-/// records is still openable — so this drops the store and pool entirely and asks a new one.
+/// tells them apart.
 #[test]
 fn a_reconnected_store_refuses_a_second_redemption_of_the_same_approval() {
     let url = require_test_url();
     let (spent, fresh) = (trust_ns("nonce_restart"), trust_ns("nonce_restart_other"));
     {
         let store = MysqlStore::connect(&url).expect("connect");
-        reset_trust_state(&store, &[], &[&spent, &fresh]);
+        reset_tokens(&store, "ask", &[&spent, &fresh]);
         assert!(
             store
-                .redeem_ask_state(&spent, TRUST_NOW + 900, TRUST_NOW)
+                .redeem_plane_token("ask", &spent, TRUST_NOW + 900, TRUST_NOW)
                 .unwrap(),
             "the FIRST redemption must be answered `true`, or nothing below is about single use"
         );
@@ -2777,85 +2864,82 @@ fn a_reconnected_store_refuses_a_second_redemption_of_the_same_approval() {
     let reopened = MysqlStore::connect(&url).expect("reconnect");
     assert!(
         !reopened
-            .redeem_ask_state(&spent, TRUST_NOW + 900, TRUST_NOW + 1)
+            .redeem_plane_token("ask", &spent, TRUST_NOW + 900, TRUST_NOW + 1)
             .unwrap(),
-        "a restart handed a spent approval back. The approval has not lapsed — outliving a restart \
-         is the point of it — so the only thing that changed is that the process which recorded the \
-         redemption is gone. On a tool an operator gated because it moves money, that second \
-         redemption is the whole defect the gate exists to stop"
+        "a restart handed a spent approval back. The approval has not lapsed, so the only thing \
+         that changed is that the process which recorded the redemption is gone"
     );
-    // THE CONTROL, and it is load-bearing: a ledger that refused everything would satisfy the case
-    // above and would have deleted the feature.
+    // THE CONTROL: a ledger that refused everything would satisfy the case above.
     assert!(
         reopened
-            .redeem_ask_state(&fresh, TRUST_NOW + 900, TRUST_NOW + 2)
+            .redeem_plane_token("ask", &fresh, TRUST_NOW + 900, TRUST_NOW + 2)
             .unwrap(),
-        "a different approval is not the one that was spent; refusing it would make the ledger a \
-         blanket refusal of every confirmation after the first"
+        "a different approval is not the one that was spent"
     );
-    reset_trust_state(&reopened, &[], &[&spent, &fresh]);
+    // The ledger is keyed by KIND as well: the same token string under another single-use kind is a
+    // different capability, never one another kind already spent.
+    assert!(
+        reopened
+            .redeem_plane_token("ask_other_kind", &spent, TRUST_NOW + 900, TRUST_NOW + 2)
+            .unwrap(),
+        "a token spent under one kind must not read as spent under another"
+    );
+    reset_tokens(&reopened, "ask", &[&spent, &fresh]);
+    reset_tokens(&reopened, "ask_other_kind", &[&spent]);
 }
 
 /// TWO CONNECTIONS ARE TWO NODES OF A FLEET, and this is the arrangement the durable ledger exists
-/// for. They share the deployment's signing key, so they share the SEAL — every check but this one
-/// passes on both — and the second redemption needs no timing skill at all: it is an ordinary
-/// sequential request that a load balancer sends somewhere else.
+/// for: the second redemption needs no timing skill at all, only a load balancer.
 #[test]
 fn a_second_node_cannot_redeem_an_approval_the_first_already_spent() {
     let url = require_test_url();
     let nonce = trust_ns("nonce_fleet");
     let node_a = MysqlStore::connect(&url).expect("node A connects");
     let node_b = MysqlStore::connect(&url).expect("node B connects");
-    reset_trust_state(&node_a, &[], &[&nonce]);
+    reset_tokens(&node_a, "ask", &[&nonce]);
 
     assert!(node_a
-        .redeem_ask_state(&nonce, TRUST_NOW + 900, TRUST_NOW)
+        .redeem_plane_token("ask", &nonce, TRUST_NOW + 900, TRUST_NOW)
         .unwrap());
     assert!(
         !node_b
-            .redeem_ask_state(&nonce, TRUST_NOW + 900, TRUST_NOW)
+            .redeem_plane_token("ask", &nonce, TRUST_NOW + 900, TRUST_NOW)
             .unwrap(),
-        "a second node of the same deployment redeemed an approval the first already spent, which \
-         is one operator confirmation executing once per node"
+        "a second node of the same deployment redeemed an approval the first already spent"
     );
-    reset_trust_state(&node_a, &[], &[&nonce]);
+    reset_tokens(&node_a, "ask", &[&nonce]);
 }
 
-/// NONCES DIFFERING ONLY IN CASE ARE DISTINCT APPROVALS, and this is the sharpest instance of the
-/// collation hazard in this schema. Under the default case-insensitive collation the ledger's
-/// primary key stops telling one approval from another: a genuinely fresh approval whose nonce
-/// happens to differ only in case from a spent one would be REFUSED — the gate breaking for an
-/// operator who did nothing wrong — while an attacker's near-miss variants fold onto one row.
+/// NONCES DIFFERING ONLY IN CASE ARE DISTINCT APPROVALS — the sharpest instance of the collation
+/// hazard: under a case-insensitive key a fresh approval would be REFUSED.
 #[test]
 fn nonces_differing_only_in_case_are_distinct_approvals() {
     let url = require_test_url();
     let (lower, upper) = (trust_ns("nonce_case_ab"), trust_ns("nonce_case_AB"));
     let store = MysqlStore::connect(&url).expect("connect");
-    reset_trust_state(&store, &[], &[&lower, &upper]);
+    reset_tokens(&store, "ask", &[&lower, &upper]);
 
     assert!(store
-        .redeem_ask_state(&lower, TRUST_NOW + 900, TRUST_NOW)
+        .redeem_plane_token("ask", &lower, TRUST_NOW + 900, TRUST_NOW)
         .unwrap());
     assert!(
         store
-            .redeem_ask_state(&upper, TRUST_NOW + 900, TRUST_NOW)
+            .redeem_plane_token("ask", &upper, TRUST_NOW + 900, TRUST_NOW)
             .unwrap(),
-        "an approval whose nonce differs only in case from a spent one is a DIFFERENT approval and \
-         must redeem. Under the default case-insensitive collation it collides with the spent row \
-         and the gate refuses a confirmation the operator legitimately gave"
+        "an approval whose nonce differs only in case from a spent one is a DIFFERENT approval"
     );
-    reset_trust_state(&store, &[], &[&lower, &upper]);
+    reset_tokens(&store, "ask", &[&lower, &upper]);
 }
 
-/// CONCURRENT REDEMPTION IS THE ATTACK, not the corner case. Eight independent CONNECTIONS — not
-/// eight threads sharing one — race on one approval through a barrier, which is the arrangement a
-/// read-then-write implementation answers "first" to eight times. Exactly one may win.
+/// CONCURRENT REDEMPTION IS THE ATTACK, not the corner case. Eight independent CONNECTIONS race on
+/// one approval through a barrier — the arrangement a read-then-write implementation answers
+/// "first" to eight times. Exactly one may win.
 #[test]
 fn exactly_one_of_many_racing_nodes_wins_the_redemption() {
     let url = require_test_url();
     let nonce = trust_ns("nonce_race");
     let cleanup = MysqlStore::connect(&url).expect("connect");
-    reset_trust_state(&cleanup, &[], &[&nonce]);
+    reset_tokens(&cleanup, "ask", &[&nonce]);
     drop(cleanup);
 
     let n = 8usize;
@@ -2869,8 +2953,8 @@ fn exactly_one_of_many_racing_nodes_wins_the_redemption() {
                 scope.spawn(move || {
                     let node = MysqlStore::connect(&url).expect("a racing node connects");
                     barrier.wait();
-                    node.redeem_ask_state(&nonce, TRUST_NOW + 900, TRUST_NOW)
-                        .expect("redeem_ask_state") as usize
+                    node.redeem_plane_token("ask", &nonce, TRUST_NOW + 900, TRUST_NOW)
+                        .expect("redeem_plane_token") as usize
                 })
             })
             .collect();
@@ -2880,17 +2964,16 @@ fn exactly_one_of_many_racing_nodes_wins_the_redemption() {
     assert_eq!(
         winners, 1,
         "exactly one redemption of one approval may be the first; {winners} nodes were each told \
-         they were, which is a test-and-set that is really a read followed by a write"
+         they were"
     );
     let cleanup = MysqlStore::connect(&url).expect("connect");
-    reset_trust_state(&cleanup, &[], &[&nonce]);
+    reset_tokens(&cleanup, "ask", &[&nonce]);
 }
 
-/// THE LEDGER IS BOUNDED BY ONE APPROVAL-VALIDITY WINDOW. `now` is handed to every redemption so the
-/// backend can drop what has lapsed in the same call — an entry recording an approval that can no
-/// longer be opened protects nothing, and a table that only grows is its own outage.
+/// THE LEDGER IS BOUNDED BY ONE VALIDITY WINDOW: `now` is handed to every redemption so the backend
+/// drops what has lapsed in the same call.
 #[test]
-fn redeeming_evicts_entries_whose_approval_can_no_longer_be_opened() {
+fn redeeming_evicts_entries_whose_token_can_no_longer_be_presented() {
     let url = require_test_url();
     let (short, long, other) = (
         trust_ns("nonce_short"),
@@ -2898,24 +2981,25 @@ fn redeeming_evicts_entries_whose_approval_can_no_longer_be_opened() {
         trust_ns("nonce_sweeper"),
     );
     let store = MysqlStore::connect(&url).expect("connect");
-    reset_trust_state(&store, &[], &[&short, &long, &other]);
+    reset_tokens(&store, "ask", &[&short, &long, &other]);
 
     assert!(store
-        .redeem_ask_state(&short, TRUST_NOW + 10, TRUST_NOW)
+        .redeem_plane_token("ask", &short, TRUST_NOW + 10, TRUST_NOW)
         .unwrap());
     assert!(store
-        .redeem_ask_state(&long, TRUST_NOW + 10_000, TRUST_NOW)
+        .redeem_plane_token("ask", &long, TRUST_NOW + 10_000, TRUST_NOW)
         .unwrap());
 
-    // A redemption past the first entry's expiry: the sweep rides along with it.
     let later = TRUST_NOW + 11;
-    assert!(store.redeem_ask_state(&other, later + 900, later).unwrap());
+    assert!(store
+        .redeem_plane_token("ask", &other, later + 900, later)
+        .unwrap());
 
     let present = |nonce: &str| -> bool {
         let mut conn = store.conn().expect("conn");
         let n: Option<u64> = conn
             .exec_first(
-                "SELECT COUNT(*) FROM spent_ask_states WHERE nonce = :n",
+                "SELECT COUNT(*) FROM plane_tokens WHERE kind = 'ask' AND token = :n",
                 params! { "n" => nonce },
             )
             .expect("count the ledger row");
@@ -2923,53 +3007,718 @@ fn redeeming_evicts_entries_whose_approval_can_no_longer_be_opened() {
     };
     assert!(
         !present(&short),
-        "the entry whose approval can no longer be opened must be evicted by the sweep the \
-         redemption carries; a ledger that only grows is its own outage"
+        "the entry whose token can no longer be presented must be evicted by the sweep"
     );
     assert!(
         present(&long),
-        "an approval still inside its window must NOT be swept — evicting it early is exactly the \
+        "a token still inside its window must NOT be swept — evicting it early is exactly the \
          double redemption this ledger exists to refuse"
     );
-    reset_trust_state(&store, &[], &[&short, &long, &other]);
+    reset_tokens(&store, "ask", &[&short, &long, &other]);
 }
 
-/// THE FULL u64 RANGE STORES FAITHFULLY. Both timestamp columns are BIGINT UNSIGNED, which is this
-/// backend's answer to the range problem the signed-BIGINT backends have to refuse — see `put_task`
-/// and `tasks.artifact_cursor` for the same choice. A clamped or wrapped `now` would be a security
-/// bug rather than a rounding one: clamped high it sweeps the ENTIRE ledger and then reports a
-/// replay as a first redemption.
+/// THE FULL u64 RANGE STORES FAITHFULLY. A clamped or wrapped `now` would be a security bug rather
+/// than a rounding one: clamped high it sweeps the ENTIRE ledger and reports a replay as first.
 #[test]
 fn the_trust_state_stores_the_full_unsigned_range() {
     let url = require_test_url();
     let (server, nonce) = (trust_ns("srv_range"), trust_ns("nonce_range"));
     let store = MysqlStore::connect(&url).expect("connect");
-    reset_trust_state(&store, &[&server], &[&nonce]);
+    reset_plane(&store, "demotion", &[&server]);
+    reset_tokens(&store, "ask", &[&nonce]);
 
     store
-        .put_mcp_demotion(&demotion(&server, "tool-drift", u64::MAX))
+        .upsert_plane_record(&demotion_rec(&server, "tool-drift", u64::MAX))
         .expect("BIGINT UNSIGNED holds the whole u64 range");
     assert_eq!(
-        store
-            .list_mcp_demotions()
-            .unwrap()
+        demotions(&store)
             .into_iter()
-            .find(|r| r.server == server)
-            .expect("the row must be there")
-            .recorded_at,
-        u64::MAX,
-        "recorded_at must read back as itself, never wrapped or clamped"
+            .find(|d| d["server"] == server.as_str())
+            .expect("the row must be there")["recorded_at"]
+            .as_u64(),
+        Some(u64::MAX)
     );
     assert!(
-        store.redeem_ask_state(&nonce, u64::MAX, TRUST_NOW).unwrap(),
+        store
+            .redeem_plane_token("ask", &nonce, u64::MAX, TRUST_NOW)
+            .unwrap(),
         "an expires_at at the top of the range is storable here and must redeem normally"
     );
     assert!(
         !store
-            .redeem_ask_state(&nonce, u64::MAX, TRUST_NOW + 1)
+            .redeem_plane_token("ask", &nonce, u64::MAX, TRUST_NOW + 1)
             .unwrap(),
-        "and the row it wrote must still be found on the replay — a value that did not read back as \
-         itself would answer `first redemption` twice"
+        "and the row it wrote must still be found on the replay"
     );
-    reset_trust_state(&store, &[&server], &[&nonce]);
+    reset_plane(&store, "demotion", &[&server]);
+    reset_tokens(&store, "ask", &[&nonce]);
+}
+
+// ── plane_token_live: the multi-use capability (kind `push_config`) ─────────────────────────────
+
+fn push_config(id: &str, disposition: PlaneDisposition) -> PlaneRecord {
+    PlaneRecord {
+        kind: "push_config".into(),
+        id: id.into(),
+        parent: None,
+        seq: 0,
+        ts: TASK_LIVE_TS,
+        disposition,
+        body: json_body(serde_json::json!({ "task_id": id, "url": "https://example.test/cb" })),
+    }
+}
+
+/// LIVE means all three: present, still ACTIVE, and inside its deadline. It SPENDS NOTHING — asking
+/// twice answers the same twice, which is what makes it usable for the several callbacks one task
+/// legitimately receives — and it dies the moment the write that made the task terminal flips the
+/// row, or the deadline passes. Every failing leg answers `false`: fail-closed.
+#[test]
+fn plane_token_live_carries_a_task_and_dies_with_it() {
+    let Some(url) = test_url() else { return };
+    let store = MysqlStore::connect(&url).expect("connect");
+    let id = &trust_ns("push_live");
+    reset_plane(&store, "push_config", &[id]);
+    let deadline = TASK_LIVE_TS + 1_000;
+
+    assert!(
+        !store
+            .plane_token_live("push_config", id, deadline, TASK_LIVE_TS)
+            .unwrap(),
+        "an unknown token holds no capability"
+    );
+    store
+        .upsert_plane_record(&push_config(id, PlaneDisposition::Active))
+        .unwrap();
+    for _ in 0..2 {
+        assert!(
+            store
+                .plane_token_live("push_config", id, deadline, TASK_LIVE_TS)
+                .unwrap(),
+            "a present, active token inside its deadline is live — and asking again spends nothing"
+        );
+    }
+    assert!(
+        store
+            .plane_token_live("push_config", id, deadline, deadline)
+            .unwrap(),
+        "`now` AT the deadline has not passed it"
+    );
+    assert!(
+        !store
+            .plane_token_live("push_config", id, deadline, deadline + 1)
+            .unwrap(),
+        "a lapsed token is not live even though nothing finished"
+    );
+    assert!(
+        !store
+            .plane_token_live("some_other_kind", id, deadline, TASK_LIVE_TS)
+            .unwrap(),
+        "the capability is scoped to its kind"
+    );
+    store
+        .upsert_plane_record(&push_config(id, PlaneDisposition::Terminal))
+        .unwrap();
+    assert!(
+        !store
+            .plane_token_live("push_config", id, deadline, TASK_LIVE_TS)
+            .unwrap(),
+        "the write that made the task terminal revokes the token"
+    );
+    store.delete_plane_record("push_config", id).unwrap();
+    assert!(!store
+        .plane_token_live("push_config", id, deadline, TASK_LIVE_TS)
+        .unwrap());
+}
+
+// ── 1.6.0 record shapes: VirtualKey, ModelTokens, MeteringRow ───────────────────────────────────
+
+/// Every scope KIND round-trips as itself. The pre-1.6.0 write path stored only each scope's
+/// VALUE into `allowed_pools`, so an `mcp_server` grant came back as a POOL grant — the MCP grant
+/// lost AND a pool the key was never given admitted. busbar 1.6.0 ships non-`pool` kinds, so this
+/// is the escalation that write path would now hand out.
+#[test]
+fn every_scope_kind_round_trips_and_none_becomes_a_pool() {
+    let Some(s) = fresh_store() else { return };
+    let mut k = sample_key("vk_scopes", "g");
+    k.allowed_scopes = Some(vec![
+        ScopeRef::pool("fast"),
+        ScopeRef {
+            kind: "mcp_server".into(),
+            value: "payments".into(),
+        },
+        ScopeRef {
+            kind: "agent".into(),
+            value: "planner".into(),
+        },
+    ]);
+    s.put_key(&k).unwrap();
+    let back = s.get_key("vk_scopes").unwrap().unwrap();
+    assert!(back.scope_allowed("pool", "fast"));
+    assert!(back.scope_allowed("mcp_server", "payments"));
+    assert!(back.scope_allowed("agent", "planner"));
+    assert!(
+        !back.scope_allowed("pool", "payments"),
+        "an mcp_server grant must never come back as a POOL grant"
+    );
+    assert!(!back.scope_allowed("pool", "planner"));
+    let mut want = k.allowed_scopes.clone().unwrap();
+    let mut got = back.allowed_scopes.clone().unwrap();
+    want.sort_by(|a, b| (&a.kind, &a.value).cmp(&(&b.kind, &b.value)));
+    got.sort_by(|a, b| (&a.kind, &a.value).cmp(&(&b.kind, &b.value)));
+    assert_eq!(got, want, "the grant round-trips exactly, every kind");
+
+    // A grant of ONLY non-pool kinds is an explicit list, fail-closed for pools — never widened to
+    // the omitted-list wildcard.
+    let mut only_mcp = sample_key("vk_scopes_mcp_only", "g");
+    only_mcp.allowed_scopes = Some(vec![ScopeRef {
+        kind: "mcp_server".into(),
+        value: "search".into(),
+    }]);
+    s.put_key_with_credential(
+        &only_mcp,
+        &sample_credential("vk_scopes_mcp_only", "AKIA_SCOPES_MCP", 0),
+    )
+    .unwrap();
+    let back = s.get_key("vk_scopes_mcp_only").unwrap().unwrap();
+    assert!(back.scope_allowed("mcp_server", "search"));
+    assert!(
+        !back.scope_allowed("pool", "anything"),
+        "a key granted only an MCP server grants no pool"
+    );
+    assert!(back.allowed_scopes.is_some(), "never the wildcard");
+    // And the pool column a 1.5.x node would read is the empty (fail-closed) grant, not NULL.
+    let mut conn = s.conn().unwrap();
+    let pools: Option<Option<String>> = conn
+        .query_first("SELECT allowed_pools FROM api_keys WHERE id = 'vk_scopes_mcp_only'")
+        .unwrap();
+    assert_eq!(
+        pools.flatten().map(|p| p.replace(' ', "")),
+        Some("[]".to_string())
+    );
+}
+
+/// The three 1.6.0 `VirtualKey` fields persist through both write paths and a tombstone.
+#[test]
+fn the_1_6_0_key_fields_round_trip() {
+    let Some(s) = fresh_store() else { return };
+    let mut k = sample_key("vk_bound", "g");
+    k.idp_subject = Some("user|abc-123".into());
+    k.binding_mode = Some("user-bound".into());
+    k.minted_by = Some("vk_app_admin".into());
+    s.put_key(&k).unwrap();
+    let back = s.get_key("vk_bound").unwrap().unwrap();
+    assert_eq!(back.idp_subject.as_deref(), Some("user|abc-123"));
+    assert_eq!(back.binding_mode.as_deref(), Some("user-bound"));
+    assert_eq!(back.minted_by.as_deref(), Some("vk_app_admin"));
+
+    let mut minted = sample_key("vk_bound_minted", "g");
+    minted.binding_mode = Some("time-bound".into());
+    minted.minted_by = Some("vk_app_admin".into());
+    s.put_key_with_credential(
+        &minted,
+        &sample_credential("vk_bound_minted", "AKIA_BOUND", 0),
+    )
+    .unwrap();
+    let back = s.get_key("vk_bound_minted").unwrap().unwrap();
+    assert_eq!(back.binding_mode.as_deref(), Some("time-bound"));
+    assert_eq!(back.minted_by.as_deref(), Some("vk_app_admin"));
+    assert_eq!(back.idp_subject, None, "an unset field reads back None");
+
+    s.delete_key("vk_bound").unwrap();
+    let tomb = s.get_key("vk_bound").unwrap().unwrap();
+    assert_eq!(
+        tomb.minted_by.as_deref(),
+        Some("vk_app_admin"),
+        "provenance survives the tombstone, like every other attribution field"
+    );
+}
+
+/// OPEN usage units (everything but the reserved four) round-trip through `put_usage`, accumulate
+/// through `add_usage` with the same floor-at-zero rule, and are replaced — not merged — by an
+/// absolute `put_usage`.
+#[test]
+fn open_usage_units_round_trip_accumulate_and_floor_at_zero() {
+    let _guard = lock_usage_windows();
+    let Some(s) = fresh_store() else { return };
+    let ledger = UsageLedger {
+        requests: 2,
+        billable_requests: 2,
+        models: vec![ModelTokens {
+            model: "rerank-x".into(),
+            usage_units: units(&[(UNIT_INPUT, 7), ("search_units", 3), ("tool_calls", 1)]),
+        }],
+    };
+    s.put_usage("vk_open_units", 1_000_201, &ledger).unwrap();
+    let back = s.get_usage("vk_open_units", 1_000_201).unwrap();
+    assert_eq!(
+        back, ledger,
+        "the whole ledger, open units included, round-trips"
+    );
+
+    s.add_usage(
+        "vk_open_units",
+        1_000_201,
+        &UsageDelta {
+            requests: 1,
+            billable_requests: 1,
+            models: vec![ModelTokensDelta {
+                model: "rerank-x".into(),
+                usage_units: units(&[("search_units", 4), ("tool_calls", -10), ("bytes", 5)]),
+            }],
+        },
+    )
+    .unwrap();
+    let after = s.get_usage("vk_open_units", 1_000_201).unwrap();
+    let m = &after.models[0];
+    assert_eq!(m.tier("search_units"), 7, "an open unit accumulates");
+    assert_eq!(
+        m.tier("tool_calls"),
+        0,
+        "an open unit floors at 0, never wraps"
+    );
+    assert_eq!(
+        m.tier("bytes"),
+        5,
+        "a unit first seen in a delta is created"
+    );
+    assert_eq!(m.tier(UNIT_INPUT), 7, "the reserved units are untouched");
+
+    // An absolute set REPLACES the window: a unit the new ledger does not carry is gone.
+    let replaced = UsageLedger {
+        requests: 1,
+        billable_requests: 1,
+        models: vec![ModelTokens {
+            model: "rerank-x".into(),
+            usage_units: units(&[("search_units", 1)]),
+        }],
+    };
+    s.put_usage("vk_open_units", 1_000_201, &replaced).unwrap();
+    assert_eq!(s.get_usage("vk_open_units", 1_000_201).unwrap(), replaced);
+
+    // And the retention sweep takes a window's open units with it.
+    s.purge_windows_before(1_000_202).unwrap();
+    let mut conn = s.conn().unwrap();
+    let left: Option<u64> = conn
+        .query_first("SELECT COUNT(*) FROM usage_window_units WHERE bucket_id = 'vk_open_units'")
+        .unwrap();
+    assert_eq!(
+        left,
+        Some(0),
+        "a purged window leaves no open-unit rows behind"
+    );
+}
+
+fn metering_delta(key: &str, bucket: u64, priced_from_ms: u64) -> MeteringDelta {
+    MeteringDelta {
+        key_id: key.into(),
+        bucket,
+        model: "m".into(),
+        provider: "p".into(),
+        tokens_input: 10,
+        tokens_output: 5,
+        tokens_cache_read: 0,
+        tokens_cache_write: 0,
+        requests: 1,
+        billable_requests: 1,
+        key_group_at_use: "team-a".into(),
+        pricing_version: "v1".into(),
+        priced_from_ms,
+        usage_units: units(&[("tool_calls", 2)]),
+    }
+}
+
+/// DECISION #79: `priced_from_ms` JOINS THE ACCRUAL KEY. A rate-card edit inside the UTC day opens
+/// a SECOND cell for that day, so each half keeps the card it was earned under; the same instant
+/// accumulates into one cell. Open units accumulate per cell, and the purge takes them with it.
+#[test]
+fn metering_cells_split_on_priced_from_ms_and_carry_open_units() {
+    let Some(s) = fresh_store() else { return };
+    s.put_key(&sample_key("vk_meter79", "g")).unwrap();
+    let bucket = 20_260_801u64;
+    s.add_metering(&metering_delta("vk_meter79", bucket, 0))
+        .unwrap();
+    s.add_metering(&metering_delta("vk_meter79", bucket, 0))
+        .unwrap();
+    s.add_metering(&metering_delta("vk_meter79", bucket, 1_780_000_000_000))
+        .unwrap();
+
+    let mut rows: Vec<MeteringRow> = s
+        .list_metering(bucket)
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.key_id == "vk_meter79")
+        .collect();
+    rows.sort_by_key(|r| r.priced_from_ms);
+    assert_eq!(rows.len(), 2, "a card edit splits the day's cell in two");
+    assert_eq!(rows[0].priced_from_ms, 0);
+    assert_eq!(
+        rows[0].requests, 2,
+        "the same instant accumulates into one cell"
+    );
+    assert_eq!(rows[0].tokens_input, 20);
+    assert_eq!(rows[0].usage_units, units(&[("tool_calls", 4)]));
+    assert_eq!(rows[1].priced_from_ms, 1_780_000_000_000);
+    assert_eq!(rows[1].requests, 1);
+    assert_eq!(rows[1].usage_units, units(&[("tool_calls", 2)]));
+
+    assert!(s.purge_metering_before(&bucket.to_string()).unwrap() >= 2);
+    assert!(s
+        .list_metering(bucket)
+        .unwrap()
+        .iter()
+        .all(|r| r.key_id != "vk_meter79"));
+    let mut conn = s.conn().unwrap();
+    let left: Option<u64> = conn
+        .query_first("SELECT COUNT(*) FROM usage_metering_units WHERE key_id = 'vk_meter79'")
+        .unwrap();
+    assert_eq!(
+        left,
+        Some(0),
+        "a purged cell leaves no open-unit rows behind"
+    );
+}
+
+// ── Upgrading an existing database IN PLACE ─────────────────────────────────────────────────────
+
+mod schema_fixtures;
+
+/// A throwaway database, dropped on scope exit. Migration tests need a whole schema of their own:
+/// seeding an old `schema_version` in the shared `busbar_test` would race every other test's
+/// `connect()`, and the CI `busbar` user cannot CREATE DATABASE, so `root` does it.
+struct ScratchDb {
+    root: Pool,
+    name: String,
+    url: String,
+}
+
+impl ScratchDb {
+    fn new(tag: &str) -> Option<Self> {
+        let url = test_url()?;
+        let name = format!(
+            "busbar_{tag}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root_url = url.replacen("busbar:busbar@", "root:busbar@", 1);
+        let root = Pool::new(Opts::from_url(&root_url).unwrap()).unwrap();
+        let mut c = root.get_conn().unwrap();
+        c.query_drop(format!("CREATE DATABASE {name}")).unwrap();
+        c.query_drop(format!("GRANT ALL PRIVILEGES ON {name}.* TO 'busbar'@'%'"))
+            .unwrap();
+        let cut = url
+            .rfind('/')
+            .expect("test_url() must be a mysql:// URL with a /database path");
+        let db_url = format!("{}/{name}", &url[..cut]);
+        Some(Self {
+            root,
+            name,
+            url: db_url,
+        })
+    }
+
+    fn conn(&self) -> PooledConn {
+        let pool = Pool::new(Opts::from_url(&self.url).unwrap()).unwrap();
+        pool.get_conn().unwrap()
+    }
+}
+
+impl Drop for ScratchDb {
+    fn drop(&mut self) {
+        if let Ok(mut c) = self.root.get_conn() {
+            let _ = c.query_drop(format!("DROP DATABASE {}", self.name));
+        }
+    }
+}
+
+/// THE UPGRADE THAT MUST NOT BREAK: a database written by the RELEASED 1.5.x plugin (v1.0.6, schema
+/// v3 — its DDL is reproduced verbatim in `schema_fixtures`) upgrades IN PLACE on the first 1.6.0
+/// boot. Every row it held reads back unchanged, the new columns and the re-keyed metering table are
+/// in place, the new tables work, and a second boot is a no-op.
+#[test]
+fn a_released_1_5_database_upgrades_in_place() {
+    let _ddl_guard = lock_fresh_database_ddl();
+    let Some(db) = ScratchDb::new("up15") else {
+        return;
+    };
+    {
+        let mut c = db.conn();
+        c.query_drop("SET SESSION sql_mode = CONCAT(@@sql_mode, ',STRICT_ALL_TABLES')")
+            .unwrap();
+        for stmt in schema_fixtures::V1_0_6_SCHEMA {
+            c.query_drop(*stmt).unwrap();
+        }
+        for stmt in [
+            "INSERT INTO store_meta (k, v) VALUES ('schema_version', '3')",
+            "INSERT INTO store_sequence (id, revision) VALUES (1, 41)",
+            "INSERT INTO api_keys (id, name, key_group, allowed_pools, labels, enabled, \
+             generation_hash, created_at, updated_at, expires_at, deleted_at, revision) VALUES \
+             ('vk_old_pools', 'old', 'team-a', '[\"fast\", \"slow\"]', '{\"env\": \"prod\"}', 1, \
+              'binding:vk_old_pools:g1', 1000, 1000, NULL, NULL, 40), \
+             ('vk_old_all', 'all', '', NULL, '{}', 1, 'g', 1000, 1000, NULL, NULL, 39), \
+             ('vk_old_none', 'none', '', '[]', '{}', 1, 'g', 1000, 1000, NULL, NULL, 38), \
+             ('vk_old_dead', '', '', NULL, '{}', 0, 'g', 1000, 1000, NULL, 2000, 41)",
+            "INSERT INTO credentials (id, key_id, kind, slot, public_id, secret, secret_form, \
+             created_at, updated_at, revision) VALUES ('cred_old', 'vk_old_pools', 'sigv4', 0, \
+             'AKIA_OLD15', 'v1:plain:old', 'recoverable', 1000, 1000, 40)",
+            "INSERT INTO denylist (sub, reason, revoked_at, expires_at, revision) \
+             VALUES ('vk_old_dead', 'revoked', 2000, 9000000000, 41)",
+            "INSERT INTO usage_windows (window_start, bucket_scope, bucket_id, model, requests, \
+             billable_requests) VALUES (3000, 'key', 'vk_old_pools', '', 9, 8)",
+            "INSERT INTO usage_windows (window_start, bucket_scope, bucket_id, model, \
+             tokens_input, tokens_output, tokens_cache_read, tokens_cache_write) \
+             VALUES (3000, 'key', 'vk_old_pools', 'gpt-x', 100, 50, 7, 3)",
+            "INSERT INTO usage_metering (bucket, key_id, provider, model, key_group_at_use, \
+             pricing_version, requests, billable_requests, tokens_input, tokens_output, \
+             tokens_cache_read, tokens_cache_write) VALUES ('0020260731', 'vk_old_pools', 'p', \
+             'm', 'team-a', 'v1', 4, 3, 40, 20, 0, 0)",
+            "INSERT INTO audit_log (seq, ts, action, resource, outcome, principal, prev_hash, hash) \
+             VALUES (1, 1000, 'key.mint', 'key:vk_old_pools', 'applied', 'admin', '', 'h1')",
+        ] {
+            c.query_drop(stmt).unwrap();
+        }
+    }
+
+    let store = MysqlStore::connect(&db.url).expect("a released 1.5.x database must upgrade");
+
+    // Every existing row reads back as it was.
+    let k = store
+        .get_key("vk_old_pools")
+        .unwrap()
+        .expect("the 1.5 key survives");
+    assert_eq!(
+        k.allowed_scopes,
+        Some(vec![ScopeRef::pool("fast"), ScopeRef::pool("slow")])
+    );
+    assert_eq!(k.group.as_deref(), Some("team-a"));
+    assert_eq!(k.labels.get("env").map(String::as_str), Some("prod"));
+    assert_eq!(k.revision, 40);
+    assert_eq!(
+        (
+            k.idp_subject.clone(),
+            k.binding_mode.clone(),
+            k.minted_by.clone()
+        ),
+        (None, None, None),
+        "a pre-field key reads the new fields as None"
+    );
+    assert_eq!(
+        store.get_key("vk_old_all").unwrap().unwrap().allowed_scopes,
+        None
+    );
+    assert_eq!(
+        store
+            .get_key("vk_old_none")
+            .unwrap()
+            .unwrap()
+            .allowed_scopes,
+        Some(vec![])
+    );
+    assert!(store
+        .get_key("vk_old_dead")
+        .unwrap()
+        .unwrap()
+        .deleted_at
+        .is_some());
+    assert_eq!(store.list_keys().unwrap().len(), 4);
+    let cred = store
+        .lookup_credential_secret("sigv4", "AKIA_OLD15")
+        .unwrap()
+        .expect("the 1.5 credential survives");
+    assert_eq!(cred.secret, "v1:plain:old");
+    assert_eq!(
+        store.list_denylist().unwrap(),
+        vec!["vk_old_dead".to_string()]
+    );
+    let usage = store.get_usage("vk_old_pools", 3000).unwrap();
+    assert_eq!((usage.requests, usage.billable_requests), (9, 8));
+    assert_eq!(usage.models.len(), 1);
+    assert_eq!(
+        usage.models[0].usage_units,
+        units(&[
+            (UNIT_INPUT, 100),
+            (UNIT_OUTPUT, 50),
+            (UNIT_CACHE_READ, 7),
+            (UNIT_CACHE_WRITE, 3)
+        ]),
+        "the four token columns ARE the reserved units — no data migration, nothing lost"
+    );
+    let meter = store.list_metering(20_260_731).unwrap();
+    assert_eq!(meter.len(), 1);
+    assert_eq!(
+        (
+            meter[0].requests,
+            meter[0].tokens_input,
+            meter[0].priced_from_ms
+        ),
+        (4, 40, 0),
+        "a 1.5 metering cell reads back unchanged, dated at the opening card (0)"
+    );
+    assert_eq!(store.list_audit().unwrap().len(), 1);
+
+    // The revision counter carried over: a new write stamps PAST every 1.5 revision.
+    store.put_key(&sample_key("vk_new16", "g")).unwrap();
+    assert!(store.get_key("vk_new16").unwrap().unwrap().revision > 41);
+
+    // The re-keyed metering table accepts a second cell for the same day on a later card, and the
+    // 1.5 cell keeps accumulating under priced_from_ms = 0.
+    store
+        .add_metering(&metering_delta("vk_old_pools", 20_260_731, 0))
+        .unwrap();
+    store
+        .add_metering(&metering_delta(
+            "vk_old_pools",
+            20_260_731,
+            1_780_000_000_000,
+        ))
+        .unwrap();
+    let mut meter = store.list_metering(20_260_731).unwrap();
+    meter.sort_by_key(|r| r.priced_from_ms);
+    assert_eq!(meter.len(), 2);
+    assert_eq!(meter[0].requests, 5, "the 1.5 cell accumulates in place");
+    // The new tables are live.
+    store
+        .upsert_plane_record(&active_task("t_after_upgrade", "working", TASK_LIVE_TS))
+        .unwrap();
+    assert!(store
+        .get_plane_record("task", "t_after_upgrade")
+        .unwrap()
+        .is_some());
+    assert!(store
+        .redeem_plane_token("ask", "n_after_upgrade", TRUST_NOW + 900, TRUST_NOW)
+        .unwrap());
+
+    let mut c = db.conn();
+    let version: Option<String> = c
+        .query_first("SELECT v FROM store_meta WHERE k = 'schema_version'")
+        .unwrap();
+    assert_eq!(
+        version.as_deref(),
+        Some(SCHEMA_VERSION.to_string().as_str())
+    );
+    drop(store);
+
+    // A second boot is a no-op: nothing re-runs destructively, every row is still there.
+    let again = MysqlStore::connect(&db.url).expect("a second boot of an upgraded database");
+    assert_eq!(again.list_keys().unwrap().len(), 5);
+    assert_eq!(again.list_metering(20_260_731).unwrap().len(), 2);
+    assert!(again
+        .get_plane_record("task", "t_after_upgrade")
+        .unwrap()
+        .is_some());
+}
+
+/// A pre-release 1.6.0 development database (v4..v6) carried plane state in per-protocol tables.
+/// The v7 crossing carries tasks, their event chains, demotions and spent approvals into the neutral
+/// tables in the envelope the engine reads, ONCE; it drops nothing; and a later boot does not
+/// re-copy (which would resurrect a demotion the engine has since cleared).
+#[test]
+fn a_v6_development_database_carries_its_plane_state_across_once() {
+    let _ddl_guard = lock_fresh_database_ddl();
+    let Some(db) = ScratchDb::new("up6") else {
+        return;
+    };
+    {
+        let mut c = db.conn();
+        for stmt in schema_fixtures::V1_0_6_SCHEMA
+            .iter()
+            .chain(schema_fixtures::V6_PLANE_TABLES)
+        {
+            c.query_drop(*stmt).unwrap();
+        }
+        for stmt in [
+            "INSERT INTO store_meta (k, v) VALUES ('schema_version', '6')",
+            "INSERT INTO store_sequence (id, revision) VALUES (1, 0)",
+            "INSERT INTO tasks (task_id, context_id, principal, direction, state, agent_id, \
+             artifact_cursor, push_callback, created_at, updated_at) VALUES \
+             ('t_v6_live', 'ctx', 'vk_a', 'inbound', 'input-required', 'planner', 18446744073709551615, \
+              'https://example.test/push', 100, 200), \
+             ('t_v6_done', 'ctx', 'vk_a', 'inbound', 'completed', 'planner', 0, '', 100, 150), \
+             ('t_v6_Done', 'ctx', 'vk_a', 'inbound', 'Completed', 'planner', 0, '', 100, 150)",
+            "INSERT INTO task_events (task_id, seq, ts, kind, context_id, principal, agent_id, \
+             state, request_id, prev_hash, hash) VALUES \
+             ('t_v6_live', 1, 101, 'task.submitted', 'ctx', 'vk_a', 'planner', 'submitted', 'r1', '', 'e1'), \
+             ('t_v6_live', 2, 102, 'task.working', 'ctx', 'vk_a', 'planner', 'working', 'r2', 'e1', 'e2')",
+            "INSERT INTO mcp_demotions (server, reason, recorded_at) VALUES ('srv_v6', 'tool-drift', 300)",
+            "INSERT INTO spent_ask_states (nonce, expires_at) VALUES ('nonce_v6', 18446744073709551615)",
+            "INSERT INTO mcp_calls (principal, seq, ts, prev_hash, hash, body) \
+             VALUES ('vk_a', 1, 400, '', 'c1', '{}')",
+        ] {
+            c.query_drop(stmt).unwrap();
+        }
+    }
+
+    let store = MysqlStore::connect(&db.url).expect("a v6 database must upgrade");
+
+    let live = get_task(&store, "t_v6_live").expect("the in-flight task crosses the upgrade");
+    assert_eq!(live["state"], "input-required");
+    assert_eq!(
+        live["artifact_cursor"].as_u64(),
+        Some(u64::MAX),
+        "a u64 column copies into the body without wrapping"
+    );
+    assert_eq!(live["push_callback"], "https://example.test/push");
+    assert_eq!(live["updated_at"].as_u64(), Some(200));
+    let events = events_of(&store, "t_v6_live");
+    assert_eq!(
+        events
+            .iter()
+            .map(|e| e["seq"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert_eq!(events[1]["prev_hash"], "e1");
+    assert!(
+        events[0].get("digest_version").is_none(),
+        "no digest_version is invented: the engine reads these as the framing they were sealed under"
+    );
+    // Terminality came across on the typed column: a purge takes the terminal task only — and
+    // `Completed` (not a recognised terminal token) is kept, the closed-set rule the v5 sweep had.
+    let _guard = lock_plane_purge();
+    assert_eq!(store.purge_plane_records_before("task", 1_000).unwrap(), 1);
+    let ids = all_task_ids(&store);
+    assert!(ids.contains(&"t_v6_live".to_string()));
+    assert!(ids.contains(&"t_v6_Done".to_string()));
+    assert!(!ids.contains(&"t_v6_done".to_string()));
+    drop(_guard);
+
+    assert_eq!(
+        demotions(&store),
+        vec![serde_json::json!({ "server": "srv_v6", "reason": "tool-drift", "recorded_at": 300 })],
+        "a quarantine outlives the upgrade"
+    );
+    assert!(
+        !store
+            .redeem_plane_token("ask", "nonce_v6", u64::MAX, 1_000)
+            .unwrap(),
+        "an approval spent before the upgrade stays spent"
+    );
+    // The call log is NOT copied (the engine has no decode for the pre-1.6 typed body), and NOTHING
+    // legacy is dropped.
+    assert!(store.list_plane_record_parents("call").unwrap().is_empty());
+    let mut c = db.conn();
+    for t in [
+        "tasks",
+        "task_events",
+        "mcp_demotions",
+        "spent_ask_states",
+        "mcp_calls",
+    ] {
+        let n: Option<u64> = c.query_first(format!("SELECT COUNT(*) FROM {t}")).unwrap();
+        assert!(
+            n.unwrap_or(0) > 0,
+            "legacy table {t} must be left as it was"
+        );
+    }
+
+    // The engine clears the demotion; a later boot must NOT resurrect it from the legacy table.
+    store.delete_plane_record("demotion", "srv_v6").unwrap();
+    drop(store);
+    let again = MysqlStore::connect(&db.url).expect("second boot");
+    assert!(
+        demotions(&again).is_empty(),
+        "the one-time copy must not re-run and resurrect a cleared quarantine"
+    );
 }

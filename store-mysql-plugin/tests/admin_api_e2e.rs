@@ -222,7 +222,7 @@ fn plugin_path() -> PathBuf {
     fresh
 }
 
-fn busbarai_root() -> PathBuf {
+fn busbar_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../busbar")
         .canonicalize()
@@ -230,14 +230,22 @@ fn busbarai_root() -> PathBuf {
 }
 
 fn build_real_binaries() -> (PathBuf, PathBuf) {
-    let root = busbarai_root();
+    let root = busbar_root();
     let status = Command::new("cargo")
+        // `busbar-plugin-pack` is a feature-gated `[[bin]]` of `busbar-plugin-sdk` in busbar 1.6.0
+        // (it used to be a package of its own), built the way busbar's own release workflow does.
         .args([
             "build",
             "--release",
             "-p",
             "busbar",
             "-p",
+            "busbar-plugin-sdk",
+            "--features",
+            "busbar-plugin-sdk/pack",
+            "--bin",
+            "busbar",
+            "--bin",
             "busbar-plugin-pack",
         ])
         .current_dir(&root)
@@ -247,9 +255,14 @@ fn build_real_binaries() -> (PathBuf, PathBuf) {
         status.success(),
         "building the real busbar + busbar-plugin-pack binaries must succeed"
     );
+    // The child `cargo` inherits CARGO_TARGET_DIR when one is set, so the binaries land THERE, not
+    // under the checkout's own `target/` — look where they were actually built.
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("target"));
     (
-        root.join("target/release/busbar"),
-        root.join("target/release/busbar-plugin-pack"),
+        target.join("release/busbar"),
+        target.join("release/busbar-plugin-pack"),
     )
 }
 
@@ -455,6 +468,10 @@ fn install_over_admin_api_then_mint_a_key_and_verify_mysql_directly() {
             .env("BUSBAR_PROVIDERS", &providers)
             .env("BUSBAR_ADMIN_TOKEN", admin_token)
             .env("BUSBAR_SIGNING_KEY", TEST_SIGNING_KEY)
+            // busbar 1.6.0 refuses to BOOT when a provider credential does not resolve
+            // (BUSBAR-9007), so the fixture's `env: MOCK_KEY` needs a placeholder value. The mock
+            // upstream is never called; only the reference has to resolve.
+            .env("MOCK_KEY", "e2e-placeholder-not-a-real-key")
             .env("BUSBAR_STATE_FILE", ""),
         work.join("boot1.log"),
         "boot #1 (memory store, admin listener up)",
@@ -534,6 +551,10 @@ fn install_over_admin_api_then_mint_a_key_and_verify_mysql_directly() {
             .env("BUSBAR_PROVIDERS", &providers)
             .env("BUSBAR_ADMIN_TOKEN", admin_token)
             .env("BUSBAR_SIGNING_KEY", TEST_SIGNING_KEY)
+            // busbar 1.6.0 refuses to BOOT when a provider credential does not resolve
+            // (BUSBAR-9007), so the fixture's `env: MOCK_KEY` needs a placeholder value. The mock
+            // upstream is never called; only the reference has to resolve.
+            .env("MOCK_KEY", "e2e-placeholder-not-a-real-key")
             .env("BUSBAR_STATE_FILE", ""),
         work.join("boot2.log"),
         "boot #2 (mysql store, the admin-installed plugin)",

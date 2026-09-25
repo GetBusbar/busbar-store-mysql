@@ -9,15 +9,18 @@ description = "The MySQL/MariaDB backend for busbar's durable governance store â
 license = "Apache-2.0"
 
 [dependencies]
-# INTERIM: busbarAI isn't public yet, so this is a local path dependency into a sibling checkout of
-# the monorepo. Once busbarAI ships publicly this should become a git (pinned rev/tag) or crates.io
+# INTERIM: busbar isn't public yet, so this is a local path dependency into a sibling checkout of
+# the monorepo. Once busbar ships publicly this should become a git (pinned rev/tag) or crates.io
 # dependency instead â€” same pattern already applied across every other first-party plugin.
 busbar-api = { path = "../../busbar/crates/api" }
 mysql = { version = "26", default-features = false, features = ["minimal"] }
 serde_json = "1"
 ulid = "1"
 
-# NO DEV-DEPENDENCIES. The `Store` contract conformance suite used to arrive here as
-# `busbar-plugin-testkit`; the owner ruled that crate DELETED on 2026-09-22 and #2/#31 forbid a
-# shared test util between plugins, so this crate owns its copy at `src/tests/store_conformance.rs`.
-# All it needs is `busbar-api`, which is already a normal dependency above.
+[dev-dependencies]
+# The `Store` contract conformance suite used to arrive here as `busbar-plugin-testkit`; the owner
+# ruled that crate DELETED on 2026-09-22 and #2/#31 forbid a shared test util between plugins, so
+# this crate owns its copy at `src/tests/store_conformance.rs`. Its plane-record battery serializes
+# throwaway stand-in rows into the opaque bodies it writes, which is the one thing it needs beyond
+# `busbar-api` (a normal dependency above) and `serde_json`.
+serde = { version = "1", features = ["derive"] }

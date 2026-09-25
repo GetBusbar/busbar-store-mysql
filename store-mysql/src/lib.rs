@@ -38,11 +38,16 @@ use mysql::prelude::*;
 use mysql::{params, Opts, Pool, PooledConn, TxOpts};
 
 use busbar_api::{
-    AuditRecord, CredentialMeta, CredentialSecret, McpCallRecord, McpDemotionRow, MeteringDelta,
-    MeteringRow, ModelTokens, ModelTokensDelta, ScopeRef, SecretForm, Store, StoreError,
-    StoreResult, TaskEventRow, TaskRow, TierTokens, UsageDelta, UsageLedger, VirtualKey,
+    AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, ModelTokens,
+    ModelTokensDelta, PlaneDisposition, PlaneRecord, PlaneSelector, ScopeRef, SecretForm, Store,
+    StoreError, StoreResult, UsageDelta, UsageLedger, VirtualKey, UNIT_CACHE_READ,
+    UNIT_CACHE_WRITE, UNIT_INPUT, UNIT_OUTPUT,
 };
+use std::collections::BTreeMap;
 
+/// `(key_id, model, provider, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write,
+/// requests, billable_requests, key_group_at_use, pricing_version, priced_from_ms)` as selected by
+/// `list_metering`.
 type MeteringRowTuple = (
     String,
     String,
@@ -55,48 +60,26 @@ type MeteringRowTuple = (
     u64,
     String,
     String,
+    u64,
 );
 type AuditRowTuple = (u64, u64, String, String, String, String, String, String);
 
-/// `(principal, seq, ts, prev_hash, hash, body)` as selected by `list_mcp_calls`.
-type McpCallRowTuple = (String, u64, u64, String, String, String);
+/// `(id, parent, ts, terminal, body)` — the stored columns an append's fork check compares.
+type PlaneRowTuple = (String, Option<String>, u64, bool, Vec<u8>);
 
-/// `(task_id, context_id, principal, direction, state, agent_id, artifact_cursor, push_callback,
-/// created_at, updated_at)` as selected by `get_task`/`list_tasks`.
-type TaskRowTuple = (
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-    u64,
-    String,
-    u64,
-    u64,
-);
-
-/// `(task_id, seq, ts, kind, context_id, principal, agent_id, state, request_id, prev_hash, hash)`
-/// as selected by `list_task_events`.
-type TaskEventRowTuple = (
-    String,
-    u64,
-    u64,
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-);
-
-/// The CLOSED set of terminal task states the retention sweep is allowed to drop, matching the
-/// tokens the trait's `TaskRow::state` documents. Closed in the SAFE direction on purpose: a state
-/// token minted by a NEWER engine than this build is not in the list, so it is never swept — the
-/// failure mode of guessing wrong is a row kept too long, not work destroyed.
+/// The CLOSED set of terminal task states the ONE-TIME v7 copy of a pre-v7 `tasks` table uses to
+/// set the new envelope's `terminal` column (see `run_v7_plane_record_copy_if_needed`). Closed in
+/// the SAFE direction on purpose, exactly as the pre-v7 retention sweep was: a state token this
+/// build does not recognise is copied as ACTIVE, so the failure mode of guessing wrong is a row kept
+/// too long, never work destroyed. Post-v7 the engine decides terminality itself and hands it over
+/// as the envelope's typed `disposition`; this list is consulted by nothing else.
 const TERMINAL_TASK_STATES: [&str; 4] = ["completed", "failed", "canceled", "rejected"];
+
+/// The plane-record kind whose retention is TERMINAL-ONLY (see `purge_plane_records_before`), and
+/// the child kind that is swept together with it. The same two strings the reference `impl Store`s
+/// in busbar branch on; every other kind is opaque to this store.
+const KIND_TASK: &str = "task";
+const KIND_TASK_EVENT: &str = "task_event";
 
 fn store_err<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError(e.to_string())
@@ -106,19 +89,17 @@ fn store_err<E: std::fmt::Display>(e: E) -> StoreError {
 /// was AT before this boot" against this constant to decide which one-time migration steps below
 /// have already run, and `"1" < "2"` string-comparison stops being safe the moment version numbers
 /// reach two digits.
-/// v4: the durable MCP TOOL-CALL LOG (`mcp_calls`). PURELY ADDITIVE and needs no migration step —
-/// the table and its index are new, so their `SCHEMA` statements (run on every boot, with the
-/// duplicate-object error swallowed) are the entire migration. Nothing is dropped and no existing
-/// row is touched, which is why no `V4_*` constant joins the two below.
-/// v5: the durable A2A TASK STORE (`tasks`, `task_events`). Additive on exactly the same terms as
-/// v4 — two new tables and one new index, so their `SCHEMA` statements ARE the migration, nothing is
-/// dropped and no existing row is touched. No `V5_*` constant either, for the same reason.
-/// v6: the durable TRUST STATE (`mcp_demotions`, `spent_ask_states`) — the recorded quarantine of an
-/// upstream that drifted from what the operator approved, and the ledger that makes a single-use
-/// human approval single-use across a restart and across a fleet. Additive on exactly the same terms
-/// as v4 and v5: two new tables and one new index, so their `SCHEMA` statements ARE the migration.
-/// No `V6_*` constant either.
-const SCHEMA_VERSION: u32 = 6;
+/// v4..v6 (never in a released build): per-protocol durable tables -- `mcp_calls` (v4), `tasks` +
+/// `task_events` (v5), `mcp_demotions` + `spent_ask_states` (v6) -- behind typed `Store` methods
+/// (`append_mcp_call`, `put_task`, `redeem_ask_state`, ...) that busbar 1.6.0 deleted.
+/// v7: busbar 1.6.0's store interface. The typed per-protocol methods collapsed onto eight neutral
+/// KIND-TAGGED verbs over an opaque `PlaneRecord` envelope, so the per-protocol tables above give
+/// way to ONE `plane_records` table plus the `plane_tokens` single-use ledger. `VirtualKey` gained
+/// `idp_subject`/`binding_mode`/`minted_by` and non-`pool` scope kinds, `ModelTokens` became a
+/// name-keyed `usage_units` map, and a metering cell is now keyed by `priced_from_ms` as well
+/// (DECISION #79) and carries open `usage_units`. Every existing table is upgraded IN PLACE and no
+/// existing row is dropped or rewritten -- see `run_v7_upgrade`. A released 1.5.x database is v3.
+const SCHEMA_VERSION: u32 = 7;
 
 /// The version each one-time migration step targets crossing INTO — named so a gate reads as "did
 /// this database predate step N" rather than a bare magic number, and so a future step can't be
@@ -127,6 +108,7 @@ const SCHEMA_VERSION: u32 = 6;
 /// version boundary it actually closes).
 const V2_BILLABLE_REQUESTS_BACKFILL: u32 = 2;
 const V3_KEY_GROUP_AT_USE_ASCII_BIN: u32 = 3;
+const V7_PLANE_RECORDS: u32 = 7;
 
 const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS store_meta (
@@ -151,6 +133,10 @@ const SCHEMA: &[&str] = &[
         expires_at BIGINT UNSIGNED NULL,
         deleted_at BIGINT UNSIGNED NULL,
         revision BIGINT NOT NULL DEFAULT 0,
+        allowed_scopes_ext JSON NULL,
+        idp_subject TEXT NULL,
+        binding_mode TEXT NULL,
+        minted_by TEXT NULL,
         CONSTRAINT ck_api_keys_tombstone CHECK (deleted_at IS NULL OR enabled = FALSE),
         CONSTRAINT ck_api_keys_expiry CHECK (expires_at IS NULL OR expires_at > created_at),
         CONSTRAINT ck_api_keys_labels_json CHECK (JSON_VALID(labels)),
@@ -219,7 +205,8 @@ const SCHEMA: &[&str] = &[
         tokens_output BIGINT UNSIGNED NOT NULL DEFAULT 0,
         tokens_cache_read BIGINT UNSIGNED NOT NULL DEFAULT 0,
         tokens_cache_write BIGINT UNSIGNED NOT NULL DEFAULT 0,
-        PRIMARY KEY (key_id, bucket, model, provider),
+        priced_from_ms BIGINT UNSIGNED NOT NULL DEFAULT 0,
+        PRIMARY KEY (key_id, bucket, model, provider, priced_from_ms),
         CONSTRAINT fk_metering_key FOREIGN KEY (key_id) REFERENCES api_keys(id) ON DELETE RESTRICT
     ) ENGINE=InnoDB",
     "CREATE INDEX idx_metering_bucket ON usage_metering (bucket)",
@@ -234,201 +221,110 @@ const SCHEMA: &[&str] = &[
         hash CHAR(64) NOT NULL DEFAULT ''
     ) ENGINE=InnoDB",
     "CREATE INDEX idx_audit_resource_seq ON audit_log (resource, seq)",
-    // The DURABLE MCP TOOL-CALL LOG. A DIFFERENT POPULATION from audit_log, kept in its own table
-    // on purpose: audit_log is the low-rate admin MUTATION log whose engine-side working set is a
-    // bounded ring, while a tool call is data-plane traffic at request rate. Pouring one into the
-    // other means a busy afternoon of tool calls evicts every admin row from the ring, so the
-    // question of who changed a registration becomes unanswerable exactly when an incident makes
-    // somebody ask.
+    // ── v7 (busbar 1.6.0) ─────────────────────────────────────────────────────────────────────
     //
-    // The chain is scoped to the PRINCIPAL, which is why (principal, seq) is the primary key and
-    // not a global counter: a global chain would serialise every caller behind one append and would
-    // make one caller's evidence unverifiable without possessing every other caller's rows.
+    // THE NEUTRAL PLANE-RECORD TABLE. One table for every kind the engine's planes persist (`task`,
+    // `task_event`, `call`, `demotion`, `push_config`, and any kind a plane registers later),
+    // because busbar 1.6.0 names a durable record by its KIND STRING rather than by a per-protocol
+    // `Store` method. `body` is the plane's OPAQUE serialized row: this store persists it and hands
+    // it back BYTE-FOR-BYTE and never decodes it. Everything the store itself needs -- identity,
+    // ordering, retention -- rides on the TYPED sidecar columns instead.
     //
-    // SHAPE: opaque body plus only the columns a query needs. principal and ts are the index
-    // columns (scoped read, and the retention sweep's age key). The CHAIN COLUMNS -- seq,
-    // prev_hash, hash -- are REAL columns rather than being buried in the body, because the engine
-    // establishes durability by READING THE CHAIN BACK and verifying it; a digest reachable only by
-    // decoding an opaque payload forces a deserialise per verify and cannot be constrained or
-    // indexed by the database. The store NEVER computes or recomputes a digest -- it persists what
-    // it was handed and returns it verbatim.
+    // IDENTITY is `(kind, ident, seq)`, the same key busbar's reference stores use: `ident` is the
+    // record's `parent` when it is an APPENDED child (a chain position is `(parent, seq)`), else its
+    // own `id` at seq 0. So an upsert kind is one row per id, and an append kind is one row per
+    // chain position -- one primary key serves the point read, the upsert and the fork check.
     //
-    // principal is VARCHAR(191), not the 255 audit_log uses for its own principal column: this one
-    // is half of a PRIMARY KEY, and 191 is the utf8mb4 length that keeps a keyed column inside the
-    // index limit on the older/utf8mb4-3072-byte configurations this store still supports (the same
-    // reason store_meta.k is 191).
+    // COLLATE utf8mb4_bin on every key column, for the reason the v4..v6 tables carried it: this
+    // schema's default collation is utf8mb4_0900_ai_ci -- CASE- AND ACCENT-INSENSITIVE -- under which
+    // two task ids, two principals or two upstreams differing only in case COLLIDE ON THE PRIMARY
+    // KEY: one silently upserts onto the other, a scoped read hands one caller another caller's
+    // chain, and an append is reported as a "fork" of a chain it never wrote. Binary rather than
+    // `CHARACTER SET ascii` because an id is an opaque protocol-supplied string that may be
+    // non-ASCII, and ascii would HARD-FAIL that write under STRICT_ALL_TABLES. VARCHAR(191) on the
+    // keyed columns is the utf8mb4 length that keeps a key inside the index limit on the older
+    // 3072-byte configurations this store still supports (the same reason store_meta.k is 191).
     //
-    // COLLATE utf8mb4_bin on `principal`, and it is load-bearing for exactly the reason it is on
-    // `tasks.task_id`. This schema's default collation is utf8mb4_0900_ai_ci -- CASE- AND
-    // ACCENT-INSENSITIVE -- and `principal` is BOTH half of the PRIMARY KEY and the ONLY predicate
-    // `list_mcp_calls` filters on. Under the default collation two busbar key ids differing only in
-    // case are the SAME key to the server: `list_mcp_calls` hands one caller ANOTHER CALLER'S
-    // tool-call evidence, and the second caller's first append collides on the primary key and is
-    // reported back as a "fork" of a chain it has never written to. A key id is an opaque
-    // identifier, never a word, and nothing in the contract makes `vk_A` and `vk_a` one caller.
-    // Binary rather than `CHARACTER SET ascii` for the same reason as `tasks.task_id`: a key id may
-    // legitimately be non-ASCII, and ascii would HARD-FAIL that write under STRICT_ALL_TABLES.
-    // `principals_differing_only_in_case_are_distinct_chains` pins it.
-    "CREATE TABLE IF NOT EXISTS mcp_calls (
-        principal VARCHAR(191) COLLATE utf8mb4_bin NOT NULL,
+    // `terminal` is the envelope's `PlaneDisposition` as a typed column, because retention has to
+    // read it: the `task` kind drops only TERMINAL rows older than the cutoff (an interrupted task
+    // waiting on a human is exactly the old row that must survive), and a backend that had to decode
+    // the body to learn that would be a backend that names a plane's row type.
+    //
+    // BIGINT UNSIGNED for `seq`/`ts`, as for every other u64 here: the full u64 range round-trips
+    // and there is no value the contract can hand this backend that it must refuse or mangle.
+    //
+    // NO FOREIGN KEY between a parent's rows and its children's, deliberately: the engine's
+    // write-throughs state no ORDER between a task's first upsert and its first event, and a DELETE
+    // trigger needs SUPER on a binlog-enabled server, which the app-level user does not hold. The
+    // one cascade this store owes (a purged task takes its event chain with it) lives in
+    // `purge_plane_records_before`, in the same transaction as the parent delete.
+    "CREATE TABLE IF NOT EXISTS plane_records (
+        kind VARCHAR(64) COLLATE utf8mb4_bin NOT NULL,
+        ident VARCHAR(191) COLLATE utf8mb4_bin NOT NULL,
         seq BIGINT UNSIGNED NOT NULL,
+        id VARCHAR(191) COLLATE utf8mb4_bin NOT NULL,
+        parent VARCHAR(191) COLLATE utf8mb4_bin NULL,
         ts BIGINT UNSIGNED NOT NULL,
-        prev_hash CHAR(64) NOT NULL DEFAULT '',
-        hash CHAR(64) NOT NULL DEFAULT '',
-        body TEXT NOT NULL,
-        -- Carried now, written by nothing yet, and deliberately so: adding a column to a populated
-        -- table later is a rewrite, whereas carrying it from the first migration is free. `version`
-        -- is the compare-and-swap slot an optimistic-concurrency write would test; `expires_at` is
-        -- the per-row sweep deadline. Retention today goes by `ts` (see purge_mcp_calls_before).
-        expires_at BIGINT UNSIGNED NULL,
-        version BIGINT UNSIGNED NOT NULL DEFAULT 0,
-        PRIMARY KEY (principal, seq)
+        terminal BOOLEAN NOT NULL DEFAULT FALSE,
+        body LONGBLOB NOT NULL,
+        PRIMARY KEY (kind, ident, seq)
     ) ENGINE=InnoDB",
-    // The retention sweep's access path: purge_mcp_calls_before deletes by ts across every
-    // principal. No IF NOT EXISTS -- MySQL has no such form for CREATE INDEX; a re-run's duplicate
-    // error is swallowed by try_init_schema, exactly as it is for idx_audit_resource_seq.
-    "CREATE INDEX idx_mcp_calls_ts ON mcp_calls (ts)",
-    // THE DURABLE A2A TASK STORE. A2A is async BY DESIGN: a task spans turns, can sit interrupted
-    // waiting on a human, and can outlive the process that started it. An in-memory task table
-    // therefore loses every in-flight task on restart, which is the difference between a resume that
-    // is real and one that is nominal.
+    // The retention sweep's access path: `purge_plane_records_before` deletes by (kind, ts < cutoff).
+    // No IF NOT EXISTS -- MySQL has no such form for CREATE INDEX; a re-run's duplicate error is
+    // swallowed by try_init_schema, exactly as it is for every other index here.
+    "CREATE INDEX idx_plane_records_kind_ts ON plane_records (kind, ts)",
+    // THE SINGLE-USE TOKEN LEDGER (`redeem_plane_token`) -- the durable record that makes a
+    // confirm-once approval execute once across a restart AND across the nodes of a fleet. A sealed
+    // token is valid bytes on its second presentation exactly as on its first; only a record that
+    // the first happened tells them apart, and in process memory that record dies with the process
+    // and is never shared with a second node. Keyed by `(kind, token)`, so the ledger is generic over
+    // every single-use kind rather than hard-wiring one.
     //
-    // Every TaskRow field is a REAL column rather than an opaque body, and that is the opposite of
-    // the shape mcp_calls uses, for a reason: mcp_calls is written once and read back whole, whereas
-    // these rows are the working set the engine QUERIES -- the retention sweep filters on
-    // (state, updated_at), the boot rehydrate partitions on state, and a stale artifact_cursor
-    // decides whether a resubscribe replays delivered artifacts or skips undelivered ones. A field
-    // reachable only by decoding a blob can be neither indexed nor constrained.
-    //
-    // Every u64 is BIGINT UNSIGNED, as every other u64 in this schema already is, so the FULL u64
-    // range round-trips and there is no value the contract can hand this backend that it must refuse
-    // or silently mangle. Signed BIGINT would wrap `artifact_cursor` negative past i64::MAX and clamp
-    // it back on read -- a row that does not read back as itself, with no error ever reported.
-    //
-    // `state` is deliberately UNCONSTRAINED (no CHECK, no ENUM): a task state token minted by a
-    // NEWER engine than the one this schema was written against must store and read back verbatim.
-    // Only the retention sweep's TERMINAL_TASK_STATES list is a closed set, and it is closed in the
-    // safe direction -- an unrecognised token is never swept.
-    //
-    // COLLATE utf8mb4_bin on `task_id` and `state`, and it is load-bearing on both. This schema's
-    // default collation is utf8mb4_0900_ai_ci -- CASE- AND ACCENT-INSENSITIVE -- under which
-    // `'Completed' IN ('completed', ...)` is TRUE and two task ids differing only in case COLLIDE
-    // ON THE PRIMARY KEY. That defeats both guarantees this table is supposed to make: the terminal
-    // set would sweep a state token it does not actually recognise (the exact failure the closed set
-    // exists to prevent), and two distinct tasks would silently upsert onto one row, losing one of
-    // them. Binary rather than `CHARACTER SET ascii` because a task id is an opaque
-    // protocol-supplied string: ascii would HARD-FAIL a non-ASCII id under STRICT_ALL_TABLES,
-    // whereas utf8mb4_bin stores the full range and still compares exactly. Same class of bug the
-    // v3 migration closed for `usage_metering.key_group_at_use`.
-    //
-    // The other columns keep the default collation on purpose: this store only ever stores them and
-    // returns them verbatim, and never compares one against a literal.
-    "CREATE TABLE IF NOT EXISTS tasks (
-        task_id VARCHAR(191) COLLATE utf8mb4_bin NOT NULL,
-        context_id VARCHAR(191) NOT NULL DEFAULT '',
-        principal VARCHAR(191) NOT NULL DEFAULT '',
-        direction VARCHAR(16) NOT NULL DEFAULT '',
-        state VARCHAR(64) COLLATE utf8mb4_bin NOT NULL DEFAULT '',
-        agent_id VARCHAR(191) NOT NULL DEFAULT '',
-        artifact_cursor BIGINT UNSIGNED NOT NULL DEFAULT 0,
-        -- TEXT, not VARCHAR(n): a push callback is an operator-supplied URL with no length this
-        -- schema can honestly bound, and under STRICT_ALL_TABLES a guessed-too-short ceiling is a
-        -- hard write failure on a task that was otherwise fine. Never indexed, never matched on.
-        push_callback TEXT NOT NULL,
-        created_at BIGINT UNSIGNED NOT NULL,
-        updated_at BIGINT UNSIGNED NOT NULL,
-        PRIMARY KEY (task_id)
-    ) ENGINE=InnoDB",
-    // The retention sweep's access path -- purge_tasks_before filters on exactly (state, updated_at)
-    // -- in that column order, because the sweep names a closed set of states and then a range on
-    // updated_at, and an index is only usable for a range on its LAST consulted column.
-    "CREATE INDEX idx_tasks_state_updated ON tasks (state, updated_at)",
-    // PER-TASK PROVENANCE, hash-chained WITHIN a task. Per-task rather than one global chain because
-    // tasks are concurrent and long-lived: a global chain would serialise every task transition
-    // behind one append and would make one task's provenance unverifiable without possessing every
-    // other tenant's events. The chain columns -- seq, prev_hash, hash -- are REAL columns for the
-    // same reason they are in mcp_calls: durability here is established by READING THE CHAIN BACK,
-    // and this store NEVER computes or recomputes a digest.
-    //
-    // NO FOREIGN KEY to `tasks`, deliberately, even though the purge cascade below is exactly what
-    // one would buy. An FK would also impose an ORDER on the writes -- no event could be appended
-    // before its task row existed -- and the engine is under no such obligation: a `task.submitted`
-    // event and the first `put_task` are two independent write-throughs and the contract states no
-    // ordering between them. A DELETE trigger, which is how store-sqlite gets the cascade without
-    // the ordering constraint, is not available here either: creating one needs SUPER (ER_NOT_SUPER,
-    // 1419) on any server with binary logging on, which the mysql:8 image CI runs has by default and
-    // the app-level `busbar` user does not hold. So the cascade lives in `purge_tasks_before`, in the
-    // same transaction as the parent delete -- see that method.
-    "CREATE TABLE IF NOT EXISTS task_events (
-        task_id VARCHAR(191) COLLATE utf8mb4_bin NOT NULL,
-        seq BIGINT UNSIGNED NOT NULL,
-        ts BIGINT UNSIGNED NOT NULL,
-        kind VARCHAR(64) NOT NULL DEFAULT '',
-        context_id VARCHAR(191) NOT NULL DEFAULT '',
-        principal VARCHAR(191) NOT NULL DEFAULT '',
-        agent_id VARCHAR(191) NOT NULL DEFAULT '',
-        state VARCHAR(64) NOT NULL DEFAULT '',
-        request_id VARCHAR(191) NOT NULL DEFAULT '',
-        prev_hash CHAR(64) NOT NULL DEFAULT '',
-        hash CHAR(64) NOT NULL DEFAULT '',
-        PRIMARY KEY (task_id, seq)
-    ) ENGINE=InnoDB",
-    // THE DURABLE MCP DEMOTION RECORD. An engine demotes a registered upstream when the tool list it
-    // is currently serving disagrees with what the operator approved. That decision is derived in
-    // memory from a LIVE OBSERVATION, and a process that has taken no observation has nothing to
-    // derive it from -- a server nobody has looked at serves against the digest the operator wrote
-    // down, which is the declarative-approval behaviour every deployment without a live refresh
-    // depends on. Those two facts together are why this table exists: without it a restart hands a
-    // quarantined upstream its approval back until the next unattended sweep looks again.
-    //
-    // ONE ROW PER UPSTREAM, keyed by the operator's local registration id and upserted, so a second
-    // demotion of one server replaces the row rather than standing a rival one beside it. Carries no
-    // secret: `reason` is an engine-chosen word for an operator to read, never caller text.
-    //
-    // COLLATE utf8mb4_bin on `server`, and it is load-bearing for the reason it is on
-    // `tasks.task_id`. This schema's default collation is utf8mb4_0900_ai_ci -- CASE- AND
-    // ACCENT-INSENSITIVE -- under which two DISTINCT registered upstreams whose ids differ only in
-    // case collide on the PRIMARY KEY: quarantining one silently overwrites the other's record, and
-    // clearing one clears both. A registration id is an opaque operator-chosen string, never a word.
-    // Binary rather than `CHARACTER SET ascii` for the same reason `tasks.task_id` is: an id may
-    // legitimately be non-ASCII, and ascii would HARD-FAIL that write under STRICT_ALL_TABLES.
-    //
-    // VARCHAR(191) because the column is the PRIMARY KEY: 191 is the utf8mb4 length that keeps a
-    // keyed column inside the index limit on the older/utf8mb4-3072-byte configurations this store
-    // still supports (the same reason `store_meta.k` and `mcp_calls.principal` are 191).
-    //
-    // BIGINT UNSIGNED for `recorded_at`, matching every other timestamp in this schema: it holds the
-    // whole u64 range, so this backend never has to refuse or clamp a value the signed-BIGINT
-    // backends cannot store.
-    "CREATE TABLE IF NOT EXISTS mcp_demotions (
-        server VARCHAR(191) COLLATE utf8mb4_bin NOT NULL,
-        reason VARCHAR(191) NOT NULL DEFAULT '',
-        recorded_at BIGINT UNSIGNED NOT NULL,
-        PRIMARY KEY (server)
-    ) ENGINE=InnoDB",
-    // THE DURABLE SPENT-APPROVAL LEDGER. A sealed, single-use approval is what makes a confirm-once
-    // tool execute once, and the seal itself cannot carry that property: the second presentation of
-    // a redeemed approval is byte-identical to the first and verifies just as well. Only a RECORD
-    // THAT THE FIRST HAPPENED tells them apart, and in process memory that record dies with the
-    // process and is never shared with a second node -- while two nodes of one deployment share the
-    // signing key, and therefore share the seal. Here it is one ledger for the whole deployment.
-    //
-    // COLLATE utf8mb4_bin on `nonce` is the SHARPEST instance of the collation hazard in this file.
-    // Under the schema default the primary key stops distinguishing a nonce from its case- or
-    // accent-variants, so a ledger whose entire job is telling one approval from another would
-    // REFUSE a genuinely fresh approval -- the gate breaking for an operator who did nothing wrong --
-    // while folding an attacker's near-miss variants onto one row. Byte-exact is the only correct
-    // comparison for a random token, and it is stated rather than inherited.
-    "CREATE TABLE IF NOT EXISTS spent_ask_states (
-        nonce VARCHAR(191) COLLATE utf8mb4_bin NOT NULL,
+    // COLLATE utf8mb4_bin on the key is the SHARPEST instance of the collation hazard in this file:
+    // under the schema default the primary key stops telling a token from its case variants, so a
+    // genuinely fresh approval would be REFUSED while an attacker's near-miss variants fold onto one
+    // row. Byte-exact is the only correct comparison for a random token.
+    "CREATE TABLE IF NOT EXISTS plane_tokens (
+        kind VARCHAR(64) COLLATE utf8mb4_bin NOT NULL,
+        token VARCHAR(191) COLLATE utf8mb4_bin NOT NULL,
         expires_at BIGINT UNSIGNED NOT NULL,
-        PRIMARY KEY (nonce)
+        PRIMARY KEY (kind, token)
     ) ENGINE=InnoDB",
     // The eviction sweep's access path. Without it the sweep's `expires_at < :now` is a full table
-    // scan, and a scan under InnoDB's REPEATABLE READ takes a lock on every row it visits -- which
-    // on the one table every concurrent redemption in the fleet touches is how a sweep turns into a
-    // lock-wait storm between nodes that have nothing to do with each other.
-    "CREATE INDEX idx_spent_ask_states_expires ON spent_ask_states (expires_at)",
+    // scan, and a scan under InnoDB's REPEATABLE READ takes a lock on every row it visits -- which on
+    // the one table every concurrent redemption in the fleet touches is a lock-wait storm.
+    "CREATE INDEX idx_plane_tokens_expires ON plane_tokens (expires_at)",
+    // THE OPEN USAGE UNITS of a budget window. busbar 1.6.0 made `ModelTokens` a name-keyed
+    // `usage_units` map: the reserved four (`input`/`output`/`cache_read`/`cache_write`) keep their
+    // existing `usage_windows` columns -- so a v3 row reads back unchanged with no data migration --
+    // and every OTHER unit a plane declares (`tool_calls`, `bytes`, a rerank's search units, ...)
+    // lands here, one row per (window, bucket, model, unit), so `add_usage` stays one atomic
+    // `count = count + delta` upsert per unit rather than a read-modify-write of a JSON blob.
+    // `unit` is utf8mb4_bin: two unit names differing in case are two counters, never one.
+    "CREATE TABLE IF NOT EXISTS usage_window_units (
+        window_start BIGINT UNSIGNED NOT NULL,
+        bucket_scope VARCHAR(8) NOT NULL,
+        bucket_id VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+        model VARCHAR(256) NOT NULL,
+        unit VARCHAR(128) COLLATE utf8mb4_bin NOT NULL,
+        count BIGINT UNSIGNED NOT NULL DEFAULT 0,
+        PRIMARY KEY (window_start, bucket_scope, bucket_id, model, unit)
+    ) ENGINE=InnoDB",
+    // THE OPEN USAGE UNITS of a metering cell -- every ledgered class the token columns do not hold
+    // (`MeteringRow::usage_units`), additive like them. Keyed by the metering cell's own key plus the
+    // unit. No foreign key: the parent cell is written first in the same transaction, and
+    // `purge_metering_before` removes both.
+    "CREATE TABLE IF NOT EXISTS usage_metering_units (
+        bucket CHAR(10) NOT NULL,
+        key_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+        provider VARCHAR(128) NOT NULL,
+        model VARCHAR(256) NOT NULL,
+        priced_from_ms BIGINT UNSIGNED NOT NULL DEFAULT 0,
+        unit VARCHAR(128) COLLATE utf8mb4_bin NOT NULL,
+        count BIGINT UNSIGNED NOT NULL DEFAULT 0,
+        PRIMARY KEY (key_id, bucket, model, provider, priced_from_ms, unit)
+    ) ENGINE=InnoDB",
+    "CREATE INDEX idx_metering_units_bucket ON usage_metering_units (bucket)",
 ];
 
 /// MySQL/MariaDB-backed [`Store`]. A single mutex-guarded pooled connection is used for all control-
@@ -484,12 +380,24 @@ impl MysqlStore {
     /// transaction is safe to retry — DDL here is idempotent via the `IF NOT EXISTS`/duplicate-error
     /// swallowing below), not a crash.
     fn init_schema(pool: &Pool) -> StoreResult<()> {
-        const MAX_ATTEMPTS: u32 = 5;
+        const MAX_ATTEMPTS: u32 = 8;
         for attempt in 1..=MAX_ATTEMPTS {
             match Self::try_init_schema(pool) {
                 Ok(()) => return Ok(()),
                 Err(e) if attempt < MAX_ATTEMPTS && e.0.contains("Deadlock found") => {
-                    std::thread::sleep(std::time::Duration::from_millis(50 * attempt as u64));
+                    // Linear backoff plus a per-process/per-thread jitter, so two booters that
+                    // deadlocked once do not retry in lockstep and deadlock again.
+                    let jitter = {
+                        use std::hash::{Hash, Hasher};
+                        let mut h = std::collections::hash_map::DefaultHasher::new();
+                        std::thread::current().id().hash(&mut h);
+                        std::process::id().hash(&mut h);
+                        attempt.hash(&mut h);
+                        h.finish() % 50
+                    };
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        50 * attempt as u64 + jitter,
+                    ));
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -499,7 +407,7 @@ impl MysqlStore {
     }
 
     /// v2 one-time backfill, closing the SAME `hydrate_budgets` billing bug store-postgres's own v6
-    /// backfill closes (busbarAI core's `crates/busbar/src/governance/state.rs`): pre-v2 rows may
+    /// backfill closes (busbar core's `crates/busbar/src/governance/state.rs`): pre-v2 rows may
     /// have `billable_requests = 0` alongside a real, positive `requests` count purely because this
     /// store didn't track the split before v2, never because of a genuine refund/discount. Trusting
     /// `billable_requests` unconditionally (as `hydrate_budgets` now does) needs those historical
@@ -600,6 +508,213 @@ impl MysqlStore {
         Ok(())
     }
 
+    /// Whether `table` exists in the connected database. `DATABASE()` scopes the lookup to this
+    /// store's own schema, so a same-named table in a sibling database on the server never answers.
+    fn table_exists(conn: &mut PooledConn, table: &str) -> StoreResult<bool> {
+        let n: Option<u64> = conn
+            .exec_first(
+                "SELECT COUNT(*) FROM information_schema.tables \
+                 WHERE table_schema = DATABASE() AND table_name = :t",
+                params! { "t" => table },
+            )
+            .map_err(store_err)?;
+        Ok(n.unwrap_or(0) > 0)
+    }
+
+    /// Whether index `index` exists on `table` in the connected database.
+    fn index_exists(conn: &mut PooledConn, table: &str, index: &str) -> StoreResult<bool> {
+        let n: Option<u64> = conn
+            .exec_first(
+                "SELECT COUNT(*) FROM information_schema.statistics \
+                 WHERE table_schema = DATABASE() AND table_name = :t AND index_name = :i",
+                params! { "t" => table, "i" => index },
+            )
+            .map_err(store_err)?;
+        Ok(n.unwrap_or(0) > 0)
+    }
+
+    /// Whether `table.column` exists in the connected database.
+    fn column_exists(conn: &mut PooledConn, table: &str, column: &str) -> StoreResult<bool> {
+        let n: Option<u64> = conn
+            .exec_first(
+                "SELECT COUNT(*) FROM information_schema.columns \
+                 WHERE table_schema = DATABASE() AND table_name = :t AND column_name = :c",
+                params! { "t" => table, "c" => column },
+            )
+            .map_err(store_err)?;
+        Ok(n.unwrap_or(0) > 0)
+    }
+
+    /// ADD `column` to `table` unless it is already there. MySQL has no `ADD COLUMN IF NOT EXISTS`,
+    /// so the check is explicit; a node booting concurrently can still win the race between the
+    /// check and the ALTER, and its `ER_DUP_FIELDNAME` (1060) is exactly "already there", so it is
+    /// swallowed. Every other error propagates.
+    fn ensure_column(
+        conn: &mut PooledConn,
+        table: &str,
+        column: &str,
+        definition: &str,
+    ) -> StoreResult<()> {
+        if Self::column_exists(conn, table, column)? {
+            return Ok(());
+        }
+        match conn.query_drop(format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+        )) {
+            Ok(()) => Ok(()),
+            Err(mysql::Error::MySqlError(e)) if e.code == 1060 => Ok(()),
+            Err(e) => Err(store_err(format!(
+                "schema upgrade failed adding {table}.{column}: {e}"
+            ))),
+        }
+    }
+
+    /// v7 SCHEMA upgrade, IN PLACE and IDEMPOTENT. Gated on what the database actually HAS rather
+    /// than on `schema_version`, so it converges whatever path a database took to get here: a fresh
+    /// database already carries every column (the `CREATE TABLE`s above declare the v7 shape) and
+    /// this is four cheap no-op lookups; a released 1.5.x database (v3) gains the columns; a crash
+    /// half-way through is finished on the next boot.
+    ///
+    /// Purely ADDITIVE on `api_keys`: four NULLable trailing columns (an instant ADD on MySQL 8),
+    /// every existing row reading back exactly as before -- `NULL` is `None` for every new field,
+    /// which is what the 1.6.0 contract says a pre-field key reads as.
+    ///
+    /// `usage_metering` gains `priced_from_ms` (DEFAULT 0) AND it joins the PRIMARY KEY, because
+    /// DECISION #79 makes it part of the accrual key: a rate-card edit inside a UTC day opens a
+    /// SECOND cell for that day so each half prices at the card it was earned under. Every existing
+    /// row takes `0`, which the contract defines as "the opening card", so no existing cell changes
+    /// meaning, and the old key's rows are unique under the new key by construction (one value of
+    /// the new column), so the rebuild cannot fail on a duplicate. The FK on `key_id` stays served:
+    /// the new key still leads with `key_id`, and both halves happen in ONE `ALTER` so there is no
+    /// instant where the table has no index the FK can use.
+    ///
+    /// `keys_table`/`metering_table` exist for test isolation only, like the `table` parameter on
+    /// the v2/v3 steps; production passes `"api_keys"`/`"usage_metering"`.
+    fn run_v7_schema_upgrade(
+        conn: &mut PooledConn,
+        keys_table: &str,
+        metering_table: &str,
+    ) -> StoreResult<()> {
+        Self::ensure_column(conn, keys_table, "allowed_scopes_ext", "JSON NULL")?;
+        Self::ensure_column(conn, keys_table, "idp_subject", "TEXT NULL")?;
+        Self::ensure_column(conn, keys_table, "binding_mode", "TEXT NULL")?;
+        Self::ensure_column(conn, keys_table, "minted_by", "TEXT NULL")?;
+        Self::ensure_column(
+            conn,
+            metering_table,
+            "priced_from_ms",
+            "BIGINT UNSIGNED NOT NULL DEFAULT 0",
+        )?;
+        let pk_has_it: Option<u64> = conn
+            .exec_first(
+                "SELECT COUNT(*) FROM information_schema.statistics \
+                 WHERE table_schema = DATABASE() AND table_name = :t \
+                 AND index_name = 'PRIMARY' AND column_name = 'priced_from_ms'",
+                params! { "t" => metering_table },
+            )
+            .map_err(store_err)?;
+        if pk_has_it.unwrap_or(0) == 0 {
+            conn.query_drop(format!(
+                "ALTER TABLE {metering_table} DROP PRIMARY KEY, \
+                 ADD PRIMARY KEY (key_id, bucket, model, provider, priced_from_ms)"
+            ))
+            .map_err(|e| {
+                store_err(format!(
+                    "schema upgrade failed re-keying {metering_table} on priced_from_ms: {e}"
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
+    /// v7 DATA step, ONE-TIME: carry the durable plane state a v4..v6 database holds in its
+    /// per-protocol tables into the neutral `plane_records`/`plane_tokens` tables, in the envelope
+    /// the 1.6.0 engine reads. Fires only when crossing INTO v7 from v4..v6 (`schema_version`
+    /// gated, unlike the schema step above) -- after the crossing the engine owns those rows through
+    /// the neutral verbs, and re-copying on a later boot would RESURRECT a demotion the engine has
+    /// since cleared or a task it has since purged. A released 1.5.x database is v3 and has none of
+    /// these tables, so for it this is a no-op.
+    ///
+    /// What moves, and in what shape (each body is the JSON object of the plane's own row, with the
+    /// field names the plane decodes by):
+    /// - `tasks` -> kind `task`, `ts` = `updated_at`, `terminal` from the same closed
+    ///   [`TERMINAL_TASK_STATES`] set (compared byte-exactly) the v5 sweep used;
+    /// - `task_events` -> kind `task_event`, parent = its task, keyed by `seq`. No `digest_version`
+    ///   is written, so the engine reads these as the legacy framing they were sealed under;
+    /// - `mcp_demotions` -> kind `demotion`, keyed by `server` -- a quarantine outlives the upgrade;
+    /// - `spent_ask_states` -> the `ask` kind of the token ledger -- a spent approval stays spent.
+    ///
+    /// `mcp_calls` does NOT move, deliberately: busbar 1.6.0 persists a call as a neutral
+    /// `{seq, prev_hash, hash, content}` journal body and states there is no legacy typed-body path
+    /// to decode, so a copied row would only be skipped at the next boot as unreadable. It stays
+    /// where it is. NOTHING here drops or rewrites a legacy table; they are simply no longer read.
+    ///
+    /// `ON DUPLICATE KEY UPDATE <table>.kind = <table>.kind` (a no-op), not `INSERT IGNORE`: a node booting concurrently makes
+    /// the duplicate case real, and IGNORE would also downgrade every OTHER error -- a value too long
+    /// for the new column, say -- to a warning and a silently truncated row.
+    fn run_v7_plane_record_copy_if_needed(
+        conn: &mut PooledConn,
+        prior_version: u32,
+    ) -> StoreResult<()> {
+        if !(4..V7_PLANE_RECORDS).contains(&prior_version) {
+            return Ok(());
+        }
+        if Self::table_exists(conn, "tasks")? {
+            let terminal = TERMINAL_TASK_STATES
+                .iter()
+                .map(|s| format!("'{s}'"))
+                .collect::<Vec<_>>()
+                .join(",");
+            conn.query_drop(format!(
+                "INSERT INTO plane_records (kind, ident, seq, id, parent, ts, terminal, body) \
+                 SELECT '{KIND_TASK}', task_id, 0, task_id, NULL, updated_at, \
+                        (CAST(state AS BINARY) IN ({terminal})), \
+                        CAST(JSON_OBJECT( \
+                            'task_id', task_id, 'context_id', context_id, 'principal', principal, \
+                            'direction', direction, 'state', state, 'agent_id', agent_id, \
+                            'artifact_cursor', artifact_cursor, 'push_callback', push_callback, \
+                            'created_at', created_at, 'updated_at', updated_at) AS CHAR) \
+                 FROM tasks \
+                 ON DUPLICATE KEY UPDATE plane_records.kind = plane_records.kind"
+            ))
+            .map_err(store_err)?;
+        }
+        if Self::table_exists(conn, "task_events")? {
+            conn.query_drop(format!(
+                "INSERT INTO plane_records (kind, ident, seq, id, parent, ts, terminal, body) \
+                 SELECT '{KIND_TASK_EVENT}', task_id, seq, task_id, task_id, ts, FALSE, \
+                        CAST(JSON_OBJECT( \
+                            'task_id', task_id, 'seq', seq, 'ts', ts, 'kind', kind, \
+                            'context_id', context_id, 'principal', principal, \
+                            'agent_id', agent_id, 'state', state, 'request_id', request_id, \
+                            'prev_hash', prev_hash, 'hash', hash) AS CHAR) \
+                 FROM task_events \
+                 ON DUPLICATE KEY UPDATE plane_records.kind = plane_records.kind"
+            ))
+            .map_err(store_err)?;
+        }
+        if Self::table_exists(conn, "mcp_demotions")? {
+            conn.query_drop(
+                "INSERT INTO plane_records (kind, ident, seq, id, parent, ts, terminal, body) \
+                 SELECT 'demotion', server, 0, server, NULL, recorded_at, FALSE, \
+                        CAST(JSON_OBJECT('server', server, 'reason', reason, \
+                                         'recorded_at', recorded_at) AS CHAR) \
+                 FROM mcp_demotions \
+                 ON DUPLICATE KEY UPDATE plane_records.kind = plane_records.kind",
+            )
+            .map_err(store_err)?;
+        }
+        if Self::table_exists(conn, "spent_ask_states")? {
+            conn.query_drop(
+                "INSERT INTO plane_tokens (kind, token, expires_at) \
+                 SELECT 'ask', nonce, expires_at FROM spent_ask_states \
+                 ON DUPLICATE KEY UPDATE plane_tokens.kind = plane_tokens.kind",
+            )
+            .map_err(store_err)?;
+        }
+        Ok(())
+    }
+
     /// Read the version this database was AT before this boot from `store_meta`, tolerating "no row
     /// yet" (a genuinely fresh database, or one already at v2 that never needed a marker written
     /// pre-v2) as version 0, but propagating any OTHER query failure (a connection blip, a lock
@@ -642,9 +757,21 @@ impl MysqlStore {
         let prior_version = Self::read_prior_version(&mut conn, "store_meta")?;
 
         for stmt in SCHEMA {
+            // An index that is ALREADY THERE is skipped without issuing the DDL at all. A
+            // `CREATE INDEX` that is going to fail as a duplicate still takes an exclusive
+            // metadata lock first, so every boot of an up-to-date database used to run a dozen DDL
+            // statements for nothing -- and several nodes (or this crate's parallel tests) booting
+            // at once then deadlocked on each other's metadata locks (ERROR 1213). Checking first
+            // makes a steady-state boot DDL-free apart from `CREATE TABLE IF NOT EXISTS`, which
+            // only takes a shared lock on a table that exists.
+            if let Some((index, table)) = parse_create_index(stmt) {
+                if Self::index_exists(&mut conn, table, index)? {
+                    continue;
+                }
+            }
             // IF NOT EXISTS on tables; CREATE INDEX has no IF NOT EXISTS in MySQL/MariaDB, so a
-            // "duplicate key name" error on re-run (schema already applied) is swallowed here —
-            // every other error propagates.
+            // "duplicate key name" error (a concurrent booter won the race after the check above)
+            // is swallowed here — every other error propagates.
             if let Err(e) = conn.query_drop(*stmt) {
                 let msg = e.to_string();
                 if !(msg.contains("Duplicate key name") || msg.contains("already exists")) {
@@ -657,6 +784,8 @@ impl MysqlStore {
 
         Self::run_v2_backfill_if_needed(&mut conn, prior_version, "usage_windows")?;
         Self::run_v3_ascii_bin_fix_if_needed(&mut conn, prior_version, "usage_metering")?;
+        Self::run_v7_schema_upgrade(&mut conn, "api_keys", "usage_metering")?;
+        Self::run_v7_plane_record_copy_if_needed(&mut conn, prior_version)?;
 
         conn.query_drop(
             "INSERT INTO store_meta (k, v) VALUES ('schema_version', :v) \
@@ -791,17 +920,12 @@ impl MysqlStore {
             .take("revision")
             .ok_or_else(|| store_err("missing column: revision"))?;
 
-        // `allowed_pools` is stored as a JSON array of bare pool-name strings (matching the
-        // wire/storage shape used pre-generalization and by `busbar_api`'s own `allowed_scopes_wire`
-        // serde shim) — every entry is `kind: "pool"` by construction, since "pool" is the only
-        // registered scope kind today.
-        let allowed_scopes: Option<Vec<ScopeRef>> = match allowed_pools_json {
-            Some(s) => {
-                let pools: Vec<String> = serde_json::from_str(&s).map_err(store_err)?;
-                Some(pools.into_iter().map(ScopeRef::pool).collect())
-            }
-            None => None,
-        };
+        let allowed_scopes_ext: Option<String> = row.take("allowed_scopes_ext").unwrap_or(None);
+        let idp_subject: Option<String> = row.take("idp_subject").unwrap_or(None);
+        let binding_mode: Option<String> = row.take("binding_mode").unwrap_or(None);
+        let minted_by: Option<String> = row.take("minted_by").unwrap_or(None);
+
+        let allowed_scopes = assemble_scopes(allowed_pools_json, allowed_scopes_ext)?;
         let labels = serde_json::from_str(&labels_json).map_err(store_err)?;
 
         Ok(VirtualKey {
@@ -820,6 +944,9 @@ impl MysqlStore {
             expires_at,
             deleted_at,
             revision,
+            idp_subject,
+            binding_mode,
+            minted_by,
         })
     }
 
@@ -876,6 +1003,18 @@ impl MysqlStore {
     }
 }
 
+/// `(index, table)` for a `SCHEMA` statement of the form `CREATE INDEX <index> ON <table> (...)`,
+/// else `None`.
+fn parse_create_index(stmt: &str) -> Option<(&str, &str)> {
+    let rest = stmt.trim_start().strip_prefix("CREATE INDEX ")?;
+    let mut words = rest.split_whitespace();
+    let index = words.next()?;
+    if words.next()? != "ON" {
+        return None;
+    }
+    Some((index, words.next()?))
+}
+
 fn parse_secret_form(s: &str) -> StoreResult<SecretForm> {
     match s {
         "none" => Ok(SecretForm::None),
@@ -893,18 +1032,130 @@ fn secret_form_str(f: &SecretForm) -> &'static str {
     }
 }
 
-/// Serializes `allowed_scopes` down to the `allowed_pools` column's JSON-array-of-bare-strings
-/// shape (every entry is `kind: "pool"` by construction today — see `row_to_key`'s matching
-/// deserialization for the full rationale).
-fn scopes_to_pools_json(scopes: &Option<Vec<ScopeRef>>) -> StoreResult<Option<String>> {
-    scopes
-        .as_ref()
-        .map(|list| {
-            let bare: Vec<&str> = list.iter().map(|s| s.value.as_str()).collect();
-            serde_json::to_string(&bare)
-        })
-        .transpose()
-        .map_err(store_err)
+/// The columns every key read selects, in one place so the three key reads cannot drift apart.
+const KEY_COLUMNS: &str = "id, generation_hash, name, allowed_pools, allowed_scopes_ext, labels, \
+     enabled, created_at, key_group, expires_at, deleted_at, revision, idp_subject, binding_mode, \
+     minted_by";
+
+/// PARTITION `allowed_scopes` into its two columns: `allowed_pools` (the `pool` kind, a JSON array
+/// of bare names -- byte-for-byte the v3 shape, so a 1.5.x node reading a row mid-rolling-upgrade
+/// sees exactly the pool grant it always did) and `allowed_scopes_ext` (every OTHER kind, as a JSON
+/// array of `[kind, value]` pairs).
+///
+/// This used to write ONLY the value of every scope into `allowed_pools`, whatever its kind -- so
+/// an `mcp_server` grant came back from the store as a POOL grant: the MCP grant lost AND a pool
+/// the key was never given admitted. busbar 1.6.0 ships non-`pool` kinds (`mcp_server`, `agent`),
+/// which makes that a live escalation, not a latent one. A kind is never remapped and never dropped.
+///
+/// `None` (the wildcard) writes NULL to both. An explicit grant ALWAYS writes `allowed_pools`, even
+/// as `[]`, so `Some([])` -- no scopes at all -- survives the trip and can never widen to `None`.
+fn partition_scopes(
+    scopes: &Option<Vec<ScopeRef>>,
+) -> StoreResult<(Option<String>, Option<String>)> {
+    let Some(list) = scopes else {
+        return Ok((None, None));
+    };
+    let mut pools: Vec<&str> = Vec::new();
+    let mut other: Vec<(&str, &str)> = Vec::new();
+    for s in list {
+        if s.kind == "pool" {
+            pools.push(s.value.as_str());
+        } else {
+            other.push((s.kind.as_str(), s.value.as_str()));
+        }
+    }
+    let pools_json = serde_json::to_string(&pools).map_err(store_err)?;
+    let other_json = if other.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&other).map_err(store_err)?)
+    };
+    Ok((Some(pools_json), other_json))
+}
+
+/// The exact inverse of [`partition_scopes`]. Both columns NULL is the omitted-grant wildcard;
+/// either present makes the grant an explicit, exhaustive-across-kinds list (pools first, then the
+/// other kinds in the order they were written -- `scope_allowed` is a membership test, so order is
+/// never consulted).
+fn assemble_scopes(
+    pools_json: Option<String>,
+    other_json: Option<String>,
+) -> StoreResult<Option<Vec<ScopeRef>>> {
+    if pools_json.is_none() && other_json.is_none() {
+        return Ok(None);
+    }
+    let mut list: Vec<ScopeRef> = Vec::new();
+    if let Some(p) = pools_json {
+        let pools: Vec<String> = serde_json::from_str(&p).map_err(store_err)?;
+        list.extend(pools.into_iter().map(ScopeRef::pool));
+    }
+    if let Some(o) = other_json {
+        let other: Vec<(String, String)> = serde_json::from_str(&o).map_err(store_err)?;
+        // REGISTER every non-`pool` kind this row carries with the scope-kind wire registry of the
+        // image this code runs in. When this store runs as a PLUGIN, that is the cdylib's OWN copy
+        // of the registry, which the engine's boot-time registration (`PlaneDecl.scope_kinds`) never
+        // reaches -- so a key granting an `mcp_server` or `agent` scope could not be serialized back
+        // across the store ABI at all ("scope kind 'mcp_server' has no registered wire field"), and
+        // the engine's governance boot, which lists every key, refused to start. Registering here is
+        // sound: the grant was serialized ENGINE-side under this exact kind when it was written,
+        // which the registry only permits for a registered kind, and registration only names the
+        // kind's wire field (`allowed_{kind}s`); it never remaps or widens a grant.
+        for (kind, _) in &other {
+            busbar_api::register_scope_kind(kind);
+        }
+        list.extend(
+            other
+                .into_iter()
+                .map(|(kind, value)| ScopeRef { kind, value }),
+        );
+    }
+    Ok(Some(list))
+}
+
+/// Split a `usage_units` map into the four RESERVED units (which keep their own typed columns --
+/// the v3 layout, so an existing row needs no migration) and the OPEN remainder (which lives in a
+/// `*_units` side table). Returned as `(input, output, cache_read, cache_write, open)`.
+fn split_units<V: Copy + Default>(units: &BTreeMap<String, V>) -> (V, V, V, V, Vec<(&str, V)>) {
+    let get = |k: &str| units.get(k).copied().unwrap_or_default();
+    let open = units
+        .iter()
+        .filter(|(k, _)| !is_reserved_unit(k))
+        .map(|(k, v)| (k.as_str(), *v))
+        .collect();
+    (
+        get(UNIT_INPUT),
+        get(UNIT_OUTPUT),
+        get(UNIT_CACHE_READ),
+        get(UNIT_CACHE_WRITE),
+        open,
+    )
+}
+
+fn is_reserved_unit(k: &str) -> bool {
+    k == UNIT_INPUT || k == UNIT_OUTPUT || k == UNIT_CACHE_READ || k == UNIT_CACHE_WRITE
+}
+
+/// Rebuild a name-keyed `usage_units` map from the four reserved columns. SPARSE, like the
+/// contract's own canonical form (`busbar_api::usage_migration`): a zero count is simply absent,
+/// which `ModelTokens::tier` reads back as 0 anyway.
+fn reserved_units(
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+) -> BTreeMap<String, u64> {
+    let mut m = BTreeMap::new();
+    for (k, v) in [
+        (UNIT_INPUT, input),
+        (UNIT_OUTPUT, output),
+        (UNIT_CACHE_READ, cache_read),
+        (UNIT_CACHE_WRITE, cache_write),
+    ] {
+        if v != 0 {
+            m.insert(k.to_string(), v);
+        }
+    }
+    m
 }
 
 impl Store for MysqlStore {
@@ -943,26 +1194,31 @@ impl Store for MysqlStore {
             }
         }
 
-        let pools_json = scopes_to_pools_json(&key.allowed_scopes)?;
+        let (pools_json, ext_json) = partition_scopes(&key.allowed_scopes)?;
         let labels_json = serde_json::to_string(&key.labels).map_err(store_err)?;
         let group = key.group.clone().unwrap_or_default();
 
         tx.exec_drop(
             "INSERT INTO api_keys
-                (id, name, key_group, allowed_pools, labels, enabled, generation_hash,
-                 created_at, updated_at, expires_at, deleted_at, revision)
-             VALUES (:id, :name, :key_group, :pools, :labels, :enabled, :gen, :created, :updated,
-                     :expires, :deleted, :rev)
+                (id, name, key_group, allowed_pools, allowed_scopes_ext, labels, enabled,
+                 generation_hash, created_at, updated_at, expires_at, deleted_at, revision,
+                 idp_subject, binding_mode, minted_by)
+             VALUES (:id, :name, :key_group, :pools, :ext, :labels, :enabled, :gen, :created,
+                     :updated, :expires, :deleted, :rev, :idp, :binding, :minted_by)
              ON DUPLICATE KEY UPDATE
                 name = VALUES(name), key_group = VALUES(key_group), allowed_pools = VALUES(allowed_pools),
+                allowed_scopes_ext = VALUES(allowed_scopes_ext),
                 labels = VALUES(labels), enabled = VALUES(enabled), generation_hash = VALUES(generation_hash),
                 updated_at = VALUES(updated_at), expires_at = VALUES(expires_at),
-                deleted_at = VALUES(deleted_at), revision = VALUES(revision)",
+                deleted_at = VALUES(deleted_at), revision = VALUES(revision),
+                idp_subject = VALUES(idp_subject), binding_mode = VALUES(binding_mode),
+                minted_by = VALUES(minted_by)",
             params! {
                 "id" => &key.id,
                 "name" => &key.name,
                 "key_group" => &group,
                 "pools" => &pools_json,
+                "ext" => &ext_json,
                 "labels" => &labels_json,
                 "enabled" => key.enabled,
                 "gen" => &key.generation_hash,
@@ -971,6 +1227,9 @@ impl Store for MysqlStore {
                 "expires" => key.expires_at,
                 "deleted" => key.deleted_at,
                 "rev" => rev,
+                "idp" => &key.idp_subject,
+                "binding" => &key.binding_mode,
+                "minted_by" => &key.minted_by,
             },
         )
         .map_err(store_err)?;
@@ -982,8 +1241,7 @@ impl Store for MysqlStore {
         let mut conn = self.conn()?;
         let row: Option<mysql::Row> = conn
             .exec_first(
-                "SELECT id, generation_hash, name, allowed_pools, labels, enabled, created_at, \
-                 key_group, expires_at, deleted_at, revision FROM api_keys WHERE id = :id",
+                format!("SELECT {KEY_COLUMNS} FROM api_keys WHERE id = :id"),
                 params! { "id" => id },
             )
             .map_err(store_err)?;
@@ -993,10 +1251,7 @@ impl Store for MysqlStore {
     fn list_keys(&self) -> StoreResult<Vec<VirtualKey>> {
         let mut conn = self.conn()?;
         let rows: Vec<mysql::Row> = conn
-            .query(
-                "SELECT id, generation_hash, name, allowed_pools, labels, enabled, created_at, \
-                 key_group, expires_at, deleted_at, revision FROM api_keys",
-            )
+            .query(format!("SELECT {KEY_COLUMNS} FROM api_keys"))
             .map_err(store_err)?;
         rows.into_iter().map(Self::row_to_key).collect()
     }
@@ -1005,8 +1260,7 @@ impl Store for MysqlStore {
         let mut conn = self.conn()?;
         let rows: Vec<mysql::Row> = conn
             .exec(
-                "SELECT id, generation_hash, name, allowed_pools, labels, enabled, created_at, \
-                 key_group, expires_at, deleted_at, revision FROM api_keys WHERE revision > :since",
+                format!("SELECT {KEY_COLUMNS} FROM api_keys WHERE revision > :since"),
                 params! { "since" => since },
             )
             .map_err(store_err)?;
@@ -1135,24 +1389,49 @@ impl Store for MysqlStore {
             )
             .map_err(store_err)?;
         let (requests, billable_requests) = totals.unwrap_or((0, 0));
+        // The OPEN units (everything but the reserved four) for this window, merged onto their
+        // model's entry. A model that carries only open units still has its `usage_windows` row --
+        // `put_usage`/`add_usage` always write one per model -- so it is already in `rows`; the
+        // `or_insert` below only guards a row an operator deleted by hand.
+        let open: Vec<(String, String, u64)> = conn
+            .exec(
+                "SELECT model, unit, count FROM usage_window_units \
+                 WHERE bucket_id = :b AND window_start = :w AND bucket_scope = 'key' \
+                 ORDER BY model, unit",
+                params! { "b" => bucket_id, "w" => window_start },
+            )
+            .map_err(store_err)?;
+
+        let mut models: Vec<ModelTokens> = rows
+            .into_iter()
+            .map(
+                |(model, input, output, cache_read, cache_write)| ModelTokens {
+                    model,
+                    usage_units: reserved_units(input, output, cache_read, cache_write),
+                },
+            )
+            .collect();
+        for (model, unit, count) in open {
+            if count == 0 {
+                continue; // sparse, like the reserved four
+            }
+            let idx = match models.iter().position(|m| m.model == model) {
+                Some(i) => i,
+                None => {
+                    models.push(ModelTokens {
+                        model,
+                        ..Default::default()
+                    });
+                    models.len() - 1
+                }
+            };
+            models[idx].usage_units.insert(unit, count);
+        }
 
         Ok(UsageLedger {
             requests,
             billable_requests,
-            models: rows
-                .into_iter()
-                .map(
-                    |(model, input, output, cache_read, cache_write)| ModelTokens {
-                        model,
-                        tokens: TierTokens {
-                            input,
-                            output,
-                            cache_read,
-                            cache_write,
-                        },
-                    },
-                )
-                .collect(),
+            models,
         })
     }
 
@@ -1175,6 +1454,14 @@ impl Store for MysqlStore {
         // showed. Naming the scope lets the range close on (window_start, 'key', bucket_id, ...).
         tx.exec_drop(
             "DELETE FROM usage_windows \
+             WHERE window_start = :w AND bucket_scope = 'key' AND bucket_id = :b",
+            params! { "b" => bucket_id, "w" => window_start },
+        )
+        .map_err(store_err)?;
+        // The window's OPEN units are part of the same absolute set: a unit the new ledger no
+        // longer carries must not survive it.
+        tx.exec_drop(
+            "DELETE FROM usage_window_units \
              WHERE window_start = :w AND bucket_scope = 'key' AND bucket_id = :b",
             params! { "b" => bucket_id, "w" => window_start },
         )
@@ -1204,6 +1491,7 @@ impl Store for MysqlStore {
         let mut models: Vec<&ModelTokens> = ledger.models.iter().collect();
         models.sort_by(|a, b| a.model.cmp(&b.model));
         for m in models {
+            let (ti, to, cr, cw, open) = split_units(&m.usage_units);
             tx.exec_drop(
                 "INSERT INTO usage_windows
                     (window_start, bucket_scope, bucket_id, model,
@@ -1211,11 +1499,23 @@ impl Store for MysqlStore {
                  VALUES (:w, 'key', :b, :model, :ti, :to_, :cr, :cw)",
                 params! {
                     "w" => window_start, "b" => bucket_id, "model" => &m.model,
-                    "ti" => m.tokens.input, "to_" => m.tokens.output,
-                    "cr" => m.tokens.cache_read, "cw" => m.tokens.cache_write,
+                    "ti" => ti, "to_" => to, "cr" => cr, "cw" => cw,
                 },
             )
             .map_err(store_err)?;
+            // BTreeMap order, so the unit rows are acquired in one deterministic order too.
+            for (unit, count) in open {
+                tx.exec_drop(
+                    "INSERT INTO usage_window_units
+                        (window_start, bucket_scope, bucket_id, model, unit, count)
+                     VALUES (:w, 'key', :b, :model, :unit, :n)",
+                    params! {
+                        "w" => window_start, "b" => bucket_id, "model" => &m.model,
+                        "unit" => unit, "n" => count,
+                    },
+                )
+                .map_err(store_err)?;
+            }
         }
         tx.commit().map_err(store_err)
     }
@@ -1254,6 +1554,7 @@ impl Store for MysqlStore {
         let mut models: Vec<&ModelTokensDelta> = delta.models.iter().collect();
         models.sort_by(|a, b| a.model.cmp(&b.model));
         for m in models {
+            let (ti, to, cr, cw, open) = split_units(&m.usage_units);
             // The VALUES(...) row constructor is type-checked against the target UNSIGNED columns
             // even on rows where ON DUPLICATE KEY UPDATE will fire instead of the INSERT -- MySQL
             // validates the whole statement's row shape up front. A refund delta's negative i64
@@ -1275,11 +1576,25 @@ impl Store for MysqlStore {
                     tokens_cache_write = GREATEST(0, CAST(tokens_cache_write AS SIGNED) + :cw)",
                 params! {
                     "w" => window_start, "b" => bucket_id, "model" => &m.model,
-                    "ti" => m.tokens.input, "to_" => m.tokens.output,
-                    "cr" => m.tokens.cache_read, "cw" => m.tokens.cache_write,
+                    "ti" => ti, "to_" => to, "cr" => cr, "cw" => cw,
                 },
             )
             .map_err(store_err)?;
+            // Every OPEN unit accumulates the same way, floored at 0, one atomic upsert per unit
+            // (BTreeMap order, so concurrent flushes take the rows in one order).
+            for (unit, d) in open {
+                tx.exec_drop(
+                    "INSERT INTO usage_window_units
+                        (window_start, bucket_scope, bucket_id, model, unit, count)
+                     VALUES (:w, 'key', :b, :model, :unit, GREATEST(0, :d))
+                     ON DUPLICATE KEY UPDATE count = GREATEST(0, CAST(count AS SIGNED) + :d)",
+                    params! {
+                        "w" => window_start, "b" => bucket_id, "model" => &m.model,
+                        "unit" => unit, "d" => d,
+                    },
+                )
+                .map_err(store_err)?;
+            }
         }
         tx.commit().map_err(store_err)
     }
@@ -1287,11 +1602,19 @@ impl Store for MysqlStore {
     fn add_metering(&self, delta: &MeteringDelta) -> StoreResult<()> {
         let bucket = format!("{:010}", delta.bucket); // matches the CHAR(10) 'YYYY-MM-DD'-shaped bucket
         let mut conn = self.conn()?;
-        conn.exec_drop(
+        // ONE transaction for the cell and its open units, so a reader never sees a cell's token
+        // counts advanced without the units the same response accrued (or the reverse).
+        let mut tx = conn
+            .start_transaction(TxOpts::default())
+            .map_err(store_err)?;
+        // `priced_from_ms` is part of the KEY (DECISION #79): a rate-card edit inside the UTC day
+        // opens a SECOND cell for that day, so each half keeps the card it was earned under rather
+        // than one card repricing the whole day.
+        tx.exec_drop(
             "INSERT INTO usage_metering
-                (bucket, key_id, provider, model, key_group_at_use, pricing_version,
+                (bucket, key_id, provider, model, key_group_at_use, pricing_version, priced_from_ms,
                  requests, billable_requests, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write)
-             VALUES (:bucket, :key, :provider, :model, :grp, :pv, :req, :breq, :ti, :to_, :cr, :cw)
+             VALUES (:bucket, :key, :provider, :model, :grp, :pv, :pfm, :req, :breq, :ti, :to_, :cr, :cw)
              ON DUPLICATE KEY UPDATE
                 requests = requests + VALUES(requests),
                 billable_requests = billable_requests + VALUES(billable_requests),
@@ -1302,12 +1625,29 @@ impl Store for MysqlStore {
             params! {
                 "bucket" => &bucket, "key" => &delta.key_id, "provider" => &delta.provider,
                 "model" => &delta.model, "grp" => &delta.key_group_at_use, "pv" => &delta.pricing_version,
+                "pfm" => delta.priced_from_ms,
                 "req" => delta.requests, "breq" => delta.billable_requests,
                 "ti" => delta.tokens_input, "to_" => delta.tokens_output,
                 "cr" => delta.tokens_cache_read, "cw" => delta.tokens_cache_write,
             },
         )
-        .map_err(store_err)
+        .map_err(store_err)?;
+        // Every ledgered class the token columns do not hold, additive like them (BTreeMap order,
+        // so concurrent writers take the unit rows in one order).
+        for (unit, n) in &delta.usage_units {
+            tx.exec_drop(
+                "INSERT INTO usage_metering_units
+                    (bucket, key_id, provider, model, priced_from_ms, unit, count)
+                 VALUES (:bucket, :key, :provider, :model, :pfm, :unit, :n)
+                 ON DUPLICATE KEY UPDATE count = count + VALUES(count)",
+                params! {
+                    "bucket" => &bucket, "key" => &delta.key_id, "provider" => &delta.provider,
+                    "model" => &delta.model, "pfm" => delta.priced_from_ms, "unit" => unit, "n" => *n,
+                },
+            )
+            .map_err(store_err)?;
+        }
+        tx.commit().map_err(store_err)
     }
 
     fn list_metering(&self, bucket: u64) -> StoreResult<Vec<MeteringRow>> {
@@ -1316,11 +1656,30 @@ impl Store for MysqlStore {
         let rows: Vec<MeteringRowTuple> = conn
             .exec(
                 "SELECT key_id, model, provider, tokens_input, tokens_output, tokens_cache_read, \
-                 tokens_cache_write, requests, billable_requests, key_group_at_use, pricing_version \
-                 FROM usage_metering WHERE bucket = :b",
+                 tokens_cache_write, requests, billable_requests, key_group_at_use, pricing_version, \
+                 priced_from_ms FROM usage_metering WHERE bucket = :b",
                 params! { "b" => &bucket_s },
             )
             .map_err(store_err)?;
+        let units: Vec<(String, String, String, u64, String, u64)> = conn
+            .exec(
+                "SELECT key_id, model, provider, priced_from_ms, unit, count \
+                 FROM usage_metering_units WHERE bucket = :b",
+                params! { "b" => &bucket_s },
+            )
+            .map_err(store_err)?;
+        // The open units, keyed by their cell, so each lands on exactly the row it was accrued to.
+        let mut by_cell: BTreeMap<(String, String, String, u64), BTreeMap<String, u64>> =
+            BTreeMap::new();
+        for (key_id, model, provider, pfm, unit, count) in units {
+            if count == 0 {
+                continue;
+            }
+            by_cell
+                .entry((key_id, model, provider, pfm))
+                .or_default()
+                .insert(unit, count);
+        }
         Ok(rows
             .into_iter()
             .map(
@@ -1336,18 +1695,31 @@ impl Store for MysqlStore {
                     billable_requests,
                     key_group_at_use,
                     pricing_version,
-                )| MeteringRow {
-                    key_id,
-                    model,
-                    provider,
-                    tokens_input,
-                    tokens_output,
-                    tokens_cache_read,
-                    tokens_cache_write,
-                    requests,
-                    billable_requests,
-                    key_group_at_use,
-                    pricing_version,
+                    priced_from_ms,
+                )| {
+                    let usage_units = by_cell
+                        .remove(&(
+                            key_id.clone(),
+                            model.clone(),
+                            provider.clone(),
+                            priced_from_ms,
+                        ))
+                        .unwrap_or_default();
+                    MeteringRow {
+                        key_id,
+                        model,
+                        provider,
+                        tokens_input,
+                        tokens_output,
+                        tokens_cache_read,
+                        tokens_cache_write,
+                        requests,
+                        billable_requests,
+                        key_group_at_use,
+                        pricing_version,
+                        priced_from_ms,
+                        usage_units,
+                    }
                 },
             )
             .collect())
@@ -1374,6 +1746,18 @@ impl Store for MysqlStore {
                 break;
             }
         }
+        // The same windows' OPEN units, swept by the same rule. Not added to the returned figure:
+        // that counts the ledger rows the contract names, and a unit row is part of one of them.
+        loop {
+            conn.exec_drop(
+                "DELETE FROM usage_window_units WHERE window_start < :b LIMIT 5000",
+                params! { "b" => before },
+            )
+            .map_err(store_err)?;
+            if conn.affected_rows() < BATCH {
+                break;
+            }
+        }
         Ok(total)
     }
 
@@ -1388,12 +1772,25 @@ impl Store for MysqlStore {
             Err(_) => bucket.to_string(),
         };
         let mut conn = self.conn()?;
-        conn.exec_drop(
+        let mut tx = conn
+            .start_transaction(TxOpts::default())
+            .map_err(store_err)?;
+        // The cells' open units go with them, in the same transaction.
+        tx.exec_drop(
+            "DELETE FROM usage_metering_units WHERE bucket = :b",
+            params! { "b" => &padded },
+        )
+        .map_err(store_err)?;
+        tx.exec_drop(
             "DELETE FROM usage_metering WHERE bucket = :b",
             params! { "b" => &padded },
         )
         .map_err(store_err)?;
-        Ok(conn.affected_rows())
+        // Read BEFORE the commit: `affected_rows` reports the LAST statement on this connection,
+        // and the COMMIT is one. This is the number of metering CELLS removed.
+        let removed = tx.affected_rows();
+        tx.commit().map_err(store_err)?;
+        Ok(removed)
     }
 
     fn put_credential(&self, secret: &CredentialSecret) -> StoreResult<()> {
@@ -1403,6 +1800,39 @@ impl Store for MysqlStore {
             .map_err(store_err)?;
         let rev = Self::bump_revision(&mut tx)?;
         let m = &secret.meta;
+
+        // THE OWNING KEY MUST BE LIVE. `delete_key` cascades a key's credentials away precisely so
+        // the secret material stops resolving; accepting a credential onto a TOMBSTONED key puts it
+        // back under a key an operator just revoked, and the FK alone only catches a key that names
+        // no row at all. Checked here, under a `FOR UPDATE` row lock held to commit, rather than by
+        // the caller: a caller-side check is a read-then-write, and a `delete_key` committing in the
+        // gap would cascade away only the rows that existed at that moment. Taken AFTER
+        // `bump_revision` and BEFORE the credentials rows, which is the crate's fixed lock order
+        // (store_sequence -> api_keys -> credentials) and the same order `delete_key` locks in.
+        let owner: Option<(Option<u64>,)> = tx
+            .exec_first(
+                "SELECT deleted_at FROM api_keys WHERE id = :k FOR UPDATE",
+                params! { "k" => &m.key_id },
+            )
+            .map_err(store_err)?;
+        match owner {
+            None => {
+                tx.rollback().map_err(store_err)?;
+                return Err(store_err(format!(
+                    "put_credential: owning key '{}' does not exist",
+                    m.key_id
+                )));
+            }
+            Some((Some(_),)) => {
+                tx.rollback().map_err(store_err)?;
+                return Err(store_err(format!(
+                    "put_credential: owning key '{}' is tombstoned; a revoked key takes no new \
+                     credentials",
+                    m.key_id
+                )));
+            }
+            Some((None,)) => {}
+        }
 
         // Slot-occupied-by-a-LIVE-credential guard: an explicit slot pointed at a live credential
         // must fail loudly, not silently clobber a working credential mid-overlap-window.
@@ -1477,21 +1907,24 @@ impl Store for MysqlStore {
             .map_err(store_err)?;
         let rev = Self::bump_revision(&mut tx)?;
 
-        let pools_json = scopes_to_pools_json(&key.allowed_scopes)?;
+        let (pools_json, ext_json) = partition_scopes(&key.allowed_scopes)?;
         let labels_json = serde_json::to_string(&key.labels).map_err(store_err)?;
         let group = key.group.clone().unwrap_or_default();
 
         tx.exec_drop(
             "INSERT INTO api_keys
-                (id, name, key_group, allowed_pools, labels, enabled, generation_hash,
-                 created_at, updated_at, expires_at, deleted_at, revision)
-             VALUES (:id, :name, :key_group, :pools, :labels, :enabled, :gen, :created, :updated,
-                     :expires, NULL, :rev)",
+                (id, name, key_group, allowed_pools, allowed_scopes_ext, labels, enabled,
+                 generation_hash, created_at, updated_at, expires_at, deleted_at, revision,
+                 idp_subject, binding_mode, minted_by)
+             VALUES (:id, :name, :key_group, :pools, :ext, :labels, :enabled, :gen, :created,
+                     :updated, :expires, NULL, :rev, :idp, :binding, :minted_by)",
             params! {
                 "id" => &key.id, "name" => &key.name, "key_group" => &group, "pools" => &pools_json,
+                "ext" => &ext_json,
                 "labels" => &labels_json, "enabled" => key.enabled, "gen" => &key.generation_hash,
                 "created" => key.created_at, "updated" => key.created_at, "expires" => key.expires_at,
-                "rev" => rev,
+                "rev" => rev, "idp" => &key.idp_subject, "binding" => &key.binding_mode,
+                "minted_by" => &key.minted_by,
             },
         )
         .map_err(store_err)?;
@@ -1773,336 +2206,334 @@ impl Store for MysqlStore {
         tx.commit().map_err(store_err)
     }
 
-    fn put_task(&self, task: &TaskRow) -> StoreResult<()> {
-        // UPSERT BY task_id: the engine writes through on EVERY state transition, so a second write
-        // for one task must REPLACE the row, never append a second one for the same id.
-        //
-        // No `affected_rows` check follows, deliberately. MySQL reports 1 for an insert, 2 for a row
-        // it actually changed and 0 for an update that changed nothing, so the number cannot tell
-        // "stored" from "failed" here — correctness rests on the statement succeeding, not on a
-        // count whose three values all mean the write landed.
-        let mut conn = self.conn()?;
-        conn.exec_drop(
-            "INSERT INTO tasks (task_id, context_id, principal, direction, state, agent_id, \
-             artifact_cursor, push_callback, created_at, updated_at) \
-             VALUES (:task_id, :context_id, :principal, :direction, :state, :agent_id, \
-             :artifact_cursor, :push_callback, :created_at, :updated_at) \
-             ON DUPLICATE KEY UPDATE \
-                context_id = VALUES(context_id), principal = VALUES(principal), \
-                direction = VALUES(direction), state = VALUES(state), \
-                agent_id = VALUES(agent_id), artifact_cursor = VALUES(artifact_cursor), \
-                push_callback = VALUES(push_callback), created_at = VALUES(created_at), \
-                updated_at = VALUES(updated_at)",
-            params! {
-                "task_id" => &task.task_id, "context_id" => &task.context_id,
-                "principal" => &task.principal, "direction" => &task.direction,
-                "state" => &task.state, "agent_id" => &task.agent_id,
-                "artifact_cursor" => task.artifact_cursor,
-                "push_callback" => &task.push_callback,
-                "created_at" => task.created_at, "updated_at" => task.updated_at,
-            },
-        )
-        .map_err(store_err)
-    }
-
-    fn get_task(&self, task_id: &str) -> StoreResult<Option<TaskRow>> {
-        // No principal filter, deliberately: the contract puts the caller-scoping check ENGINE-side,
-        // because an authorization check living in the backend is one an unauthorized reader
-        // bypasses by configuring a different backend.
-        let mut conn = self.conn()?;
-        let row: Option<TaskRowTuple> = conn
-            .exec_first(
-                "SELECT task_id, context_id, principal, direction, state, agent_id, \
-                 artifact_cursor, push_callback, created_at, updated_at FROM tasks \
-                 WHERE task_id = :task_id",
-                params! { "task_id" => task_id },
-            )
-            .map_err(store_err)?;
-        Ok(row.map(row_to_task))
-    }
-
-    fn list_tasks(&self) -> StoreResult<Vec<TaskRow>> {
-        // UNFILTERED, terminal rows included. The boot rehydrate wants the active rows, the
-        // retention sweep wants the terminal ones and the scoped listing wants one principal's; a
-        // store that pre-filtered for any one of those would break the other two.
-        let mut conn = self.conn()?;
-        let rows: Vec<TaskRowTuple> = conn
-            .query(
-                "SELECT task_id, context_id, principal, direction, state, agent_id, \
-                 artifact_cursor, push_callback, created_at, updated_at FROM tasks ORDER BY task_id",
-            )
-            .map_err(store_err)?;
-        Ok(rows.into_iter().map(row_to_task).collect())
-    }
-
-    fn purge_tasks_before(&self, before: u64) -> StoreResult<u64> {
-        // TERMINAL ONLY, and STRICTLY older than the cutoff. An interrupted task waiting on a human
-        // is exactly the row that legitimately sits still for a long time; compacting it is losing
-        // the work, not reclaiming space. The IN list is the CLOSED terminal set, so a state token
-        // minted by a newer engine than this build is never dropped.
-        //
-        // The events go with the task, in the SAME TRANSACTION as the parent delete. That cascade is
-        // load-bearing rather than tidiness: `purge_tasks_before` is the ONLY retention method the
-        // contract gives this data, so a purge that left the events behind would leave `task_events`
-        // with no bound anywhere in the trait. It is done here in application code because neither
-        // way of pushing it into the schema is available (see the `task_events` DDL): a foreign key
-        // would impose a write ORDER the contract never states, and a DELETE trigger needs SUPER on
-        // a binlog-enabled server, which the app-level user does not hold. One transaction is what
-        // makes the pair atomic anyway — a crash between the two statements cannot leave a task
-        // whose chain has been half-swept.
-        let placeholders = (0..TERMINAL_TASK_STATES.len())
-            .map(|i| format!(":s{i}"))
-            .collect::<Vec<_>>()
-            .join(",");
-        let mut args: Vec<(String, mysql::Value)> = vec![("before".to_string(), before.into())];
-        for (i, state) in TERMINAL_TASK_STATES.iter().enumerate() {
-            args.push((format!("s{i}"), (*state).into()));
-        }
-
-        let mut conn = self.conn()?;
-        let mut tx = conn
-            .start_transaction(TxOpts::default())
-            .map_err(store_err)?;
-        tx.exec_drop(
-            format!(
-                "DELETE te FROM task_events te JOIN tasks t ON te.task_id = t.task_id \
-                 WHERE t.updated_at < :before AND t.state IN ({placeholders})"
-            ),
-            args.clone(),
-        )
-        .map_err(store_err)?;
-        tx.exec_drop(
-            format!("DELETE FROM tasks WHERE updated_at < :before AND state IN ({placeholders})"),
-            args,
-        )
-        .map_err(store_err)?;
-        // Read BEFORE the commit: `affected_rows` reports the LAST statement executed on this
-        // connection, and the COMMIT itself is one. This is the count the DELETE actually performed,
-        // never an estimate.
-        let removed = tx.affected_rows();
-        tx.commit().map_err(store_err)?;
-        Ok(removed)
-    }
-
-    fn append_task_event(&self, event: &TaskEventRow) -> StoreResult<()> {
-        // UPSERT ON (task_id, seq), and this is where the task-event contract genuinely DIFFERS from
-        // `append_mcp_call`'s: that one treats an occupied slot holding a DIFFERENT record as a fork
-        // and refuses it, while this one is specified to upsert so the engine's write-through is
-        // idempotent on replay — "rejecting or duplicating a replayed `seq` breaks the chain the
-        // engine will verify on read". Copying the call log's fork check here would be wrong in a
-        // way that looks right, so it is stated rather than left to be inferred from the SQL.
-        //
-        // As in `put_task`, no `affected_rows` check: ON DUPLICATE KEY UPDATE returns 2 for a row it
-        // changed and 0 for a replay identical to what is already stored, and 0 is a SUCCESS here.
-        let mut conn = self.conn()?;
-        conn.exec_drop(
-            "INSERT INTO task_events (task_id, seq, ts, kind, context_id, principal, agent_id, \
-             state, request_id, prev_hash, hash) \
-             VALUES (:task_id, :seq, :ts, :kind, :context_id, :principal, :agent_id, :state, \
-             :request_id, :prev_hash, :hash) \
-             ON DUPLICATE KEY UPDATE \
-                ts = VALUES(ts), kind = VALUES(kind), context_id = VALUES(context_id), \
-                principal = VALUES(principal), agent_id = VALUES(agent_id), \
-                state = VALUES(state), request_id = VALUES(request_id), \
-                prev_hash = VALUES(prev_hash), hash = VALUES(hash)",
-            params! {
-                "task_id" => &event.task_id, "seq" => event.seq, "ts" => event.ts,
-                "kind" => &event.kind, "context_id" => &event.context_id,
-                "principal" => &event.principal, "agent_id" => &event.agent_id,
-                "state" => &event.state, "request_id" => &event.request_id,
-                "prev_hash" => &event.prev_hash, "hash" => &event.hash,
-            },
-        )
-        .map_err(store_err)
-    }
-
-    fn list_task_events(&self, task_id: &str) -> StoreResult<Vec<TaskEventRow>> {
-        // Oldest-first by seq — the order the engine's chain verifier reads — and the scope is the
-        // one task, because the chain is per-task.
-        let mut conn = self.conn()?;
-        let rows: Vec<TaskEventRowTuple> = conn
-            .exec(
-                "SELECT task_id, seq, ts, kind, context_id, principal, agent_id, state, \
-                 request_id, prev_hash, hash FROM task_events WHERE task_id = :task_id ORDER BY seq",
-                params! { "task_id" => task_id },
-            )
-            .map_err(store_err)?;
-        Ok(rows.into_iter().map(row_to_task_event).collect())
-    }
-
-    fn append_mcp_call(&self, record: &McpCallRecord) -> StoreResult<()> {
-        let body = mcp_call_body(record);
-        let mut conn = self.conn()?;
-        // INSERT IGNORE makes the insert atomic against a concurrent writer. Reading the incumbent
-        // AFTERWARDS is safe without a transaction precisely because this table is never rewritten:
-        // a row that exists cannot change under us, so what we read is what collided.
-        conn.exec_drop(
-            "INSERT IGNORE INTO mcp_calls (principal, seq, ts, prev_hash, hash, body) \
-             VALUES (:principal, :seq, :ts, :prev, :hash, :body)",
-            params! {
-                "principal" => &record.principal, "seq" => record.seq, "ts" => record.ts,
-                "prev" => &record.prev_hash, "hash" => &record.hash, "body" => &body,
-            },
-        )
-        .map_err(store_err)?;
-        if conn.affected_rows() == 1 {
-            return Ok(());
-        }
-        let existing: Option<(u64, String, String, String)> = conn
-            .exec_first(
-                "SELECT ts, prev_hash, hash, body FROM mcp_calls WHERE principal = :principal AND seq = :seq",
-                params! { "principal" => &record.principal, "seq" => record.seq },
-            )
-            .map_err(store_err)?;
-        if let Some((e_ts, e_prev, e_hash, e_body)) = existing {
-            // BYTE-IDENTICAL is the at-least-once retry and is success. DIFFERENT is a forked or
-            // tampered log and is an error: overwriting would destroy exactly the case worth
-            // reporting, and this store never restates a digest it was handed.
-            if e_ts == record.ts
-                && e_prev == record.prev_hash
-                && e_hash == record.hash
-                && e_body == body
-            {
-                return Ok(());
-            }
-        }
-        // Names the sequence and nothing else — it must not echo stored (or caller) content back.
-        Err(StoreError(format!(
-            "mcp call log fork: a different record is already persisted at sequence {} for this principal",
-            record.seq
-        )))
-    }
-
-    fn list_mcp_calls(&self, principal: &str) -> StoreResult<Vec<McpCallRecord>> {
-        let mut conn = self.conn()?;
-        let rows: Vec<McpCallRowTuple> = conn
-            .exec(
-                "SELECT principal, seq, ts, prev_hash, hash, body FROM mcp_calls \
-                 WHERE principal = :principal ORDER BY seq",
-                params! { "principal" => principal },
-            )
-            .map_err(store_err)?;
-        Ok(rows.into_iter().map(row_to_mcp_call).collect())
-    }
-
-    fn list_mcp_call_principals(&self) -> StoreResult<Vec<String>> {
-        let mut conn = self.conn()?;
-        conn.query("SELECT DISTINCT principal FROM mcp_calls ORDER BY principal")
-            .map_err(store_err)
-    }
-
-    fn purge_mcp_calls_before(&self, before: u64) -> StoreResult<u64> {
-        // STRICTLY less-than, matching the contract's wording: a row exactly at the cutoff is kept.
-        // `affected_rows` reports what the DELETE actually removed, so the count is one performed.
-        let mut conn = self.conn()?;
-        conn.exec_drop(
-            "DELETE FROM mcp_calls WHERE ts < :before",
-            params! { "before" => before },
-        )
-        .map_err(store_err)?;
-        Ok(conn.affected_rows())
-    }
-
     fn list_denylist(&self) -> StoreResult<Vec<String>> {
         let mut conn = self.conn()?;
         conn.query("SELECT sub FROM denylist").map_err(store_err)
     }
 
-    fn put_mcp_demotion(&self, row: &McpDemotionRow) -> StoreResult<()> {
-        // UPSERT BY server, as the trait requires: a second demotion of one upstream REPLACES the
-        // row rather than appending a rival one, so the boot read cannot come back holding two
-        // answers about one server.
+    // ── THE NEUTRAL KIND-TAGGED PLANE-RECORD VERBS (busbar 1.6.0) ─────────────────────────────
+    //
+    // Eight verbs over ONE table replace the fourteen per-protocol methods (`put_task`,
+    // `append_mcp_call`, `put_mcp_demotion`, `redeem_ask_state`, ...) this store used to implement.
+    // Every one is GENERIC over `kind`: nothing here decodes a `body`, and identity, ordering and
+    // retention read only the typed sidecar columns. That is what lets a plane registered after this
+    // build persist through it unchanged. The one kind-aware rule is retention's, and it is the
+    // contract's: `task` drops only TERMINAL rows, and takes its `task_event` chain with it.
+
+    fn upsert_plane_record(&self, record: &PlaneRecord) -> StoreResult<()> {
+        // UPSERT by identity: a second write for one `(kind, id)` REPLACES the row -- the engine
+        // writes a task through on every state transition, and the boot read must find one row per
+        // id, holding the last state.
         //
-        // No `affected_rows` check follows, deliberately, and for the same reason `put_task` has
-        // none: MySQL reports 1 for an insert, 2 for a row it actually changed and 0 for an update
-        // that changed nothing, so the number cannot tell "stored" from "failed" here. Correctness
-        // rests on the statement succeeding. (`redeem_ask_state` below is the one place where
-        // `affected_rows` IS the answer, and there the statement is written so the count is
-        // unambiguous.)
+        // No `affected_rows` check, deliberately: MySQL reports 1 for an insert, 2 for a row it
+        // changed and 0 for an update that changed nothing, so the number cannot tell "stored" from
+        // "failed". Correctness rests on the statement succeeding.
         let mut conn = self.conn()?;
         conn.exec_drop(
-            "INSERT INTO mcp_demotions (server, reason, recorded_at) \
-             VALUES (:server, :reason, :recorded_at) \
-             ON DUPLICATE KEY UPDATE reason = VALUES(reason), recorded_at = VALUES(recorded_at)",
-            params! {
-                "server" => &row.server,
-                "reason" => &row.reason,
-                "recorded_at" => row.recorded_at,
-            },
+            "INSERT INTO plane_records (kind, ident, seq, id, parent, ts, terminal, body) \
+             VALUES (:kind, :ident, :seq, :id, :parent, :ts, :terminal, :body) \
+             ON DUPLICATE KEY UPDATE id = VALUES(id), parent = VALUES(parent), ts = VALUES(ts), \
+                terminal = VALUES(terminal), body = VALUES(body)",
+            plane_params(record),
         )
         .map_err(store_err)
     }
 
-    fn list_mcp_demotions(&self) -> StoreResult<Vec<McpDemotionRow>> {
-        // The boot read that puts a demotion back in force before the first request is served. An
-        // EMPTY answer means "no upstream is recorded as demoted" and never "we could not tell" — a
-        // read failure surfaces as an Err, because a server with no row is a server nobody demoted,
-        // which is a different fact from a server that drifted, and conflating them would quarantine
-        // every declaratively-approved deployment at boot.
+    fn get_plane_record(&self, kind: &str, id: &str) -> StoreResult<Option<Vec<u8>>> {
+        // No caller filter, deliberately: the contract puts caller-scoping ENGINE-side, because an
+        // authorization check living in the backend is one an unauthorized reader bypasses by
+        // configuring a different backend. An unknown id is `None`, never an error.
         let mut conn = self.conn()?;
-        let rows: Vec<(String, String, u64)> = conn
-            .query("SELECT server, reason, recorded_at FROM mcp_demotions ORDER BY server")
+        conn.exec_first(
+            "SELECT body FROM plane_records WHERE kind = :kind AND ident = :id AND seq = 0",
+            params! { "kind" => kind, "id" => id },
+        )
+        .map_err(store_err)
+    }
+
+    fn append_plane_record(&self, record: &PlaneRecord) -> StoreResult<()> {
+        // APPEND-ONLY at a chain position `(parent, seq)`. A record arriving on a position that
+        // already holds one is settled by comparing the two, exactly as `append_audit` settles a
+        // duplicate `seq`:
+        //   identical -> the write-through retrying after a lost ACK. Common, benign, Ok.
+        //   different -> two records claiming one chain position: a forked or tampered chain, and
+        //                an error. Overwriting would destroy exactly the case worth reporting; this
+        //                store never restates a digest it was handed.
+        //
+        // INSERT FIRST, with no preceding `SELECT ... FOR UPDATE`, for the reason `append_audit`
+        // gives: a locking read of a MISSING row takes a gap lock under REPEATABLE READ, and two
+        // appends into the same gap then deadlock on each other's insert-intention lock. `kind =
+        // kind` makes the duplicate a no-op whose affected-row count is 0; NOT `INSERT IGNORE`,
+        // which would also downgrade every OTHER error -- a body or id too long for its column -- to a
+        // warning and a silently truncated row.
+        //
+        // The loop covers the row being purged between the insert and the read-back: the position
+        // is free again, so inserting is right. Bounded, and exhausting it is an error.
+        const MAX_ATTEMPTS: u32 = 3;
+        let ident = plane_ident(record);
+        let mut conn = self.conn()?;
+        for _ in 0..MAX_ATTEMPTS {
+            conn.exec_drop(
+                "INSERT INTO plane_records (kind, ident, seq, id, parent, ts, terminal, body) \
+                 VALUES (:kind, :ident, :seq, :id, :parent, :ts, :terminal, :body) \
+                 ON DUPLICATE KEY UPDATE kind = kind",
+                plane_params(record),
+            )
             .map_err(store_err)?;
-        Ok(rows
-            .into_iter()
-            .map(|(server, reason, recorded_at)| McpDemotionRow {
-                server,
-                reason,
-                recorded_at,
-            })
-            .collect())
+            if conn.affected_rows() == 1 {
+                return Ok(());
+            }
+            let existing: Option<PlaneRowTuple> = conn
+                .exec_first(
+                    "SELECT id, parent, ts, terminal, body FROM plane_records \
+                     WHERE kind = :kind AND ident = :ident AND seq = :seq",
+                    params! { "kind" => &record.kind, "ident" => ident, "seq" => record.seq },
+                )
+                .map_err(store_err)?;
+            let Some((id, parent, ts, terminal, body)) = existing else {
+                continue; // purged between the insert and the read: the position is free, retry
+            };
+            if id == record.id
+                && parent == record.parent
+                && ts == record.ts
+                && terminal == is_terminal(record.disposition)
+                && body == record.body
+            {
+                return Ok(());
+            }
+            // Names the position and nothing else -- it must not echo stored (or caller) content.
+            return Err(store_err(format!(
+                "append_plane_record: kind '{}' seq {} already holds a different record for this \
+                 parent; the chain has forked",
+                record.kind, record.seq
+            )));
+        }
+        Err(store_err(format!(
+            "append_plane_record: kind '{}' seq {} kept being freed between the insert and the \
+             read-back after {MAX_ATTEMPTS} attempts; the record was NOT stored",
+            record.kind, record.seq
+        )))
     }
 
-    fn clear_mcp_demotion(&self, server: &str) -> StoreResult<()> {
-        // Removing a row that is not there is a NO-OP, not an error: the engine clears on every
-        // observation that agrees with the operator's approval rather than tracking whether it had
-        // demoted, so the overwhelmingly common call is one against no row at all.
+    fn list_plane_records(
+        &self,
+        kind: &str,
+        selector: &PlaneSelector,
+    ) -> StoreResult<Vec<Vec<u8>>> {
+        // Oldest-first by `seq` -- the order the engine's chain verifier reads a parent's chain in.
+        // `All` is UNFILTERED (terminal rows included): the boot rehydrate wants the active rows,
+        // retention the terminal ones and a scoped listing one caller's, and a store that
+        // pre-filtered for one of them would break the other two.
         let mut conn = self.conn()?;
-        conn.exec_drop(
-            "DELETE FROM mcp_demotions WHERE server = :server",
-            params! { "server" => server },
+        match selector {
+            PlaneSelector::All => conn.exec(
+                "SELECT body FROM plane_records WHERE kind = :kind ORDER BY seq, ident",
+                params! { "kind" => kind },
+            ),
+            PlaneSelector::Parent(parent) => conn.exec(
+                "SELECT body FROM plane_records \
+                 WHERE kind = :kind AND ident = :parent AND parent = :parent ORDER BY seq",
+                params! { "kind" => kind, "parent" => parent },
+            ),
+        }
+        .map_err(store_err)
+    }
+
+    fn list_plane_record_parents(&self, kind: &str) -> StoreResult<Vec<String>> {
+        // The boot enumeration a restart resumes chains from: every distinct parent holding at
+        // least one record of the kind, including one this process has never seen written.
+        let mut conn = self.conn()?;
+        conn.exec(
+            "SELECT DISTINCT parent FROM plane_records \
+             WHERE kind = :kind AND parent IS NOT NULL ORDER BY parent",
+            params! { "kind" => kind },
         )
         .map_err(store_err)
     }
 
-    fn redeem_ask_state(&self, nonce: &str, expires_at: u64, now: u64) -> StoreResult<bool> {
+    fn purge_plane_records_before(&self, kind: &str, before: u64) -> StoreResult<u64> {
+        // STRICTLY older than the cutoff: a row exactly at `before` is kept. The count returned is
+        // one the DELETE actually performed (`affected_rows`), never an estimate.
         let mut conn = self.conn()?;
-        // THE EVICTION SWEEP the redemption carries, so the table is bounded by one
-        // approval-validity window rather than growing forever: an entry recording an approval that
-        // can no longer be opened protects nothing. STRICTLY less-than, so an entry expiring exactly
-        // at `now` is kept — the boundary convention every retention method in this crate uses. It
-        // runs BEFORE the insert, so it can never delete the row this very call is about to write.
-        //
-        // DELIBERATELY NOT IN A TRANSACTION WITH THE INSERT BELOW, and that is where this parts
-        // company with the Postgres backend's shape. The atomicity that matters belongs to the
-        // INSERT alone; wrapping the sweep in with it buys nothing and costs plenty, because InnoDB
-        // under REPEATABLE READ takes NEXT-KEY locks over the range a DELETE scans and holds them to
-        // commit — so every node's redemption would sit on a range lock across the one table the
-        // whole fleet writes to. The sweep is an independent, idempotent statement; a crash between
-        // the two leaves a ledger that is correct and merely one sweep behind.
+        if kind == KIND_TASK {
+            // TERMINAL ONLY. An interrupted task waiting on a human is exactly the row that sits
+            // still for a long time; compacting it is losing the work, not reclaiming space.
+            // Terminality is the envelope's typed `terminal` column -- never decoded from the body.
+            //
+            // The task's event chain goes with it, in the SAME TRANSACTION. That cascade is
+            // load-bearing: nothing else ever purges a `task_event` row, so a purge that left them
+            // behind would leave the chains of every swept task with no bound anywhere in the
+            // contract. It lives here because neither schema-side mechanism is available (see the
+            // `plane_records` DDL), and one transaction makes the pair atomic -- a crash between the
+            // two statements cannot leave a task whose chain has been half-swept. Only the chains
+            // under a task that actually goes are touched: an event whose task is retained, or was
+            // never written, is left alone.
+            //
+            // SHAPE, and why it is not one set-based DELETE: two sweeps running at once (two nodes,
+            // or the retention tick racing an operator purge) each took next-key locks across the
+            // `(kind, ts)` range and the joined event ranges, and deadlocked on each other
+            // (ERROR 1213, reproduced by the interleaved-runs conformance check). So the candidates
+            // are found by a plain NON-LOCKING read, and each is then removed in its own short
+            // transaction by PRIMARY KEY, with the retention predicate RE-CHECKED in the DELETE --
+            // a task re-activated or re-timestamped since the read is simply not matched. A point
+            // delete on a unique key takes a record lock and no gap lock, so concurrent sweeps can
+            // at worst wait on one row, never on each other's ranges; ascending ident order keeps
+            // even that wait ordered. A task that turns terminal after the read is the next sweep's.
+            let candidates: Vec<String> = conn
+                .exec(
+                    "SELECT ident FROM plane_records \
+                     WHERE kind = :kind AND seq = 0 AND ts < :before AND terminal ORDER BY ident",
+                    params! { "kind" => KIND_TASK, "before" => before },
+                )
+                .map_err(store_err)?;
+            let mut removed = 0u64;
+            for ident in candidates {
+                let mut tx = conn
+                    .start_transaction(TxOpts::default())
+                    .map_err(store_err)?;
+                tx.exec_drop(
+                    "DELETE FROM plane_records WHERE kind = :kind AND ident = :ident AND seq = 0 \
+                     AND ts < :before AND terminal",
+                    params! { "kind" => KIND_TASK, "ident" => &ident, "before" => before },
+                )
+                .map_err(store_err)?;
+                // Read BEFORE the next statement: `affected_rows` reports the LAST statement on
+                // this connection. 0 = a concurrent sweep took it first, or it is no longer
+                // eligible; either way its chain is not this sweep's to touch.
+                if tx.affected_rows() == 1 {
+                    tx.exec_drop(
+                        "DELETE FROM plane_records WHERE kind = :event_kind AND ident = :ident",
+                        params! { "event_kind" => KIND_TASK_EVENT, "ident" => &ident },
+                    )
+                    .map_err(store_err)?;
+                    removed += 1;
+                }
+                tx.commit().map_err(store_err)?;
+            }
+            return Ok(removed);
+        }
+        // Every other kind drops ALL of its rows older than the cutoff. Batched and looped, like
+        // `purge_windows_before`: the batch bound keeps any one DELETE's lock footprint small, and
+        // the loop makes the contract -- every row below the cutoff -- actually hold for a backlog
+        // larger than one batch.
+        const BATCH: u64 = 5000;
+        let mut total = 0u64;
+        loop {
+            conn.exec_drop(
+                "DELETE FROM plane_records WHERE kind = :kind AND ts < :before LIMIT 5000",
+                params! { "kind" => kind, "before" => before },
+            )
+            .map_err(store_err)?;
+            let n = conn.affected_rows();
+            total += n;
+            if n < BATCH {
+                break;
+            }
+        }
+        Ok(total)
+    }
+
+    fn delete_plane_record(&self, kind: &str, id: &str) -> StoreResult<()> {
+        // Absent is a NO-OP, not an error: the engine clears a demotion on every observation that
+        // agrees with the approval rather than tracking whether it had demoted, so the common call
+        // is one against no row at all. Every `seq` under the identity goes, so deleting a parent's
+        // record can never leave part of a chain behind.
+        let mut conn = self.conn()?;
         conn.exec_drop(
-            "DELETE FROM spent_ask_states WHERE expires_at < :now",
+            "DELETE FROM plane_records WHERE kind = :kind AND ident = :id",
+            params! { "kind" => kind, "id" => id },
+        )
+        .map_err(store_err)
+    }
+
+    fn redeem_plane_token(
+        &self,
+        kind: &str,
+        token: &str,
+        expires_at: u64,
+        now: u64,
+    ) -> StoreResult<bool> {
+        let mut conn = self.conn()?;
+        // THE EVICTION SWEEP the redemption carries, so the ledger is bounded by one validity
+        // window rather than growing forever: an entry recording a token that can no longer be
+        // presented protects nothing. STRICTLY less-than, so an entry expiring exactly at `now` is
+        // kept -- the boundary convention every retention method in this crate uses. It runs
+        // BEFORE the insert, so it can never delete the row this very call is about to write.
+        //
+        // DELIBERATELY NOT IN A TRANSACTION WITH THE INSERT. The atomicity that matters belongs to
+        // the INSERT alone; InnoDB under REPEATABLE READ holds NEXT-KEY locks over the range a
+        // DELETE scans until commit, so wrapping the sweep in would make every node's redemption
+        // sit on a range lock across the one table the whole fleet writes to. The sweep is an
+        // independent, idempotent statement; a crash between the two leaves a ledger that is
+        // correct and merely one sweep behind.
+        conn.exec_drop(
+            "DELETE FROM plane_tokens WHERE expires_at < :now",
             params! { "now" => now },
         )
         .map_err(store_err)?;
-        // THE TEST AND SET, as ONE statement. `ON DUPLICATE KEY UPDATE nonce = nonce` makes the
-        // duplicate case a no-op that changes nothing, so `affected_rows` is exactly 1 when THIS
-        // call inserted the row and 0 when it was already there — the same idiom `append_audit` uses
-        // for its own occupied-slot check. Reading the table and then writing it would tell BOTH
-        // halves of a race they were first — two nodes behind a load balancer, or two requests to
-        // one node — and that is precisely the shape this method is specified not to have.
-        //
-        // INSERT IGNORE would give the same count and is NOT used: it downgrades every other error
-        // on the statement to a warning too, and a redemption that silently swallowed a write
-        // failure would answer `false` — refusing a legitimate approval — or, worse, `true` off a
+        // THE TEST AND SET, as ONE statement. `ON DUPLICATE KEY UPDATE token = token` makes the
+        // duplicate case a no-op, so `affected_rows` is exactly 1 when THIS call inserted the row
+        // and 0 when it was already there. Reading and then writing would tell BOTH halves of a race
+        // they were first -- two nodes behind a load balancer -- which is the shape this verb is
+        // specified not to have. Not INSERT IGNORE: it would downgrade every other error on the
+        // statement to a warning, and a redemption that swallowed a failed write would answer from a
         // row that never landed.
         conn.exec_drop(
-            "INSERT INTO spent_ask_states (nonce, expires_at) VALUES (:nonce, :expires_at) \
-             ON DUPLICATE KEY UPDATE nonce = nonce",
-            params! { "nonce" => nonce, "expires_at" => expires_at },
+            "INSERT INTO plane_tokens (kind, token, expires_at) VALUES (:kind, :token, :exp) \
+             ON DUPLICATE KEY UPDATE token = token",
+            params! { "kind" => kind, "token" => token, "exp" => expires_at },
         )
         .map_err(store_err)?;
         Ok(conn.affected_rows() == 1)
+    }
+
+    fn plane_token_live(
+        &self,
+        kind: &str,
+        token: &str,
+        expires_at: u64,
+        now: u64,
+    ) -> StoreResult<bool> {
+        // MULTI-USE and SPENDS NOTHING -- the opposite of `redeem_plane_token`. A plain READ of the
+        // `(kind, token)` upsert record: live only while it is present, still ACTIVE (not
+        // terminal), and `now` has not passed `expires_at`. Each of the three failing is `false`,
+        // so this stays fail-closed on an unknown token, a finished task and a lapsed deadline
+        // alike. Nothing is written, so asking twice answers the same twice.
+        if now > expires_at {
+            return Ok(false);
+        }
+        let mut conn = self.conn()?;
+        let terminal: Option<bool> = conn
+            .exec_first(
+                "SELECT terminal FROM plane_records WHERE kind = :kind AND ident = :token AND seq = 0",
+                params! { "kind" => kind, "token" => token },
+            )
+            .map_err(store_err)?;
+        Ok(terminal == Some(false))
+    }
+}
+
+/// A plane record's IDENTITY within its kind: its `parent` when it is an appended child (a chain
+/// position is `(parent, seq)`), else its own `id` (at seq 0 for an upsert kind). The same rule
+/// busbar's reference stores key by, so every backend agrees on what "the same record" means.
+fn plane_ident(record: &PlaneRecord) -> &str {
+    record.parent.as_deref().unwrap_or(&record.id)
+}
+
+fn is_terminal(d: PlaneDisposition) -> bool {
+    matches!(d, PlaneDisposition::Terminal)
+}
+
+fn plane_params(record: &PlaneRecord) -> mysql::Params {
+    params! {
+        "kind" => &record.kind,
+        "ident" => plane_ident(record),
+        "seq" => record.seq,
+        "id" => &record.id,
+        "parent" => &record.parent,
+        "ts" => record.ts,
+        "terminal" => is_terminal(record.disposition),
+        "body" => &record.body,
     }
 }
 
@@ -2111,111 +2542,6 @@ fn crate_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-}
-
-/// The non-indexed payload of a call record, as stored in `mcp_calls.body`. `principal`, `seq`,
-/// `ts`, `prev_hash` and `hash` are deliberately NOT duplicated here: they are real columns, and a
-/// value stored in two places is a value that can disagree with itself. `serde_json`'s object keys
-/// are ordered, so this encoding is deterministic — which is what makes the byte comparison in
-/// `append_mcp_call`'s replay check meaningful.
-fn mcp_call_body(record: &McpCallRecord) -> String {
-    serde_json::json!({
-        "server": record.server,
-        "tool": record.tool,
-        "outcome": record.outcome,
-        "reason": record.reason,
-        "tool_digest": record.tool_digest,
-        "pin_generation": record.pin_generation,
-        "request_id": record.request_id,
-    })
-    .to_string()
-}
-
-/// Rebuild a record from its columns plus its opaque body. The CHAIN comes from the columns, which
-/// is the point of their being columns: what the engine verifies is what the database holds in a
-/// field it can constrain, not a value recovered by decoding a payload.
-/// No clamping and no fallback anywhere in here, unlike `row_to_mcp_call`'s tolerant body decode:
-/// every field is a real, NOT NULL column of a known type, so a row that fails to decode is a schema
-/// that is not what this build thinks it is — and the driver reports that rather than this function
-/// papering over it with a default. The u64s round-trip exactly because the columns are
-/// `BIGINT UNSIGNED`.
-fn row_to_task(row: TaskRowTuple) -> TaskRow {
-    let (
-        task_id,
-        context_id,
-        principal,
-        direction,
-        state,
-        agent_id,
-        artifact_cursor,
-        push_callback,
-        created_at,
-        updated_at,
-    ) = row;
-    TaskRow {
-        task_id,
-        context_id,
-        principal,
-        direction,
-        state,
-        agent_id,
-        artifact_cursor,
-        push_callback,
-        created_at,
-        updated_at,
-    }
-}
-
-fn row_to_task_event(row: TaskEventRowTuple) -> TaskEventRow {
-    let (
-        task_id,
-        seq,
-        ts,
-        kind,
-        context_id,
-        principal,
-        agent_id,
-        state,
-        request_id,
-        prev_hash,
-        hash,
-    ) = row;
-    TaskEventRow {
-        task_id,
-        seq,
-        ts,
-        kind,
-        context_id,
-        principal,
-        agent_id,
-        state,
-        request_id,
-        prev_hash,
-        hash,
-    }
-}
-
-fn row_to_mcp_call(row: McpCallRowTuple) -> McpCallRecord {
-    let (principal, seq, ts, prev_hash, hash, body) = row;
-    let v: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
-    let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
-    McpCallRecord {
-        principal,
-        seq,
-        ts,
-        prev_hash,
-        hash,
-        server: s("server"),
-        tool: s("tool"),
-        outcome: s("outcome"),
-        reason: s("reason"),
-        tool_digest: s("tool_digest"),
-        pin_generation: v
-            .get("pin_generation")
-            .and_then(|x| x.as_u64())
-            .unwrap_or(0),
-        request_id: s("request_id"),
-    }
 }
 
 #[cfg(test)]
