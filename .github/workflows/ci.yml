@@ -1,5 +1,20 @@
-# Calls the canonical plugin-ci reusable workflow (GetBusbar/busbar/.github/workflows/plugin-ci.yml)
-# instead of hand-copying build/test/signoff steps here — see that file for what actually runs.
+# store-mysql CI — build, test, and the store's linked + dropped-in conformance, against the busbar
+# rev this repo PINS.
+#
+# This repo builds standalone: its only busbar dependency (busbar-contract, and busbar-plugin-loader
+# for the conformance and end-to-end tests) is a `git` dependency on https://github.com/GetBusbar/busbar
+# at the rev in field 1 of `.busbar-ref`. No path dependency — so what CI proves is exactly what a
+# busbar build that pulls this repo at a pinned rev links.
+#
+# The end-to-end tests drive the REAL `busbar` and `busbar-plugin-pack` binaries (file-drop install,
+# admin-API install). Those are built from a busbar checkout AT THE SAME PIN beside this repo
+# (`busbar/`), which the tests find at `../busbar` (or `$BUSBAR_CHECKOUT`) and refuse unless its HEAD
+# is the pin.
+#
+# The live-MySQL cases run on the ubuntu leg against a real MySQL 8 service container
+# (`BUSBAR_TEST_MYSQL_URL`). GitHub offers no service containers on macOS, so the macos leg proves
+# fmt/clippy/build and the linked + dropped-in conformance's database-free arms (row statement,
+# first-party, the store's own open refusals, and both RED arms); every live case runs on ubuntu.
 name: ci
 
 on:
@@ -7,40 +22,123 @@ on:
     branches: [main, dev, qa]
   pull_request:
     branches: [main, dev, qa]
-  # Manual trigger. Needed because `gh run rerun` PINS the reusable-workflow SHA:
-  # a rerun re-uses the plugin-ci.yml snapshot from the original run, so a fix landing in
-  # core's reusable workflow can only be picked up by a NEW run, never by rerunning an old one.
   workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  ci:
-    uses: GetBusbar/busbar/.github/workflows/plugin-ci.yml@dev
-    with:
-      plugin_crate: busbar-store-mysql-plugin
-      plugin_kind: store
-      plugin_alias: mysql
-      service: mysql
-      busbar_ref: ${{ github.base_ref || github.ref_name }}
-      # base_ref FIRST: on a pull_request `github.ref_name` is '<number>/merge', not a branch
-      # name, so this asked busbar for a branch called '5/merge' and the sibling checkout died
-      # with an unreadable git error on EVERY pull request to this repo.
-      # Same-branch intent is unchanged: qa builds core qa, dev builds core dev, never a
-      # stale main or tag.
+  pin:
+    name: the busbar pin is one rev
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      rev: ${{ steps.pin.outputs.rev }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # Every `rev = "..."` on the busbar git source in every manifest is field 1 of `.busbar-ref`.
+      # Two revs would link two copies of the contract; a rev that disagrees with `.busbar-ref` makes
+      # the pin a lie about what the release builds against.
+      - name: every busbar git dependency names the .busbar-ref rev
+        id: pin
+        run: |
+          set -euo pipefail
+          pin=$(awk '{print $1; exit}' .busbar-ref)
+          [[ "$pin" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::.busbar-ref field 1 is not a full sha: '$pin'"; exit 1; }
+          found=$(grep -hoE 'git = "https://github.com/GetBusbar/busbar", rev = "[0-9a-f]+"' */Cargo.toml | grep -oE '[0-9a-f]{40}' | sort -u)
+          [ -n "$found" ] || { echo "::error::no busbar git dependency found"; exit 1; }
+          if [ "$found" != "$pin" ]; then
+            echo "::error::busbar revs in manifests ($found) != .busbar-ref ($pin)"; exit 1
+          fi
+          if grep -nE 'path = "\.\./\.\./' */Cargo.toml; then
+            echo "::error::a manifest names a sibling-checkout path dependency"; exit 1
+          fi
+          echo "pinned busbar rev: $pin"
+          echo "rev=$pin" >> "$GITHUB_OUTPUT"
+
+  build-test:
+    name: fmt, clippy, build, test, conformance [${{ matrix.os }}]
+    needs: [pin]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    # The ubuntu leg builds the real busbar binary (release) for the end-to-end tests.
+    timeout-minutes: 90
+    services:
+      # Real MySQL 8 for the live cases. Service containers exist on Linux runners only; on macOS the
+      # image expression is empty and no container starts.
+      mysql:
+        image: ${{ matrix.os == 'ubuntu-latest' && 'mysql:8@sha256:b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb' || '' }}
+        env:
+          MYSQL_ROOT_PASSWORD: busbar
+          MYSQL_USER: busbar
+          MYSQL_PASSWORD: busbar
+          MYSQL_DATABASE: busbar_test
+        ports:
+          - 3306:3306
+        options: >-
+          ${{ matrix.os == 'ubuntu-latest' && '--health-cmd "mysqladmin ping -h localhost -ubusbar -pbusbar" --health-interval 10s --health-timeout 5s --health-retries 10' || '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: plugin
+      - name: Checkout busbar at the pin (the real binaries the end-to-end tests drive)
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: GetBusbar/busbar
+          ref: ${{ needs.pin.outputs.rev }}
+          path: busbar
+      - uses: dtolnay/rust-toolchain@62ae3a85dbdd2bedbb5819da8ce45635129289a1 # 1.98.0
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            plugin
+            busbar
+      - name: fmt
+        working-directory: plugin
+        run: cargo fmt --all -- --check
+      - name: clippy
+        working-directory: plugin
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: build (the rlib a busbar build links, and the cdylib a signed tarball carries)
+        working-directory: plugin
+        run: cargo build --workspace --locked
+      - name: mysql — set strict sql_mode (dynamic variable, no restart needed)
+        if: matrix.os == 'ubuntu-latest'
+        # SET GLOBAL requires SUPER, which the image's MYSQL_USER account (busbar) lacks by design —
+        # only root has it.
+        run: mysql -h 127.0.0.1 -uroot -pbusbar -e "SET GLOBAL sql_mode='STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION';"
+      - name: test (the store's own suite, live MySQL, end-to-end, linked/dropped-in conformance)
+        if: matrix.os == 'ubuntu-latest'
+        working-directory: plugin
+        env:
+          BUSBAR_TEST_MYSQL_URL: mysql://busbar:busbar@127.0.0.1:3306/busbar_test
+        run: cargo test --workspace --locked
+      - name: conformance (database-free arms; no MySQL service on macOS runners)
+        if: matrix.os == 'macos-latest'
+        working-directory: plugin
+        # The test's live scenario follows the repo gate: unset + CI is a failure, unset off CI is a
+        # skip. This leg has no MySQL by construction, so it runs with CI unset and says so in its
+        # output; the live scenario runs on the ubuntu leg.
+        run: env -u CI cargo test --locked -p busbar-store-mysql-plugin --test conformance
 
   # ── coverage (llvm-cov · codecov) ─────────────────────────────────────────────────────────────
-  # ADDITIVE, NON-GATING coverage reporting for the README badge + per-PR line context. It is a
-  # SEPARATE job from the `ci` reusable-workflow call above and is deliberately NOT a required check:
-  #   * fail_ci_if_error: false — a Codecov outage / tokenless rate-limit is a no-op, never a red job.
-  #   * codecov.yml marks the statuses informational and comment:false, so a coverage delta can never
-  #     block a PR or turn dev/qa/main red. The correctness gate is the `ci` reusable workflow.
-  # It MIRRORS plugin-ci.yml's real MySQL 8 service container EXACTLY (same digest pin, env, ports,
-  # health options) plus the same strict `sql_mode` setup and BUSBAR_TEST_MYSQL_URL, so this plugin's
-  # live-DB roundtrip tests run UNDER coverage here rather than being skipped. This repo is a
-  # same-repo Cargo workspace whose only sibling-checkout deps are busbar-api / busbar-plugin-sdk /
-  # busbar-plugin-loader, so busbar is checked out at ../busbar (the path those deps name), with
-  # the same base_ref-first ref selection as the `ci` job above.
+  # ADDITIVE, NON-GATING coverage reporting for the README badge + per-PR line context. Not a
+  # required check: fail_ci_if_error: false, and codecov.yml marks every status informational. The
+  # correctness gate is `build-test` above. Same MySQL service and busbar checkout (at the pin).
   coverage:
     name: coverage (llvm-cov · codecov)
+    needs: [pin]
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     if: github.event_name != 'push' || contains(fromJSON('["refs/heads/main", "refs/heads/dev", "refs/heads/qa"]'), github.ref)
     services:
       mysql:
@@ -58,41 +156,32 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - name: Checkout the plugin
-        uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: plugin
-      - name: Checkout busbar (sibling path dependency)
-        uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: GetBusbar/busbar
-          # base_ref FIRST, same reasoning as the `ci` job above: on a pull_request github.ref_name is
-          # '<number>/merge', not a branch name, which would ask busbar for a non-existent branch.
-          ref: ${{ github.base_ref || github.ref_name }}
+          ref: ${{ needs.pin.outputs.rev }}
           path: busbar
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@62ae3a85dbdd2bedbb5819da8ce45635129289a1 # 1.98.0
         with:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
         with:
-          # Both Cargo workspaces live under path: checkouts (plugin/ and busbar/), nothing at the
-          # workspace root — the action would otherwise silently miss the cache. Same as plugin-ci.yml.
           workspaces: |
             plugin
             busbar
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
-      - name: mysql — set strict sql_mode (dynamic variable, no restart needed)
-        # SET GLOBAL requires SUPER, which the image's MYSQL_USER account (busbar) lacks by design —
-        # only root has it. Mirrors plugin-ci.yml's strict-mode step so the live-DB tests see the
-        # same server behaviour under coverage as they do under `ci`.
+      - name: mysql — set strict sql_mode
         run: mysql -h 127.0.0.1 -uroot -pbusbar -e "SET GLOBAL sql_mode='STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION';"
       - name: Collect coverage (workspace, live MySQL tests wired)
         working-directory: plugin
         env:
           BUSBAR_TEST_MYSQL_URL: mysql://busbar:busbar@127.0.0.1:3306/busbar_test
         run: cargo llvm-cov --workspace --locked --ignore-run-fail --lcov --output-path lcov.info
-      - name: Upload to Codecov (tokenless; never fails the build)
+      - name: Upload to Codecov (never fails the build)
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}

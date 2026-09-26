@@ -25,7 +25,7 @@
 //!
 //! The "reaches every backend on its next dependency bump" promise in the doc below is therefore
 //! NO LONGER TRUE of this copy, and is left standing as the record of what the shared crate was for.
-//! Contract conformance for [`busbar_api::Store`] — the checks every backend must pass identically.
+//! Contract conformance for [`busbar_contract::records::Store`] — the checks every backend must pass identically.
 //!
 //! These exist because an audit found the fleet disagreeing with itself: the same input produced a
 //! different outcome depending on which store an operator had deployed. `revoke_credential` on an
@@ -62,9 +62,9 @@
 //! }
 //! ```
 
-use busbar_api::{
+use busbar_contract::records::{
     AuditRecord, CredentialMeta, CredentialSecret, PlaneDisposition, PlaneRecord, PlaneSelector,
-    SecretForm, Store, VirtualKey,
+    RecordStore, SecretForm, VirtualKey,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
@@ -183,7 +183,7 @@ pub fn audit(seq: u64, action: &str) -> AuditRecord {
 /// Enforced in the store rather than by the caller on purpose: core's callers do check `deleted_at`
 /// first, but that is a read-then-write, and a `delete_key` committing in the gap goes straight
 /// through it. Only the backend can make the test and the write atomic.
-pub fn assert_put_key_does_not_resurrect_a_tombstone(store: &dyn Store, ns: &str) {
+pub fn assert_put_key_does_not_resurrect_a_tombstone(store: &dyn RecordStore, ns: &str) {
     let id = format!("{ns}_resurrect");
     let key = live_key(&id);
     store.put_key(&key).expect("seed the live key");
@@ -233,7 +233,7 @@ pub fn assert_put_key_does_not_resurrect_a_tombstone(store: &dyn Store, ns: &str
 /// "already tombstoned" means the intent is satisfied and the evidence is on disk, while "no such
 /// id" means nothing was touched, and `Ok(())` there tells an operator a key was revoked when it was
 /// not.
-pub fn assert_delete_key_unknown_id_is_an_error(store: &dyn Store, ns: &str) {
+pub fn assert_delete_key_unknown_id_is_an_error(store: &dyn RecordStore, ns: &str) {
     assert!(
         store.delete_key(&format!("{ns}_no_such_key")).is_err(),
         "delete_key on an id that names no row returned Ok — an operator who typo'd an id is told \
@@ -255,7 +255,7 @@ pub fn assert_delete_key_unknown_id_is_an_error(store: &dyn Store, ns: &str) {
 /// no-op lets an operator believe a leaked secret was killed when it was not.
 ///
 /// Skip on a backend with no credential support.
-pub fn assert_revoke_credential_unknown_id_is_an_error(store: &dyn Store, ns: &str) {
+pub fn assert_revoke_credential_unknown_id_is_an_error(store: &dyn RecordStore, ns: &str) {
     assert!(
         store
             .revoke_credential(&format!("{ns}_no_such_cred"), "leaked")
@@ -288,7 +288,7 @@ pub fn assert_revoke_credential_unknown_id_is_an_error(store: &dyn Store, ns: &s
 /// away only the rows that existed at that moment.
 ///
 /// Skip on a backend with no credential support.
-pub fn assert_put_credential_requires_a_live_key(store: &dyn Store, ns: &str) {
+pub fn assert_put_credential_requires_a_live_key(store: &dyn RecordStore, ns: &str) {
     let absent = format!("{ns}_no_such_owner");
     assert!(
         store
@@ -324,7 +324,7 @@ pub fn assert_put_credential_requires_a_live_key(store: &dyn Store, ns: &str) {
 /// with no credential that the caller was told did not get created.
 ///
 /// Skip on a backend with no credential support.
-pub fn assert_put_key_with_credential_is_atomic(store: &dyn Store, ns: &str) {
+pub fn assert_put_key_with_credential_is_atomic(store: &dyn RecordStore, ns: &str) {
     let incumbent_key = format!("{ns}_mintowner");
     let incumbent_cred = format!("{ns}_mintcred");
     store
@@ -361,7 +361,7 @@ pub fn assert_put_key_with_credential_is_atomic(store: &dyn Store, ns: &str) {
 ///
 /// `seq` must be free before this runs (see the module doc on namespacing). Skip on a backend that
 /// does not provide durable audit (the defaulted no-op).
-pub fn assert_append_audit_duplicate_seq(store: &dyn Store, seq: u64) {
+pub fn assert_append_audit_duplicate_seq(store: &dyn RecordStore, seq: u64) {
     let first = audit(seq, "hook.register");
     store.append_audit(&first).expect("first append");
     store
@@ -575,7 +575,7 @@ fn body<T: serde::Serialize>(row: &T) -> Vec<u8> {
 /// **`upsert_plane_record`/`get_plane_record` (kind `task`) round-trip.** A task written through the
 /// neutral upsert reads back through the neutral point-read as the same row; an unknown id is `None`,
 /// not an error; and the row appears in the kind's unfiltered listing.
-pub fn assert_plane_task_upsert_get_list(store: &dyn Store, ns: &str) {
+pub fn assert_plane_task_upsert_get_list(store: &dyn RecordStore, ns: &str) {
     let record = plane_task(ns, "working");
     let task_id = record.id.clone();
     let expected: SampleTask =
@@ -617,7 +617,7 @@ pub fn assert_plane_task_upsert_get_list(store: &dyn Store, ns: &str) {
 /// **`append_plane_record`/`list_plane_records(Parent)` (kind `task_event`) orders by `seq`.** Events
 /// appended OUT of order come back oldest-first — the property the engine's chain verifier depends
 /// on. This is exactly the cross-backend ruling that used to live only in each backend's own suite.
-pub fn assert_plane_event_chain_is_ordered_by_seq(store: &dyn Store, ns: &str) {
+pub fn assert_plane_event_chain_is_ordered_by_seq(store: &dyn RecordStore, ns: &str) {
     let parent = format!("{ns}_pchain");
     // Append seq 2 BEFORE seq 1: a backend that returns insertion order rather than `seq` order fails.
     for seq in [2u64, 1u64] {
@@ -641,7 +641,7 @@ pub fn assert_plane_event_chain_is_ordered_by_seq(store: &dyn Store, ns: &str) {
 /// **`list_plane_record_parents` (kind `call`) enumerates every parent with a record.** The boot
 /// enumeration a restart resumes chains from — it must find a principal this process never saw
 /// written.
-pub fn assert_plane_call_parents_enumerated(store: &dyn Store, ns: &str) {
+pub fn assert_plane_call_parents_enumerated(store: &dyn RecordStore, ns: &str) {
     let p1 = format!("{ns}_prinA");
     let p2 = format!("{ns}_prinB");
     // ts is a fixed sentinel far above any `ns_time_band` window the purge checks below can produce
@@ -668,7 +668,7 @@ pub fn assert_plane_call_parents_enumerated(store: &dyn Store, ns: &str) {
 
 /// **`upsert_plane_record`/`list_plane_records(All)`/`delete_plane_record` (kind `demotion`).** A
 /// demotion is recorded, listed, then dropped; deleting an ABSENT record is a no-op, not an error.
-pub fn assert_plane_demotion_upsert_list_delete(store: &dyn Store, ns: &str) {
+pub fn assert_plane_demotion_upsert_list_delete(store: &dyn RecordStore, ns: &str) {
     let s1 = format!("{ns}_srvA");
     let s2 = format!("{ns}_srvB");
     for server in [&s1, &s2] {
@@ -676,7 +676,7 @@ pub fn assert_plane_demotion_upsert_list_delete(store: &dyn Store, ns: &str) {
             .upsert_plane_record(&plane_demotion(server))
             .expect("upsert a demotion plane record");
     }
-    let servers = |store: &dyn Store| -> Vec<String> {
+    let servers = |store: &dyn RecordStore| -> Vec<String> {
         store
             .list_plane_records("demotion", &PlaneSelector::All)
             .expect("list demotions")
@@ -731,7 +731,7 @@ pub fn assert_plane_demotion_upsert_list_delete(store: &dyn Store, ns: &str) {
 /// SURVIVOR evidence below (this run's own older row, addressed by id/parent, is gone; its own newer
 /// row is still readable), because `new_ts` never crosses the shared `cutoff` regardless of who
 /// dropped what when.
-pub fn assert_plane_purge_honours_the_cutoff(store: &dyn Store, ns: &str) {
+pub fn assert_plane_purge_honours_the_cutoff(store: &dyn RecordStore, ns: &str) {
     let parent = format!("{ns}_purgeprin");
     // `cutoff` is FIXED and shared by every run (see `ns_purge_window`); only `old_ts`/`new_ts` are
     // salted per `ns`, each confined to its own side of `cutoff`, so no run's sweep can ever reach a
@@ -803,7 +803,7 @@ pub fn assert_plane_purge_honours_the_cutoff(store: &dyn Store, ns: &str) {
 ///
 /// The cutoff still applies on top: a TERMINAL row newer than `before` stays. So the three rows
 /// below separate the two axes, and a backend that honours only one of them fails.
-pub fn assert_plane_purge_task_keeps_active_rows(store: &dyn Store, ns: &str) {
+pub fn assert_plane_purge_task_keeps_active_rows(store: &dyn RecordStore, ns: &str) {
     // See `ns_purge_window`: `cutoff` is fixed and shared by every run; only `old_ts`/`fresh_ts` are
     // salted per `ns`, each confined to its own side of `cutoff`, well under the ~1_700_000_000
     // epoch-second fixtures other helpers in this module use for the same `task` kind.
@@ -858,7 +858,7 @@ pub fn assert_plane_purge_task_keeps_active_rows(store: &dyn Store, ns: &str) {
 /// **`redeem_plane_token` (kind `ask`) is a single-use test-and-set.** The FIRST redemption of a
 /// nonce is `true`, every later one is `false` — the durable ledger that makes a confirm-once tool
 /// execute once across a restart and across two nodes. A different nonce is still redeemable.
-pub fn assert_plane_token_is_single_use(store: &dyn Store, ns: &str) {
+pub fn assert_plane_token_is_single_use(store: &dyn RecordStore, ns: &str) {
     let token = format!("{ns}_asknonce");
     let expires_at = 2_000_000_000;
     let now = 1_700_000_000;

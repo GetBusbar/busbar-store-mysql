@@ -11,7 +11,7 @@
 //! same `busbar-plugin-pack` tool CI's own SIGNOFF step uses), drops it into a real `plugins.dir`,
 //! and runs the REAL `busbar --validate` binary against a config naming `store: { module: mysql }` —
 //! the documented file-drop install path. `--validate` genuinely exercises the trust gate + ABI
-//! dlopen + `Store::connect` (real schema migration against real MySQL), so a successful validate is
+//! dlopen + `RecordStore::connect` (real schema migration against real MySQL), so a successful validate is
 //! real proof the plugin loads and initializes through busbar's own boot path, not a proxy for it.
 //!
 //! Persistence is then proven the same two independent ways the prior direct-call test used:
@@ -193,12 +193,38 @@ fn cleanup(url: &str, id: &str) {
     }
 }
 
-/// The sibling busbar checkout's root (same convention this repo already uses for its path deps).
+/// The busbar checkout the real binaries are built from: `$BUSBAR_CHECKOUT`, else a sibling
+/// `busbar/` beside this repo (ci.yml checks GetBusbar/busbar out there at the `.busbar-ref` pin).
+/// It must be AT the pin (`.busbar-ref` field 1): an end-to-end proof against any other busbar is a
+/// proof about a binary this repo does not build against.
 fn busbar_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../busbar")
-        .canonicalize()
-        .expect("sibling busbar checkout must exist (see Cargo.toml path deps)")
+    let root = std::env::var_os("BUSBAR_CHECKOUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../busbar"));
+    let root = root.canonicalize().unwrap_or_else(|e| {
+        panic!(
+            "no busbar checkout at {} ({e}): set BUSBAR_CHECKOUT to a GetBusbar/busbar checkout at \
+             the .busbar-ref pin, or check it out beside this repo",
+            root.display()
+        )
+    });
+    let pin = include_str!("../../.busbar-ref")
+        .split_whitespace()
+        .next()
+        .expect(".busbar-ref field 1 is the pinned busbar sha")
+        .to_string();
+    let head = Command::new("git")
+        .args(["-C", root.to_str().unwrap(), "rev-parse", "HEAD"])
+        .output()
+        .expect("git rev-parse the busbar checkout");
+    let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    assert_eq!(
+        head,
+        pin,
+        "the busbar checkout at {} is not at the .busbar-ref pin",
+        root.display()
+    );
+    root
 }
 
 /// Build (once, cached by cargo) and return the path to the real `busbar` binary and the real
@@ -207,17 +233,17 @@ fn busbar_root() -> PathBuf {
 fn build_real_binaries() -> (PathBuf, PathBuf) {
     let root = busbar_root();
     let status = Command::new("cargo")
-        // `busbar-plugin-pack` is a feature-gated `[[bin]]` of `busbar-plugin-sdk` in busbar 1.6.0
-        // (it used to be a package of its own), built the way busbar's own release workflow does.
+        // `busbar-plugin-pack` is a feature-gated `[[bin]]` of `busbar-plugin-loader` in busbar 1.6.0
+        // (roster def 14), built the way busbar's own release workflow does.
         .args([
             "build",
             "--release",
             "-p",
             "busbar",
             "-p",
-            "busbar-plugin-sdk",
+            "busbar-plugin-loader",
             "--features",
-            "busbar-plugin-sdk/pack",
+            "busbar-plugin-loader/pack",
             "--bin",
             "busbar",
             "--bin",
@@ -345,7 +371,7 @@ fn load_and_exercise_mysql_plugin_via_file_drop() {
 
     // PROOF real MySQL was touched by the REAL busbar process, through the REAL file-drop path: an
     // independent connection (bypassing the plugin/ABI/loader entirely) confirms the schema now
-    // exists -- --validate's own plugin-open call ran Store::connect, which runs init_schema(). Also
+    // exists -- --validate's own plugin-open call ran RecordStore::connect, which runs init_schema(). Also
     // exercises MysqlStore::connect itself as the second independent-verification leg the prior
     // direct-call test used.
     let _direct = MysqlStore::connect(&url)
@@ -362,7 +388,7 @@ fn load_and_exercise_mysql_plugin_via_file_drop() {
     assert!(
         exists,
         "the api_keys table must exist after busbar --validate loaded the plugin via file-drop -- \
-         proof the real boot path actually called Store::connect/init_schema, not a no-op"
+         proof the real boot path actually called RecordStore::connect/init_schema, not a no-op"
     );
 
     let _ = std::fs::remove_dir_all(&work);
@@ -452,7 +478,7 @@ fn decode(b: &[u8]) -> serde_json::Value {
 /// see the failure that actually matters in production, because in production this backend is ONLY
 /// ever reached as a plugin.
 ///
-/// `busbar_api::Store` DEFAULTS every one of these verbs to accept-and-keep-nothing. A plugin seam
+/// `busbar_contract::records::Store` DEFAULTS every one of these verbs to accept-and-keep-nothing. A plugin seam
 /// that does not RELAY them silently substitutes those defaults: every write returns `Ok`, every
 /// read answers empty, and a deployment loses every in-flight A2A task and every tool-call record
 /// while reporting success. That is not hypothetical — the ABI once carried four store methods while
@@ -467,7 +493,7 @@ fn decode(b: &[u8]) -> serde_json::Value {
 /// answered from its own in-process cache still fails here.
 #[test]
 fn tasks_and_call_log_survive_an_unload_and_reload_over_the_real_plugin_abi() {
-    use busbar_api::{PlaneDisposition, PlaneRecord, PlaneSelector, Store};
+    use busbar_contract::records::{PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore};
 
     let path = plugin_path();
     let Some(url) = mysql_url() else {
@@ -662,13 +688,13 @@ fn tasks_and_call_log_survive_an_unload_and_reload_over_the_real_plugin_abi() {
     // LEG 3 — the surviving rows through the plain `MysqlStore`, never the cdylib / ABI / loader.
     assert_eq!(
         ids_of(
-            Store::list_plane_records(&direct, "task", &PlaneSelector::All)
+            RecordStore::list_plane_records(&direct, "task", &PlaneSelector::All)
                 .expect("list tasks via the direct connection")
         ),
         vec!["t_alpha", "t_beta"],
         "the tasks must be physically present in MySQL, not just cached in-process by the plugin"
     );
-    let direct_events = Store::list_plane_records(
+    let direct_events = RecordStore::list_plane_records(
         &direct,
         "task_event",
         &PlaneSelector::Parent("t_alpha".into()),
@@ -676,14 +702,16 @@ fn tasks_and_call_log_survive_an_unload_and_reload_over_the_real_plugin_abi() {
     .expect("list task events via the direct connection");
     assert_eq!(seqs_of(&direct_events), vec![1, 2, 3]);
     let direct_calls =
-        Store::list_plane_records(&direct, "call", &PlaneSelector::Parent("vk_abi".into()))
+        RecordStore::list_plane_records(&direct, "call", &PlaneSelector::Parent("vk_abi".into()))
             .expect("list calls via the direct connection");
     assert_eq!(seqs_of(&direct_calls), vec![2, 3]);
-    assert!(
-        Store::list_plane_records(&direct, "call", &PlaneSelector::Parent("vk_other".into()))
-            .expect("list calls")
-            .is_empty()
-    );
+    assert!(RecordStore::list_plane_records(
+        &direct,
+        "call",
+        &PlaneSelector::Parent("vk_other".into())
+    )
+    .expect("list calls")
+    .is_empty());
 
     wipe_task_and_call_rows(&url);
 }
@@ -725,7 +753,7 @@ fn clear_trust_rows(url: &str, servers: &[&str], nonces: &[&str]) {
 /// of two properties whose unimplemented form is silently green.
 #[test]
 fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
-    use busbar_api::{PlaneDisposition, PlaneRecord, PlaneSelector, Store};
+    use busbar_contract::records::{PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore};
 
     let path = plugin_path();
     let url = std::env::var("BUSBAR_TEST_MYSQL_URL").unwrap_or_else(|_| {
@@ -769,7 +797,7 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         disposition: PlaneDisposition::Active,
         body: body(serde_json::json!({ "server": server, "reason": reason, "recorded_at": at })),
     };
-    let mine = |store: &dyn Store| -> Vec<serde_json::Value> {
+    let mine = |store: &dyn RecordStore| -> Vec<serde_json::Value> {
         store
             .list_plane_records("demotion", &PlaneSelector::All)
             .expect("list demotions")
@@ -850,7 +878,7 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         "the demotion must be physically present in MySQL, not merely cached in the plugin"
     );
     assert!(
-        !Store::redeem_plane_token(&direct, "ask", &nonce_restart, NOW + 900, NOW + 5)
+        !RecordStore::redeem_plane_token(&direct, "ask", &nonce_restart, NOW + 900, NOW + 5)
             .expect("redeem via the direct connection"),
         "the spent-approval row must be physically present in MySQL"
     );
@@ -869,7 +897,7 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
 /// boot, which lists every key, refused to start against this backend.
 #[test]
 fn a_non_pool_scope_grant_crosses_the_plugin_abi() {
-    use busbar_api::{ScopeRef, VirtualKey};
+    use busbar_contract::records::{ScopeRef, VirtualKey};
 
     let path = plugin_path();
     let Some(url) = mysql_url() else {
@@ -895,7 +923,7 @@ fn a_non_pool_scope_grant_crosses_the_plugin_abi() {
         created_at: 1_000,
         ..Default::default()
     };
-    busbar_api::register_scope_kind("mcp_server"); // the engine side registers it at boot
+    busbar_contract::records::register_scope_kind("mcp_server"); // the engine side registers it at boot
     store
         .put_key(&key)
         .expect("put a key with an mcp_server grant");

@@ -52,11 +52,11 @@ cargo fmt --all -- --check                   # format before committing
 
 This repo is a 2-crate Cargo workspace and brings everything it needs:
 
-- `store-mysql-plugin/` is a thin adapter: it turns the engine's JSON `open`
-  config into a `MysqlStore` and hands the trait object to
-  [`busbar-plugin-sdk`](https://github.com/GetBusbar/busbar/tree/main/crates/plugin-sdk),
-  which emits the C ABI symbols the loader resolves.
-- `store-mysql/` is the real library crate: all the SQL, the schema, the
+- `store-mysql-plugin/` is the thin cdylib: it re-exports `store-mysql`, whose one
+  door registration (`busbar_contract::abi::sdk::export_store_plugin!(open)`, from
+  [`busbar-contract`](https://github.com/GetBusbar/busbar/tree/main/crates/busbar-contract))
+  is what the C ABI symbols the loader resolves answer through.
+- `store-mysql/` is the real library crate: the door, all the SQL, the schema, the
   migrations and their tests live here, in THIS repository. Most substantive
   changes belong here, not in the `busbar` monorepo.
 

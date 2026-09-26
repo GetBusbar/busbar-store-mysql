@@ -18,7 +18,7 @@
 //!   4. Stop that process, rewrite `config.yaml` to point `store: module: mysql` at the real MySQL,
 //!      using the SAME plugins.dir the admin API itself wrote the tarball to in step 2.
 //!   5. Boot a SECOND real `busbar` process against that config — its first-boot store resolution
-//!      dlopens the admin-installed plugin and runs `Store::connect()`/schema init. Poll — via a RAW
+//!      dlopens the admin-installed plugin and runs `RecordStore::connect()`/schema init. Poll — via a RAW
 //!      independent `mysql::Pool`, never `MysqlStore::connect` — for `api_keys` to appear.
 //!   6. `POST /api/v1/admin/keys` (with `issue_aws_credential: true`) against this SECOND process.
 //!   7. Independently verify — a fresh RAW `mysql::Pool`, bypassing the plugin/ABI/admin-API
@@ -222,27 +222,54 @@ fn plugin_path() -> PathBuf {
     fresh
 }
 
+/// The busbar checkout the real binaries are built from: `$BUSBAR_CHECKOUT`, else a sibling
+/// `busbar/` beside this repo (ci.yml checks GetBusbar/busbar out there at the `.busbar-ref` pin).
+/// It must be AT the pin (`.busbar-ref` field 1): an end-to-end proof against any other busbar is a
+/// proof about a binary this repo does not build against.
 fn busbar_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../busbar")
-        .canonicalize()
-        .expect("sibling busbar checkout must exist (see Cargo.toml path deps)")
+    let root = std::env::var_os("BUSBAR_CHECKOUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../busbar"));
+    let root = root.canonicalize().unwrap_or_else(|e| {
+        panic!(
+            "no busbar checkout at {} ({e}): set BUSBAR_CHECKOUT to a GetBusbar/busbar checkout at \
+             the .busbar-ref pin, or check it out beside this repo",
+            root.display()
+        )
+    });
+    let pin = include_str!("../../.busbar-ref")
+        .split_whitespace()
+        .next()
+        .expect(".busbar-ref field 1 is the pinned busbar sha")
+        .to_string();
+    let head = Command::new("git")
+        .args(["-C", root.to_str().unwrap(), "rev-parse", "HEAD"])
+        .output()
+        .expect("git rev-parse the busbar checkout");
+    let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    assert_eq!(
+        head,
+        pin,
+        "the busbar checkout at {} is not at the .busbar-ref pin",
+        root.display()
+    );
+    root
 }
 
 fn build_real_binaries() -> (PathBuf, PathBuf) {
     let root = busbar_root();
     let status = Command::new("cargo")
-        // `busbar-plugin-pack` is a feature-gated `[[bin]]` of `busbar-plugin-sdk` in busbar 1.6.0
-        // (it used to be a package of its own), built the way busbar's own release workflow does.
+        // `busbar-plugin-pack` is a feature-gated `[[bin]]` of `busbar-plugin-loader` in busbar 1.6.0
+        // (roster def 14), built the way busbar's own release workflow does.
         .args([
             "build",
             "--release",
             "-p",
             "busbar",
             "-p",
-            "busbar-plugin-sdk",
+            "busbar-plugin-loader",
             "--features",
-            "busbar-plugin-sdk/pack",
+            "busbar-plugin-loader/pack",
             "--bin",
             "busbar",
             "--bin",
@@ -562,7 +589,7 @@ fn install_over_admin_api_then_mint_a_key_and_verify_mysql_directly() {
 
     // Poll -- via a RAW independent mysql::Pool, never MysqlStore::connect -- for `api_keys` to
     // appear, the only genuine confirmation boot #2 dlopened the admin-installed plugin and ran
-    // Store::connect()/schema init before ever handling a request.
+    // RecordStore::connect()/schema init before ever handling a request.
     let deadline = Instant::now() + Duration::from_secs(15);
     let booted = loop {
         if let Ok(pool) = mysql::Pool::new(mysql::Opts::from_url(&url).unwrap()) {

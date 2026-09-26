@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 use super::*;
-use busbar_api::ModelTokensDelta;
+use busbar_contract::records::ModelTokensDelta;
 use std::collections::BTreeMap;
 
 /// A name-keyed `usage_units` map from literal pairs — the 1.6.0 shape of what used to be the four
@@ -451,15 +451,15 @@ fn usage_request_counters_do_not_multiply_with_the_model_count() {
     s.add_usage(
         "vk_multimodel",
         1_000_101,
-        &busbar_api::UsageDelta {
+        &busbar_contract::records::UsageDelta {
             requests: 2,
             billable_requests: 1,
             models: vec![
-                busbar_api::ModelTokensDelta {
+                busbar_contract::records::ModelTokensDelta {
                     model: "gpt-x".to_string(),
                     usage_units: units(&[(UNIT_INPUT, 1), (UNIT_OUTPUT, 1)]),
                 },
-                busbar_api::ModelTokensDelta {
+                busbar_contract::records::ModelTokensDelta {
                     model: "gpt-y".to_string(),
                     usage_units: units(&[(UNIT_INPUT, 1), (UNIT_OUTPUT, 1)]),
                 },
@@ -817,7 +817,7 @@ fn connect_establishes_strict_sql_mode_via_init_even_when_the_default_would_be_p
 /// detector would abort one side with a real "Deadlock found" error under this contention.
 ///
 /// The deleter used to keep the row alive by re-`put_key`ing a LIVE key straight over the tombstone
-/// it had just written. That is the resurrection `Store::put_key` now refuses, so the loop clears the
+/// it had just written. That is the resurrection `RecordStore::put_key` now refuses, so the loop clears the
 /// tombstone with a raw hard DELETE instead — test scaffolding, not a store operation, and
 /// deliberately not `delete_key`, whose lock ordering is the thing under test and must keep running
 /// against a real live row every iteration.

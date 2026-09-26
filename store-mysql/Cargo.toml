@@ -5,14 +5,19 @@ version = "1.0.0"
 publish = false            # internal workspace crate; never goes to crates.io
 edition = "2021"
 rust-version = "1.97"
-description = "The MySQL/MariaDB backend for busbar's durable governance store — the shared, multi-node db plugin. Implements busbar_api::Store over a mutex-guarded sync mysql client."
+description = "The MySQL/MariaDB backend for busbar's durable governance store — the shared, multi-node db plugin. Implements busbar_contract::records::RecordStore over a mutex-guarded sync mysql client."
 license = "Apache-2.0"
 
+[lib]
+# rlib: THE LOGIC, and the store's one door registration (`export_store_plugin!(open)`, its
+# `linked::STORE` row and `BUSBAR_COLD_ENTRY`). The sibling `busbar-store-mysql-plugin` cdylib
+# re-exports it as the dropped-in door. One source, both doors (DECISIONS #2 rule (1)).
+crate-type = ["rlib"]
+
 [dependencies]
-# INTERIM: busbar isn't public yet, so this is a local path dependency into a sibling checkout of
-# the monorepo. Once busbar ships publicly this should become a git (pinned rev/tag) or crates.io
-# dependency instead — same pattern already applied across every other first-party plugin.
-busbar-api = { path = "../../busbar/crates/api" }
+# The ONE busbar crate a plugin names (#40: contract only; DECISIONS #84 merged the plugin SDK into it
+# as `busbar_contract::abi::sdk`). Pinned by git rev to the busbar commit in `.busbar-ref`.
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "8b7b6473f47f8d37ae60839c74cfe6a9b64a1dc9" }
 mysql = { version = "26", default-features = false, features = ["minimal"] }
 serde_json = "1"
 ulid = "1"
@@ -22,5 +27,5 @@ ulid = "1"
 # ruled that crate DELETED on 2026-09-22 and #2/#31 forbid a shared test util between plugins, so
 # this crate owns its copy at `src/tests/store_conformance.rs`. Its plane-record battery serializes
 # throwaway stand-in rows into the opaque bodies it writes, which is the one thing it needs beyond
-# `busbar-api` (a normal dependency above) and `serde_json`.
+# `busbar-contract` (a normal dependency above) and `serde_json`.
 serde = { version = "1", features = ["derive"] }
