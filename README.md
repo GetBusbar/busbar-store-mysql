@@ -1,6 +1,6 @@
 # busbar-store-mysql
 
-[![Coverage](https://codecov.io/gh/GetBusbar/store-mysql/branch/dev/graph/badge.svg)](https://codecov.io/gh/GetBusbar/store-mysql)
+[![Coverage](https://codecov.io/gh/GetBusbar/busbar-store-mysql/branch/dev/graph/badge.svg)](https://codecov.io/gh/GetBusbar/busbar-store-mysql)
 
 The MySQL/MariaDB backend for busbar's durable governance store — a `kind: store` plugin.
 

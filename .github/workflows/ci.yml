@@ -189,5 +189,5 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: plugin/lcov.info
-          slug: GetBusbar/store-mysql
+          slug: GetBusbar/busbar-store-mysql
           fail_ci_if_error: false
