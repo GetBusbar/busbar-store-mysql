@@ -1,341 +1,57 @@
-# Release: on a version tag (e.g. v1.0.0), build the store-mysql plugin cdylib for all 5
-# supported targets, pack + sign each into a loadable busbar plugin tarball, and publish them to
-# THIS repo's own GitHub Release.
-#
-# Same 5-target matrix, same BUSBAR_SIGN_KEY-or-`--allow-unsigned` fallback, same `gh release
-# upload` + build-provenance attestation pattern busbar's own plugins use — every plugin (including
-# this one) releases from its own repo.
-#
-# CONTRACT-ONLY BUILD (busbar 1.6.0). The cdylib's one busbar dependency is busbar-contract, a `git`
-# dependency on GetBusbar/busbar at the rev in `.busbar-ref` field 1 (ci.yml's `pin` job refuses a
-# manifest that disagrees). The plugin builds standalone with `--locked`; the busbar checkout at that
-# same rev exists ONLY to build the packer (busbar-plugin-pack, from busbar-plugin-loader) and for
-# the ABI-completeness read — nothing in this repo's build reaches into it by path.
-#
-# This plugin's own version (the `v*` tag pushed here) is NOT tied to busbar's version number —
-# it is independently versioned starting at 0.5.0 (see README), separate from whichever busbar
-# commit it happens to build against via the .busbar-ref file at repo root.
+# RENDERED by `cargo xtask fleet render busbar-store-mysql` from GetBusbar/busbar's plugins.yaml and
+# .github/fleet/ templates; `cargo xtask fleet check` is red on any edit here. On a v* tag: this
+# repo's CI on the tagged commit, then busbar's plugin-release.yml (build, sign, pack, publish), then
+# the consumer verification of what was published, each at the busbar commit this repo pins.
 name: release
 
 on:
   push:
-    tags:
-      - "v*"
+    tags: ["v*", "!v*-*"]
+  # A tag pushed with GITHUB_TOKEN starts no workflow, so a workflow that tags dispatches this on
+  # the tag ref (`gh workflow run release.yml --ref <tag>`).
+  workflow_dispatch: {}
 
 permissions:
-  contents: write      # create the Release + upload assets
-  id-token: write      # OIDC identity for keyless Sigstore signing (provenance)
-  attestations: write  # record the build-provenance attestation
+  contents: write
+  id-token: write
+  attestations: write
+  issues: write
+  actions: read
 
 jobs:
-  # ── TEST GATE ────────────────────────────────────────────────────────────────────────────────
-  # Nothing is built, signed or attested until this repo's own suite passes AGAINST THE EXACT CORE
-  # COMMIT THIS RELEASE WILL BUILD AGAINST.
-  #
-  # This was missing, and the gap was not theoretical: `ci.yml` is armed on branch pushes and PRs
-  # only, so a `v*` tag event did not trigger it AT ALL, while `release-on-upstream.yml`'s cron cuts
-  # those tags automatically. A signed, provenance-attested plugin could therefore ship from a
-  # commit whose suite never ran in that run -- the attestation would faithfully certify the
-  # provenance of an untested artifact.
-  #
-  # `busbar_ref` is resolved from `.busbar-ref`, NOT from the branch: the release builds against a
-  # pinned core SHA, so the gate has to test against that same SHA or it is not testing what ships.
-  # Testing against a moving branch instead is the other half of the same defect.
-  resolve-busbar-ref:
-    runs-on: ubuntu-latest
-    outputs:
-      sha: ${{ steps.ref.outputs.sha }}
-    steps:
-      - uses: actions/checkout@v7
-      - name: Resolve busbar ref from .busbar-ref
-        id: ref
-        run: echo "sha=$(cut -d' ' -f1 .busbar-ref)" >> "$GITHUB_OUTPUT"
-        shell: bash
-
-  # This repo's OWN ci.yml, on the tagged commit: its `pin` job proves every manifest's busbar rev
-  # IS `.busbar-ref` field 1, then fmt/clippy/build/test and the linked + dropped-in conformance run
-  # against that rev with live MySQL. (busbar's shared plugin-ci.yml assumed a sibling path checkout
-  # of the retired plugin-sdk and cannot build a contract-only plugin.)
-  gate:
-    needs: resolve-busbar-ref
-    uses: ./.github/workflows/ci.yml
+  ci:
+    uses: GetBusbar/busbar/.github/workflows/plugin-ci.yml@7a5b429041752e00375e120ab1547a8928c3dee4
+    with:
+      service: mysql
+      busbar_checkout: true
+      macos_test: "env -u CI cargo test --locked -p busbar-store-mysql-plugin --test conformance"
+      extra_test: ""
     secrets: inherit
-
-  # ── ABI-COMPLETENESS GATE ────────────────────────────────────────────────────────────────────
-  # THE GATE THAT REFUSES A CDYLIB THE PINNED ABI CANNOT CARRY. This runs BEFORE `create-release`,
-  # so a failure here leaves no tag-attached Release, no artifact, no signature and no attestation.
-  #
-  # `gate` above proves this repo's suite passes against the pinned core. It cannot prove the pinned
-  # contract's `store_dispatch` actually ROUTES the RecordStore methods this repo implements — the
-  # suite exercises the trait in-process, while a shipped plugin is reached over the C ABI. Because
-  # `busbar_contract::records::RecordStore` gives several methods a DEFAULT body, an unrouted method
-  # does not fail to compile: it compiles, packs, signs, attests, and then silently takes the default
-  # at runtime, reporting success while dropping the write. busbar 74a1f9fa ("a task written through
-  # a plugin store is no longer discarded") is that bug, already shipped once.
-  #
-  # The check is generic — it derives the method list from this repo's own `impl RecordStore for` block
-  # rather than naming any one feature, so it stays correct as the Store trait grows and cannot go
-  # stale the way a hardcoded pin can. See .github/scripts/verify-abi-completeness.sh.
-  abi-completeness:
-    needs: resolve-busbar-ref
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout store-mysql
-        uses: actions/checkout@v7
-        with:
-          path: store-mysql
-
-      - name: Checkout busbar at the PINNED .busbar-ref sha (not a branch)
-        uses: actions/checkout@v7
-        with:
-          repository: GetBusbar/busbar
-          ref: ${{ needs.resolve-busbar-ref.outputs.sha }}
-          path: busbar
-
-      - name: Every RecordStore method implemented here must be routed by the pinned ABI
-        run: bash store-mysql/.github/scripts/verify-abi-completeness.sh store-mysql busbar
-        shell: bash
-
-  # Create the Release first so the parallel per-target upload jobs have something to attach to
-  # (uploading from a matrix without a pre-existing release races -> "release not found").
-  create-release:
-    needs: [gate, abi-completeness]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - name: Create GitHub Release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          if ! out=$(gh release create "${GITHUB_REF_NAME}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --title "busbar-store-mysql ${GITHUB_REF_NAME}" \
-            --draft \
-            --verify-tag --generate-notes 2>&1); then
-            if echo "$out" | grep -qi "already exists"; then
-              echo "$out"
-              echo "Release ${GITHUB_REF_NAME} already exists — reusing it (parallel matrix re-run or race)."
-              gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}"
-            else
-              echo "$out" >&2
-              exit 1
-            fi
-          else
-            echo "$out"
-          fi
-
-  # One signed .tar.gz per target: {cdylib + manifest.json}, packed by busbar-plugin-pack and
-  # signed with the busbar release PRIVATE key (BUSBAR_SIGN_KEY secret) so it verifies as
-  # first-party against the PUBLIC key embedded in busbar's own release binaries. If that secret
-  # isn't provisioned on this repo, falls back to an UNSIGNED tarball (loadable only under
-  # plugins.trust.allow_unsigned) rather than blocking the release — same seam busbar's own
-  # release.yml documents (TODO(release-keys)).
-  store-plugin:
-    needs: create-release
-    name: store-plugin (${{ matrix.target }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            libext: so
-            libprefix: lib
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-24.04-arm
-            libext: so
-            libprefix: lib
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            libext: dylib
-            libprefix: lib
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            libext: dylib
-            libprefix: lib
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            libext: dll
-            libprefix: ""
-    steps:
-      - name: Checkout store-mysql
-        uses: actions/checkout@v7
-        with:
-          path: store-mysql
-
-      - name: Resolve busbar ref from .busbar-ref
-        id: ref
-        run: echo "sha=$(cut -d' ' -f1 store-mysql/.busbar-ref)" >> "$GITHUB_OUTPUT"
-        shell: bash
-
-      # Source of the packer only; the plugin itself resolves busbar-contract from git at this rev.
-      - name: Checkout busbar at the pin (builds busbar-plugin-pack)
-        uses: actions/checkout@v7
-        with:
-          repository: GetBusbar/busbar
-          ref: ${{ steps.ref.outputs.sha }}
-          path: busbar
-
-      # The toolchain rust-toolchain.toml pins (both repos name 1.98.0). A floating `@stable` would
-      # install the target on a toolchain rustup then ignores in favour of the pinned one.
-      - uses: dtolnay/rust-toolchain@62ae3a85dbdd2bedbb5819da8ce45635129289a1 # 1.98.0
-        with:
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            store-mysql
-            busbar
-
-      - name: Build the store-mysql plugin cdylib (busbar-contract from git at .busbar-ref)
-        working-directory: store-mysql
-        run: cargo build --release --locked --target ${{ matrix.target }} -p busbar-store-mysql-plugin
-        shell: bash
-
-      # Host build: the packer only reads the cdylib's bytes, so it need not match the plugin target.
-      - name: Build busbar-plugin-pack (from the pinned busbar checkout)
-        working-directory: busbar
-        run: cargo build --release --locked -p busbar-plugin-loader --features pack --bin busbar-plugin-pack
-        shell: bash
-
-      - name: Package + sign the plugin tarball
-        env:
-          BUSBAR_SIGN_KEY: ${{ secrets.BUSBAR_SIGN_KEY }}
-        run: |
-          set -euo pipefail
-          ver="${GITHUB_REF_NAME#v}"
-          target="${{ matrix.target }}"
-          outdir="plugin-dist"; mkdir -p "$outdir"
-          pack="busbar/target/release/busbar-plugin-pack"
-          [ -x "$pack" ] || pack="busbar/target/release/busbar-plugin-pack.exe"
-          unsigned_flag=""
-          if [ -z "${BUSBAR_SIGN_KEY:-}" ]; then
-            echo "::warning::BUSBAR_SIGN_KEY secret is not provisioned — packaging an UNSIGNED plugin tarball (loadable only under plugins.trust.allow_unsigned). See busbar's release.yml TODO(release-keys) seam."
-            unsigned_flag="--allow-unsigned"
-          fi
-          lib="store-mysql/target/${target}/release/${{ matrix.libprefix }}busbar_store_mysql_plugin.${{ matrix.libext }}"
-          "$pack" pack \
-            --lib "$lib" \
-            --name "busbar-store-mysql-plugin" --alias "mysql" --kind store \
-            --version "$ver" --publisher busbar \
-            --description "First-party signed kind:store plugin cdylib: the MySQL/MariaDB backend for busbar's durable governance store, exported over the store C ABI. Drop the built library into the plugins folder and set store.module: mysql to share virtual keys, budgets, and usage across a fleet of busbar nodes." \
-            --license Apache-2.0 \
-            --out "${outdir}/busbar-store-mysql-${ver}-${target}.tar.gz" \
-            $unsigned_flag
-          ls -l "$outdir"
-        shell: bash
-
-      - name: Attach plugin tarball to Release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${GITHUB_REF_NAME}" plugin-dist/*.tar.gz --repo "${GITHUB_REPOSITORY}" --clobber
-        shell: bash
-
-      # Keyless (Sigstore/OIDC) build-provenance attestation binding this tarball's digest to this
-      # workflow run + commit — `gh attestation verify <tarball> --repo ${{ github.repository }}`.
-      - name: Attest plugin build provenance
-        uses: actions/attest-build-provenance@v4
-        with:
-          subject-path: "plugin-dist/*.tar.gz"
-
-  # PHANTOM-RELEASE GUARD: assert the published Release actually carries assets before we treat this
-  # as a real release. The per-target build/upload jobs run with fail-fast:false, and `create-release`
-  # always makes the (initially empty) Release up front — so a build/pack failure on EVERY target
-  # (e.g. a stale Cargo.lock tripping `--locked`) leaves a tag + Release with ZERO assets: a "phantom"
-  # that silently breaks busbar's plugin-registry-gate. This job fails the whole release run loud if
-  # assets == 0, so a phantom can never ship (or notify downstream) unnoticed. It depends on the build
-  # matrix but does NOT inherit its fail-fast:false — one green target is enough to have assets, but
-  # zero across the board must hard-fail here.
-  verify-assets:
-    needs: [store-plugin]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Assert the Release has at least one asset
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          count="$(gh release view "${GITHUB_REF_NAME}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --json assets --jq '.assets | length')"
-          echo "Release ${GITHUB_REF_NAME} has ${count} asset(s)."
-          if [ "${count}" -eq 0 ]; then
-            echo "::error::PHANTOM RELEASE: ${GITHUB_REF_NAME} was published with 0 assets." \
-                 "Every build/pack target failed to upload a tarball. Failing the release run so this" \
-                 "tag is not mistaken for a real release by busbar's plugin-registry-gate. Fix the" \
-                 "build (check Cargo.lock freshness vs --locked and the plugin cdylib build step)," \
-                 "delete this tag+release, and re-cut." >&2
-            exit 1
-          fi
-          # Only now, with assets provably attached, does this stop being a draft and become
-          # the release that `releases/latest` resolves to.
-          gh release edit "${GITHUB_REF_NAME}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --draft=false --latest
-          echo "::notice::Published ${GITHUB_REF_NAME} with ${count} asset(s)."
-
-  # Instant marketing-site rebuild the moment this plugin ships a real release -- marketing's
-  # deploy.yml listens for this exact repository_dispatch event type (plus its own daily-poll
-  # fallback, so a missed/failed dispatch here is never a permanent gap). Same RELEASE_DISPATCH_TOKEN
-  # pattern busbar core's own release.yml uses for its downstream fan-out -- see that file's
-  # notify-downstream job for the template this mirrors. Fails loud (not a silent no-op) if the
-  # secret isn't provisioned, so a missing secret can't masquerade as "nothing to notify."
-  notify-marketing:
-    needs: [store-plugin, verify-assets]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Dispatch upstream-release to the marketing site
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_DISPATCH_TOKEN }}
-        run: |
-          set -euo pipefail
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::error::RELEASE_DISPATCH_TOKEN is not provisioned on this repo -- cannot notify" \
-                 "marketing instantly. marketing's own daily poll will still pick this release up" \
-                 "within 24h (self-healing fallback intact)." >&2
-            exit 1
-          fi
-          gh api "repos/GetBusbar/marketing/dispatches" \
-            -f event_type=upstream-release \
-            -f "client_payload[repo]=${GITHUB_REPOSITORY}" \
-            -f "client_payload[tag]=${GITHUB_REF_NAME}"
-
-  # THE LAST STEP: does what we just published work for a user?
-  #
-  # Everything above verifies what THIS RUN produced, from inside this run. verify-assets asserts the
-  # assets it uploaded are present, which proves the run believed itself. It cannot prove the tarball
-  # downloads for a stranger, unpacks into a plugin busbar will load, or (where a bundle is
-  # published) boots. Those are the failures that shipped: a zero-asset phantom release, and a
-  # published bundle that exits 1 on startup.
-  #
-  # Consumer verification is POST-PUBLICATION by nature - you cannot download an asset that was never
-  # uploaded - so this cannot block the publish and does not pretend to. What it does is make the
-  # verdict impossible to miss: a failure is THIS release run's failure, and the shared workflow also
-  # opens or updates one labelled issue naming the failing check, expected, observed and the run URL.
-  #
-  # !cancelled() because a needs: on a FAILED job skips its dependent by default - the exact shape
-  # that skips a release's own guard precisely when the release is broken.
-  consumer-verification:
-    name: consumer verification (LAST STEP)
-    needs: [verify-assets]
+  release:
+    needs: ci
+    uses: GetBusbar/busbar/.github/workflows/plugin-release.yml@7a5b429041752e00375e120ab1547a8928c3dee4
+    with:
+      plugin_crate: busbar-store-mysql-plugin
+      manifest_name: busbar-store-mysql-plugin
+      plugin_alias: mysql
+      plugin_kind: store
+      asset_prefix: busbar-store-mysql
+      description: "First-party signed kind:store plugin cdylib: the MySQL/MariaDB backend for busbar's durable governance store, exported over the store C ABI. Drop the built library into the plugins folder and set store.module: mysql to share virtual keys, budgets, and usage across a fleet of busbar nodes."
+      lib_only: false
+      needs_prompt: ""
+      needs_user: ""
+      declares_file: "store-mysql/declares.json"
+    secrets: inherit
+  consumer-verify:
+    needs: release
     if: ${{ !cancelled() }}
-    uses: GetBusbar/busbar/.github/workflows/plugin-consumer-verify.yml@dev
+    uses: GetBusbar/busbar/.github/workflows/plugin-consumer-verify.yml@7a5b429041752e00375e120ab1547a8928c3dee4
     with:
       version: ${{ github.ref_name }}
       asset_prefix: busbar-store-mysql
       plugin_name: busbar-store-mysql-plugin
       plugin_alias: mysql
       plugin_kind: store
-      # EMPTY, and correct: this repo publishes exactly one kind of artifact, a signed
-      # busbar-store-*.tar.gz per target (see release.yml's `plugin-dist/*.tar.gz` upload) -- no
-      # container bundle anywhere in this repo's workflows. `bundle_image: ""` makes the shared
-      # workflow declare the runnable-bundle boot check NOT-APPLICABLE rather than silently skip it.
       bundle_image: ""
       bundle_env: ""
-    permissions:
-      contents: read
-      issues: write
-      actions: read
     secrets: inherit

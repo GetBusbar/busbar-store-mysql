@@ -1,193 +1,24 @@
-# store-mysql CI — build, test, and the store's linked + dropped-in conformance, against the busbar
-# rev this repo PINS.
-#
-# This repo builds standalone: its only busbar dependency (busbar-contract, and busbar-plugin-loader
-# for the conformance and end-to-end tests) is a `git` dependency on https://github.com/GetBusbar/busbar
-# at the rev in field 1 of `.busbar-ref`. No path dependency — so what CI proves is exactly what a
-# busbar build that pulls this repo at a pinned rev links.
-#
-# The end-to-end tests drive the REAL `busbar` and `busbar-plugin-pack` binaries (file-drop install,
-# admin-API install). Those are built from a busbar checkout AT THE SAME PIN beside this repo
-# (`busbar/`), which the tests find at `../busbar` (or `$BUSBAR_CHECKOUT`) and refuse unless its HEAD
-# is the pin.
-#
-# The live-MySQL cases run on the ubuntu leg against a real MySQL 8 service container
-# (`BUSBAR_TEST_MYSQL_URL`). GitHub offers no service containers on macOS, so the macos leg proves
-# fmt/clippy/build and the linked + dropped-in conformance's database-free arms (row statement,
-# first-party, the store's own open refusals, and both RED arms); every live case runs on ubuntu.
+# RENDERED by `cargo xtask fleet render busbar-store-mysql` from GetBusbar/busbar's plugins.yaml and
+# .github/fleet/ templates; `cargo xtask fleet check` is red on any edit here. The CI itself is
+# busbar's plugin-ci.yml, taken at the busbar commit this repo pins (.busbar-ref).
 name: ci
 
 on:
   push:
-    branches: [main, dev, qa]
+    branches: [dev, qa, main]
   pull_request:
-    branches: [main, dev, qa]
+    branches: [dev, qa, main]
   workflow_dispatch: {}
-  # release.yml's `gate` runs THIS workflow on the tagged commit, so a release is gated by exactly the
-  # suite (pin check, fmt, clippy, build, test, conformance) every dev push runs — at the same pin.
-  workflow_call: {}
 
 permissions:
   contents: read
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
-  pin:
-    name: the busbar pin is one rev
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      rev: ${{ steps.pin.outputs.rev }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      # Every `rev = "..."` on the busbar git source in every manifest is field 1 of `.busbar-ref`.
-      # Two revs would link two copies of the contract; a rev that disagrees with `.busbar-ref` makes
-      # the pin a lie about what the release builds against.
-      - name: every busbar git dependency names the .busbar-ref rev
-        id: pin
-        run: |
-          set -euo pipefail
-          pin=$(awk '{print $1; exit}' .busbar-ref)
-          [[ "$pin" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::.busbar-ref field 1 is not a full sha: '$pin'"; exit 1; }
-          found=$(grep -hoE 'git = "https://github.com/GetBusbar/busbar", rev = "[0-9a-f]+"' ./*/Cargo.toml | grep -oE '[0-9a-f]{40}' | sort -u)
-          [ -n "$found" ] || { echo "::error::no busbar git dependency found"; exit 1; }
-          if [ "$found" != "$pin" ]; then
-            echo "::error::busbar revs in manifests ($found) != .busbar-ref ($pin)"; exit 1
-          fi
-          if grep -nE 'path = "\.\./\.\./' ./*/Cargo.toml; then
-            echo "::error::a manifest names a sibling-checkout path dependency"; exit 1
-          fi
-          echo "pinned busbar rev: $pin"
-          echo "rev=$pin" >> "$GITHUB_OUTPUT"
-
-  build-test:
-    name: fmt, clippy, build, test, conformance [${{ matrix.os }}]
-    needs: [pin]
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    # The ubuntu leg builds the real busbar binary (release) for the end-to-end tests.
-    timeout-minutes: 90
-    services:
-      # Real MySQL 8 for the live cases. Service containers exist on Linux runners only; on macOS the
-      # image expression is empty and no container starts.
-      mysql:
-        image: ${{ matrix.os == 'ubuntu-latest' && 'mysql:8@sha256:b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb' || '' }}
-        env:
-          MYSQL_ROOT_PASSWORD: busbar
-          MYSQL_USER: busbar
-          MYSQL_PASSWORD: busbar
-          MYSQL_DATABASE: busbar_test
-        ports:
-          - 3306:3306
-        options: >-
-          ${{ matrix.os == 'ubuntu-latest' && '--health-cmd "mysqladmin ping -h localhost -ubusbar -pbusbar" --health-interval 10s --health-timeout 5s --health-retries 10' || '' }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          path: plugin
-      - name: Checkout busbar at the pin (the real binaries the end-to-end tests drive)
-        if: matrix.os == 'ubuntu-latest'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          repository: GetBusbar/busbar
-          ref: ${{ needs.pin.outputs.rev }}
-          path: busbar
-      - uses: dtolnay/rust-toolchain@62ae3a85dbdd2bedbb5819da8ce45635129289a1 # 1.98.0
-        with:
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            plugin
-            busbar
-      - name: fmt
-        working-directory: plugin
-        run: cargo fmt --all -- --check
-      - name: clippy
-        working-directory: plugin
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: build (the rlib a busbar build links, and the cdylib a signed tarball carries)
-        working-directory: plugin
-        run: cargo build --workspace --locked
-      - name: mysql — set strict sql_mode (dynamic variable, no restart needed)
-        if: matrix.os == 'ubuntu-latest'
-        # SET GLOBAL requires SUPER, which the image's MYSQL_USER account (busbar) lacks by design —
-        # only root has it.
-        run: mysql -h 127.0.0.1 -uroot -pbusbar -e "SET GLOBAL sql_mode='STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION';"
-      - name: test (the store's own suite, live MySQL, end-to-end, linked/dropped-in conformance)
-        if: matrix.os == 'ubuntu-latest'
-        working-directory: plugin
-        env:
-          BUSBAR_TEST_MYSQL_URL: mysql://busbar:busbar@127.0.0.1:3306/busbar_test
-        run: cargo test --workspace --locked
-      - name: conformance (database-free arms; no MySQL service on macOS runners)
-        if: matrix.os == 'macos-latest'
-        working-directory: plugin
-        # The test's live scenario follows the repo gate: unset + CI is a failure, unset off CI is a
-        # skip. This leg has no MySQL by construction, so it runs with CI unset and says so in its
-        # output; the live scenario runs on the ubuntu leg.
-        run: env -u CI cargo test --locked -p busbar-store-mysql-plugin --test conformance
-
-  # ── coverage (llvm-cov · codecov) ─────────────────────────────────────────────────────────────
-  # ADDITIVE, NON-GATING coverage reporting for the README badge + per-PR line context. Not a
-  # required check: fail_ci_if_error: false, and codecov.yml marks every status informational. The
-  # correctness gate is `build-test` above. Same MySQL service and busbar checkout (at the pin).
-  coverage:
-    name: coverage (llvm-cov · codecov)
-    needs: [pin]
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    if: github.event_name != 'push' || contains(fromJSON('["refs/heads/main", "refs/heads/dev", "refs/heads/qa"]'), github.ref)
-    services:
-      mysql:
-        image: mysql:8@sha256:b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb
-        env:
-          MYSQL_ROOT_PASSWORD: busbar
-          MYSQL_USER: busbar
-          MYSQL_PASSWORD: busbar
-          MYSQL_DATABASE: busbar_test
-        ports:
-          - 3306:3306
-        options: >-
-          --health-cmd "mysqladmin ping -h localhost -ubusbar -pbusbar"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          path: plugin
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          repository: GetBusbar/busbar
-          ref: ${{ needs.pin.outputs.rev }}
-          path: busbar
-      - uses: dtolnay/rust-toolchain@62ae3a85dbdd2bedbb5819da8ce45635129289a1 # 1.98.0
-        with:
-          components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            plugin
-            busbar
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
-      - name: mysql — set strict sql_mode
-        run: mysql -h 127.0.0.1 -uroot -pbusbar -e "SET GLOBAL sql_mode='STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION';"
-      - name: Collect coverage (workspace, live MySQL tests wired)
-        working-directory: plugin
-        env:
-          BUSBAR_TEST_MYSQL_URL: mysql://busbar:busbar@127.0.0.1:3306/busbar_test
-        run: cargo llvm-cov --workspace --locked --ignore-run-fail --lcov --output-path lcov.info
-      - name: Upload to Codecov (never fails the build)
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: plugin/lcov.info
-          slug: GetBusbar/busbar-store-mysql
-          fail_ci_if_error: false
+  ci:
+    uses: GetBusbar/busbar/.github/workflows/plugin-ci.yml@7a5b429041752e00375e120ab1547a8928c3dee4
+    with:
+      service: mysql
+      busbar_checkout: true
+      macos_test: "env -u CI cargo test --locked -p busbar-store-mysql-plugin --test conformance"
+      extra_test: ""
+    secrets: inherit

@@ -26,8 +26,8 @@ busbar-store-mysql = { path = "../store-mysql" }
 # The conformance and end-to-end tests load the built cdylib over the REAL loader (sign, pack, scan,
 # open) and the linked row through the same registry — dev-only, never in the shipped artifact. Same
 # pinned rev as the logic crate's busbar-contract, so one busbar source resolves.
-busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "8b7b6473f47f8d37ae60839c74cfe6a9b64a1dc9" }
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "8b7b6473f47f8d37ae60839c74cfe6a9b64a1dc9" }
+busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "7a5b429041752e00375e120ab1547a8928c3dee4" }
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "7a5b429041752e00375e120ab1547a8928c3dee4" }
 serde_json = "1"
 mysql = { version = "26", default-features = false, features = ["minimal"] }
 # For admin_api_e2e.rs: drives the real busbar admin HTTP API (install/mint) against an
