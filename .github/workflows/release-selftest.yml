@@ -79,9 +79,12 @@ jobs:
           parent="$(gh api "repos/GetBusbar/busbar/commits/${pin}" --jq '.parents[0].sha')"
           [[ "$parent" =~ ^[0-9a-f]{40}$ ]] || fail "could not resolve the pin's parent commit"
 
-          # RED arms: a short sha and a missing version are refused before anything is written.
-          if bash "$script" "${pin:0:9}" "$ver"; then fail "a short sha was accepted"; fi
-          if bash "$script" "$pin" ""; then fail "an empty version was accepted"; fi
+          # RED arms: a short sha and a missing version are refused, by name, before anything is
+          # written. (Output captured so the expected refusal is not raised as a run annotation.)
+          if out="$(bash "$script" "${pin:0:9}" "$ver" 2>&1)"; then fail "a short sha was accepted"; fi
+          grep -q "is not a full 40-hex busbar sha" <<<"$out" || fail "short sha refused for the wrong reason: $out"
+          if out="$(bash "$script" "$pin" "" 2>&1)"; then fail "an empty version was accepted"; fi
+          grep -q "usage: repin-busbar.sh" <<<"$out" || fail "empty version refused for the wrong reason: $out"
           git diff --exit-code || fail "a refused repin wrote files"
 
           # The recorded pin is a fixed point.
