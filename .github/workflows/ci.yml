@@ -23,6 +23,9 @@ on:
   pull_request:
     branches: [main, dev, qa]
   workflow_dispatch: {}
+  # release.yml's `gate` runs THIS workflow on the tagged commit, so a release is gated by exactly the
+  # suite (pin check, fmt, clippy, build, test, conformance) every dev push runs — at the same pin.
+  workflow_call: {}
 
 permissions:
   contents: read
@@ -48,12 +51,12 @@ jobs:
           set -euo pipefail
           pin=$(awk '{print $1; exit}' .busbar-ref)
           [[ "$pin" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::.busbar-ref field 1 is not a full sha: '$pin'"; exit 1; }
-          found=$(grep -hoE 'git = "https://github.com/GetBusbar/busbar", rev = "[0-9a-f]+"' */Cargo.toml | grep -oE '[0-9a-f]{40}' | sort -u)
+          found=$(grep -hoE 'git = "https://github.com/GetBusbar/busbar", rev = "[0-9a-f]+"' ./*/Cargo.toml | grep -oE '[0-9a-f]{40}' | sort -u)
           [ -n "$found" ] || { echo "::error::no busbar git dependency found"; exit 1; }
           if [ "$found" != "$pin" ]; then
             echo "::error::busbar revs in manifests ($found) != .busbar-ref ($pin)"; exit 1
           fi
-          if grep -nE 'path = "\.\./\.\./' */Cargo.toml; then
+          if grep -nE 'path = "\.\./\.\./' ./*/Cargo.toml; then
             echo "::error::a manifest names a sibling-checkout path dependency"; exit 1
           fi
           echo "pinned busbar rev: $pin"

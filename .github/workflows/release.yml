@@ -2,11 +2,15 @@
 # supported targets, pack + sign each into a loadable busbar plugin tarball, and publish them to
 # THIS repo's own GitHub Release.
 #
-# Same 5-target matrix, same busbar-plugin-pack pack/sign step (built from a sibling busbar
-# checkout), same BUSBAR_SIGN_KEY-or-`--allow-unsigned` fallback, same `gh release upload` +
-# build-provenance attestation pattern busbar's own plugins use — but every plugin (including this
-# one) now releases from its own repo; busbar no longer has a combined `store-plugins` release
-# job to mirror.
+# Same 5-target matrix, same BUSBAR_SIGN_KEY-or-`--allow-unsigned` fallback, same `gh release
+# upload` + build-provenance attestation pattern busbar's own plugins use — every plugin (including
+# this one) releases from its own repo.
+#
+# CONTRACT-ONLY BUILD (busbar 1.6.0). The cdylib's one busbar dependency is busbar-contract, a `git`
+# dependency on GetBusbar/busbar at the rev in `.busbar-ref` field 1 (ci.yml's `pin` job refuses a
+# manifest that disagrees). The plugin builds standalone with `--locked`; the busbar checkout at that
+# same rev exists ONLY to build the packer (busbar-plugin-pack, from busbar-plugin-loader) and for
+# the ABI-completeness read — nothing in this repo's build reaches into it by path.
 #
 # This plugin's own version (the `v*` tag pushed here) is NOT tied to busbar's version number —
 # it is independently versioned starting at 0.5.0 (see README), separate from whichever busbar
@@ -48,29 +52,28 @@ jobs:
         run: echo "sha=$(cut -d' ' -f1 .busbar-ref)" >> "$GITHUB_OUTPUT"
         shell: bash
 
+  # This repo's OWN ci.yml, on the tagged commit: its `pin` job proves every manifest's busbar rev
+  # IS `.busbar-ref` field 1, then fmt/clippy/build/test and the linked + dropped-in conformance run
+  # against that rev with live MySQL. (busbar's shared plugin-ci.yml assumed a sibling path checkout
+  # of the retired plugin-sdk and cannot build a contract-only plugin.)
   gate:
     needs: resolve-busbar-ref
-    uses: GetBusbar/busbar/.github/workflows/plugin-ci.yml@dev
-    with:
-      plugin_crate: busbar-store-mysql-plugin
-      plugin_kind: store
-      plugin_alias: mysql
-      service: mysql
-      busbar_ref: ${{ needs.resolve-busbar-ref.outputs.sha }}
+    uses: ./.github/workflows/ci.yml
+    secrets: inherit
 
   # ── ABI-COMPLETENESS GATE ────────────────────────────────────────────────────────────────────
   # THE GATE THAT REFUSES A CDYLIB THE PINNED ABI CANNOT CARRY. This runs BEFORE `create-release`,
   # so a failure here leaves no tag-attached Release, no artifact, no signature and no attestation.
   #
   # `gate` above proves this repo's suite passes against the pinned core. It cannot prove the pinned
-  # core's plugin-sdk `dispatch` actually ROUTES the Store methods this repo implements — the suite
-  # exercises the trait in-process, while a shipped plugin is reached over the C ABI. Because
-  # `busbar_api::Store` gives every method a DEFAULT body, an unrouted method does not fail to
-  # compile: it compiles, packs, signs, attests, and then silently takes the default at runtime,
-  # reporting success while dropping the write. busbar 74a1f9fa ("a task written through a plugin
-  # store is no longer discarded") is that bug, already shipped once.
+  # contract's `store_dispatch` actually ROUTES the RecordStore methods this repo implements — the
+  # suite exercises the trait in-process, while a shipped plugin is reached over the C ABI. Because
+  # `busbar_contract::records::RecordStore` gives several methods a DEFAULT body, an unrouted method
+  # does not fail to compile: it compiles, packs, signs, attests, and then silently takes the default
+  # at runtime, reporting success while dropping the write. busbar 74a1f9fa ("a task written through
+  # a plugin store is no longer discarded") is that bug, already shipped once.
   #
-  # The check is generic — it derives the method list from this repo's own `impl Store for` block
+  # The check is generic — it derives the method list from this repo's own `impl RecordStore for` block
   # rather than naming any one feature, so it stays correct as the Store trait grows and cannot go
   # stale the way a hardcoded pin can. See .github/scripts/verify-abi-completeness.sh.
   abi-completeness:
@@ -89,7 +92,7 @@ jobs:
           ref: ${{ needs.resolve-busbar-ref.outputs.sha }}
           path: busbar
 
-      - name: Every Store method implemented here must be routed by the pinned ABI
+      - name: Every RecordStore method implemented here must be routed by the pinned ABI
         run: bash store-mysql/.github/scripts/verify-abi-completeness.sh store-mysql busbar
         shell: bash
 
@@ -167,26 +170,34 @@ jobs:
         run: echo "sha=$(cut -d' ' -f1 store-mysql/.busbar-ref)" >> "$GITHUB_OUTPUT"
         shell: bash
 
-      - name: Checkout busbar (sibling path dependency)
+      # Source of the packer only; the plugin itself resolves busbar-contract from git at this rev.
+      - name: Checkout busbar at the pin (builds busbar-plugin-pack)
         uses: actions/checkout@v7
         with:
           repository: GetBusbar/busbar
           ref: ${{ steps.ref.outputs.sha }}
           path: busbar
 
-      - uses: dtolnay/rust-toolchain@stable
+      # The toolchain rust-toolchain.toml pins (both repos name 1.98.0). A floating `@stable` would
+      # install the target on a toolchain rustup then ignores in favour of the pinned one.
+      - uses: dtolnay/rust-toolchain@62ae3a85dbdd2bedbb5819da8ce45635129289a1 # 1.98.0
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            store-mysql
+            busbar
 
-      - name: Build the store-mysql plugin cdylib
+      - name: Build the store-mysql plugin cdylib (busbar-contract from git at .busbar-ref)
         working-directory: store-mysql
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }} -p busbar-store-mysql-plugin
         shell: bash
 
-      - name: Build busbar-plugin-pack (from the sibling busbar checkout)
+      # Host build: the packer only reads the cdylib's bytes, so it need not match the plugin target.
+      - name: Build busbar-plugin-pack (from the pinned busbar checkout)
         working-directory: busbar
-        run: cargo build --release --target ${{ matrix.target }} -p busbar-plugin-loader --features pack --bin busbar-plugin-pack
+        run: cargo build --release --locked -p busbar-plugin-loader --features pack --bin busbar-plugin-pack
         shell: bash
 
       - name: Package + sign the plugin tarball
@@ -197,8 +208,8 @@ jobs:
           ver="${GITHUB_REF_NAME#v}"
           target="${{ matrix.target }}"
           outdir="plugin-dist"; mkdir -p "$outdir"
-          pack="busbar/target/${target}/release/busbar-plugin-pack"
-          [ -x "$pack" ] || pack="busbar/target/${target}/release/busbar-plugin-pack.exe"
+          pack="busbar/target/release/busbar-plugin-pack"
+          [ -x "$pack" ] || pack="busbar/target/release/busbar-plugin-pack.exe"
           unsigned_flag=""
           if [ -z "${BUSBAR_SIGN_KEY:-}" ]; then
             echo "::warning::BUSBAR_SIGN_KEY secret is not provisioned — packaging an UNSIGNED plugin tarball (loadable only under plugins.trust.allow_unsigned). See busbar's release.yml TODO(release-keys) seam."
