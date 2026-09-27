@@ -87,6 +87,20 @@ jobs:
           grep -q "usage: repin-busbar.sh" <<<"$out" || fail "empty version refused for the wrong reason: $out"
           git diff --exit-code || fail "a refused repin wrote files"
 
+          # --decide (release-on-upstream's "did upstream move?"), against the recorded pin:
+          #   same version + same sha -> skip; same version + DIFFERENT sha -> cut (the upstream
+          #   release commit moved under an unchanged version string); newer version -> cut;
+          #   older version / no incoming version / same version with no sha -> skip.
+          decide() { bash "$script" --decide "$1" "$2" 2>/dev/null; }
+          [ "$(decide "$pin" "$ver")" = skip ]       || fail "same version + same sha must skip"
+          [ "$(decide "$parent" "$ver")" = cut ]     || fail "same version + different sha must cut"
+          [ "$(decide "$parent" "v$ver")" = cut ]    || fail "a leading v must not hide a moved commit"
+          [ "$(decide "" "$ver")" = skip ]           || fail "same version with no incoming sha must skip"
+          [ "$(decide "$parent" "999.0.0")" = cut ]  || fail "a newer version must cut"
+          [ "$(decide "$parent" "0.0.1")" = skip ]   || fail "an older version must skip"
+          [ "$(decide "$parent" "")" = skip ]        || fail "no incoming version must skip"
+          if bash "$script" --decide "${parent:0:9}" "$ver" >/dev/null 2>&1; then fail "--decide accepted a short sha"; fi
+
           # The recorded pin is a fixed point.
           bash "$script" "$pin" "$ver"
           git diff --exit-code || fail "re-pinning to the recorded rev changed files"
@@ -101,4 +115,4 @@ jobs:
           # And back: byte-identical to the committed tree.
           bash "$script" "$pin" "$ver"
           git diff --exit-code || fail "moving the pin away and back is not a round trip"
-          echo "repin self-test passed (refusals, fixed point, real move, round trip)"
+          echo "repin self-test passed (decide: same-version moved commit cuts, same commit skips; refusals, fixed point, real move, round trip)"
