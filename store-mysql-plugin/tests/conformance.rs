@@ -245,7 +245,7 @@ fn the_linked_and_the_dropped_in_mysql_store_are_one_store() {
     let url = mysql_url();
     let url = url.as_deref();
     let (name, alias, _) = busbar_store_mysql::linked::STORE;
-    assert_eq!(name, "busbar-store-mysql-plugin");
+    assert_eq!(name, "busbar-store-mysql");
     assert_eq!(alias, "mysql");
     let lib = cdylib();
 

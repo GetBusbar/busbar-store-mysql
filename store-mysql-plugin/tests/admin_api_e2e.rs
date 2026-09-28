@@ -440,7 +440,7 @@ fn install_over_admin_api_then_mint_a_key_and_verify_mysql_directly() {
             "--lib",
             so_path.to_str().unwrap(),
             "--name",
-            "busbar-store-mysql-plugin",
+            "busbar-store-mysql",
             "--alias",
             "mysql",
             "--kind",
@@ -555,7 +555,7 @@ fn install_over_admin_api_then_mint_a_key_and_verify_mysql_directly() {
     assert!(
         items
             .iter()
-            .any(|p| p["target"] == file && p["name"] == "busbar-store-mysql-plugin"),
+            .any(|p| p["target"] == file && p["name"] == "busbar-store-mysql"),
         "the installed mysql plugin must be listed in the real catalog: {items:?}"
     );
 

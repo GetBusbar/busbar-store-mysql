@@ -2557,7 +2557,7 @@ fn crate_now() -> u64 {
 // looks up in the library answer through this same registration. One source, both doors.
 
 /// The store's package name — the name its signed tarball states and a linked row registers.
-pub const NAME: &str = "busbar-store-mysql-plugin";
+pub const NAME: &str = "busbar-store-mysql";
 
 /// The alias `store.module` selects it by.
 pub const ALIAS: &str = "mysql";

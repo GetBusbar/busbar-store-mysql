@@ -299,7 +299,7 @@ fn load_and_exercise_mysql_plugin_via_file_drop() {
             "--lib",
             so_path.to_str().unwrap(),
             "--name",
-            "busbar-store-mysql-plugin",
+            "busbar-store-mysql",
             "--alias",
             "mysql",
             "--kind",
