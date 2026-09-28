@@ -25,7 +25,7 @@ jobs:
     with:
       version: ${{ inputs.version || '' }}
       asset_prefix: busbar-store-mysql
-      plugin_name: busbar-store-mysql-plugin
+      plugin_name: busbar-store-mysql
       plugin_alias: mysql
       plugin_kind: store
       bundle_image: ""

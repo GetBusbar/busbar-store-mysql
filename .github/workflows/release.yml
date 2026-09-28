@@ -32,7 +32,7 @@ jobs:
     uses: GetBusbar/busbar/.github/workflows/plugin-release.yml@7a5b429041752e00375e120ab1547a8928c3dee4
     with:
       plugin_crate: busbar-store-mysql-plugin
-      manifest_name: busbar-store-mysql-plugin
+      manifest_name: busbar-store-mysql
       plugin_alias: mysql
       plugin_kind: store
       asset_prefix: busbar-store-mysql
@@ -49,7 +49,7 @@ jobs:
     with:
       version: ${{ github.ref_name }}
       asset_prefix: busbar-store-mysql
-      plugin_name: busbar-store-mysql-plugin
+      plugin_name: busbar-store-mysql
       plugin_alias: mysql
       plugin_kind: store
       bundle_image: ""
