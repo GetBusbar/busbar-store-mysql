@@ -1,17 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# One repo per plugin (owner ruling, busbar 1.6.0): this repo brings 100% of what the MySQL/MariaDB
-# governance store (`store.module: mysql`) needs — the store logic (busbar-store-mysql, the rlib a
-# busbar build can link, carrying the store's one door registration) and the thin cdylib that
-# packages it as a droppable `kind: store` plugin (busbar-store-mysql-plugin) — as a same-repo Cargo
-# workspace.
+# RENDERED by `cargo xtask fleet render busbar-store-mysql` from GetBusbar/busbar's plugins.yaml and
+# .github/fleet/workspace-Cargo.toml; `cargo xtask fleet check` is red on any edit here.
 #
-# Its one busbar dependency is busbar-contract (busbar-plugin-loader too, dev-only for the
-# conformance and end-to-end tests), a git dependency on GetBusbar/busbar pinned to the rev in
-# `.busbar-ref` field 1. No sibling-checkout path dependency ships in any manifest.
+# One repo per plugin, every repo a twin: this workspace is exactly two crates, the logic
+# (`store-mysql/`, the rlib a busbar build can link) and the thin cdylib that packages it as a
+# droppable `kind: store` plugin (`store-mysql-plugin/`, crate `busbar-store-mysql-plugin`). Its busbar
+# dependencies are git dependencies on GetBusbar/busbar at the fleet pin (`.busbar-ref` field 1);
+# no sibling-checkout path dependency ships in any manifest.
 [workspace]
 resolver = "2"
 members = [
     "store-mysql",
     "store-mysql-plugin",
 ]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.98"
+license = "Apache-2.0"
+publish = false
+repository = "https://github.com/GetBusbar/busbar-store-mysql"
+
+[workspace.dependencies]
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "7a5b429041752e00375e120ab1547a8928c3dee4" }
+busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "7a5b429041752e00375e120ab1547a8928c3dee4" }

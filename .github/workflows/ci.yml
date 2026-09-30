@@ -21,4 +21,7 @@ jobs:
       busbar_checkout: true
       macos_test: "env -u CI cargo test --locked -p busbar-store-mysql-plugin --test conformance"
       extra_test: ""
+      plugin_crate: busbar-store-mysql-plugin
+      plugin_kind: store
+      plugin_alias: mysql
     secrets: inherit

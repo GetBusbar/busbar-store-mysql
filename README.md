@@ -10,6 +10,8 @@ First-party signed kind:store plugin cdylib: the MySQL/MariaDB backend for busba
 [![ci](https://github.com/GetBusbar/busbar-store-mysql/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/GetBusbar/busbar-store-mysql/actions/workflows/ci.yml)
 <!-- fleet:header:end -->
 
+## What it is for
+
 [![Coverage](https://codecov.io/gh/GetBusbar/busbar-store-mysql/branch/dev/graph/badge.svg)](https://codecov.io/gh/GetBusbar/busbar-store-mysql)
 
 The MySQL/MariaDB backend for busbar's durable governance store — a `kind: store` plugin.
@@ -21,7 +23,7 @@ speaks the standard RESP protocol — broad coverage via standard SQL, not three
 Point a fleet of busbar nodes at one MySQL/MariaDB server and they share virtual keys, budgets, and
 usage across the cluster, same as the sibling `store-postgres` plugin.
 
-## Install
+### Install
 
 ```yaml
 store:
@@ -33,7 +35,7 @@ store:
 Drop the built `.so`/`.dll`/`.dylib` into busbar's `plugins_dir`, or install it live via
 `POST /plugins` — see busbar's admin API docs.
 
-## Requirements
+### Requirements
 
 - MySQL **>= 8.0.16** (older 8.x releases and Aurora MySQL 2.x parse `CHECK` constraints but do not
   enforce them — this plugin boot-probes for real enforcement and refuses to start if it's missing,
@@ -41,7 +43,7 @@ Drop the built `.so`/`.dll`/`.dylib` into busbar's `plugins_dir`, or install it 
 - `sql_mode` must include `STRICT_ALL_TABLES` or `STRICT_TRANS_TABLES` — also boot-probed. Set it
   server-wide (`SET GLOBAL sql_mode='STRICT_ALL_TABLES';`) before pointing busbar at the server.
 
-## Design notes
+### Design notes
 
 - `api_keys`, not `keys`: `KEYS` is a MySQL/MariaDB reserved word. Every other backend (Postgres,
   SQLite, Valkey) keeps `keys`.
@@ -71,7 +73,17 @@ Drop the built `.so`/`.dll`/`.dylib` into busbar's `plugins_dir`, or install it 
   rate-card change inside a day opens a second cell), and the new tables. No existing row is
   dropped or rewritten.
 
-## Testing
+## Config
+
+Configured under the `mysql` module name.
+
+## Build
+
+```bash
+cargo build --release -p busbar-store-mysql-plugin
+```
+
+## Tests
 
 ```
 docker run -d -p 3306:3306 \
@@ -85,9 +97,13 @@ demotions and the single-use token ledger, in-crate and over the plugin ABI) del
 instead, because their unimplemented form is silently green. CI always sets the URL via the
 `mysql:8` service container in the shared `plugin-ci.yml` workflow.
 
-## Status
+### Status
 
 Built against busbar 1.6.0's `Store` interface (the neutral `PlaneRecord` verbs). MariaDB compatibility is
 validated by schema/query design (standard SQL, no MySQL-8-only syntax used) but not yet exercised
 against a live MariaDB container in this repo's test suite — flagged as a follow-up, not a
 guarantee. MySQL 8 is the fully tested target.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).
