@@ -39,9 +39,9 @@ use mysql::{params, Opts, Pool, PooledConn, TxOpts};
 
 use busbar_contract::records::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, ModelTokens,
-    ModelTokensDelta, PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore, RecordStoreError,
-    RecordStoreResult, ScopeRef, SecretForm, UsageDelta, UsageLedger, VirtualKey, UNIT_CACHE_READ,
-    UNIT_CACHE_WRITE, UNIT_INPUT, UNIT_OUTPUT,
+    ModelTokensDelta, PlaneDisposition, PlaneRecord, PlaneRecordRef, PlaneSelector, RecordStore,
+    RecordStoreError, RecordStoreResult, ScopeRef, SecretForm, UsageDelta, UsageLedger, VirtualKey,
+    UNIT_CACHE_READ, UNIT_CACHE_WRITE, UNIT_INPUT, UNIT_OUTPUT,
 };
 use std::collections::BTreeMap;
 
@@ -2225,7 +2225,9 @@ impl RecordStore for MysqlStore {
     // build persist through it unchanged. The one kind-aware rule is retention's, and it is the
     // contract's: `task` drops only TERMINAL rows, and takes its `task_event` chain with it.
 
-    fn upsert_plane_record(&self, record: &PlaneRecord) -> RecordStoreResult<()> {
+    fn upsert_plane_record(&self, record: PlaneRecordRef<'_>) -> RecordStoreResult<()> {
+        // This store binds owned rows: the one copy of the borrowed view happens here.
+        let record = &record.to_record();
         // UPSERT by identity: a second write for one `(kind, id)` REPLACES the row -- the engine
         // writes a task through on every state transition, and the boot read must find one row per
         // id, holding the last state.
@@ -2256,7 +2258,9 @@ impl RecordStore for MysqlStore {
         .map_err(store_err)
     }
 
-    fn append_plane_record(&self, record: &PlaneRecord) -> RecordStoreResult<()> {
+    fn append_plane_record(&self, record: PlaneRecordRef<'_>) -> RecordStoreResult<()> {
+        // This store binds owned rows: the one copy of the borrowed view happens here.
+        let record = &record.to_record();
         // APPEND-ONLY at a chain position `(parent, seq)`. A record arriving on a position that
         // already holds one is settled by comparing the two, exactly as `append_audit` settles a
         // duplicate `seq`:
@@ -2323,7 +2327,7 @@ impl RecordStore for MysqlStore {
     fn list_plane_records(
         &self,
         kind: &str,
-        selector: &PlaneSelector,
+        selector: &PlaneSelector<'_>,
     ) -> RecordStoreResult<Vec<Vec<u8>>> {
         // Oldest-first by `seq` -- the order the engine's chain verifier reads a parent's chain in.
         // `All` is UNFILTERED (terminal rows included): the boot rehydrate wants the active rows,
@@ -2338,7 +2342,7 @@ impl RecordStore for MysqlStore {
             PlaneSelector::Parent(parent) => conn.exec(
                 "SELECT body FROM plane_records \
                  WHERE kind = :kind AND ident = :parent AND parent = :parent ORDER BY seq",
-                params! { "kind" => kind, "parent" => parent },
+                params! { "kind" => kind, "parent" => parent.as_ref() },
             ),
         }
         .map_err(store_err)

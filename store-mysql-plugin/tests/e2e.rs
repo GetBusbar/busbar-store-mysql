@@ -571,25 +571,25 @@ fn tasks_and_call_log_survive_an_unload_and_reload_over_the_real_plugin_abi() {
             ("t_gamma", "completed", 30, PlaneDisposition::Terminal),
         ] {
             store
-                .upsert_plane_record(&task(id, state, updated, d))
+                .upsert_plane_record(task(id, state, updated, d).view())
                 .expect("upsert a task");
         }
         // Out of order, so the read has to sort by seq, not by insertion.
         for (seq, prev, hash) in [(2_u64, "e1", "e2"), (1, "", "e1"), (3, "e2", "e3")] {
             store
-                .append_plane_record(&event("t_alpha", seq, prev, hash))
+                .append_plane_record(event("t_alpha", seq, prev, hash).view())
                 .expect("append a task event");
         }
         store
-            .append_plane_record(&event("t_beta", 1, "", "b1"))
+            .append_plane_record(event("t_beta", 1, "", "b1").view())
             .expect("append a task event");
         for (seq, prev, hash) in [(1_u64, "", "h1"), (2, "h1", "h2"), (3, "h2", "h3")] {
             store
-                .append_plane_record(&call("vk_abi", seq, prev, hash))
+                .append_plane_record(call("vk_abi", seq, prev, hash).view())
                 .expect("append a call");
         }
         store
-            .append_plane_record(&call("vk_other", 1, "", "o1"))
+            .append_plane_record(call("vk_other", 1, "", "o1").view())
             .expect("append a call");
         // Dropping the boxed store drops the loader's `Library` handle: `busbar_close` runs and the
         // dylib is UNLOADED. Nothing this process still holds can be answering the reads below.
@@ -654,7 +654,7 @@ fn tasks_and_call_log_survive_an_unload_and_reload_over_the_real_plugin_abi() {
     // A fork is refused over the ABI too — the error has to survive the crossing as an Err.
     assert!(
         store
-            .append_plane_record(&call("vk_abi", 1, "", "FORKED"))
+            .append_plane_record(call("vk_abi", 1, "", "FORKED").view())
             .is_err(),
         "a different record at an occupied chain position must be refused across the ABI"
     );
@@ -811,14 +811,14 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         let store = busbar_plugin_loader::load_store(&path, &config)
             .expect("the mysql plugin must load over the real ABI");
         store
-            .upsert_plane_record(&demotion(&srv_demoted, "tool-drift", NOW))
+            .upsert_plane_record(demotion(&srv_demoted, "tool-drift", NOW).view())
             .expect("upsert a demotion");
         // The UPSERT path crosses the ABI too: a second demotion of one upstream replaces the row.
         store
-            .upsert_plane_record(&demotion(&srv_demoted, "digest-mismatch", NOW + 10))
+            .upsert_plane_record(demotion(&srv_demoted, "digest-mismatch", NOW + 10).view())
             .expect("upsert a demotion");
         store
-            .upsert_plane_record(&demotion(&srv_cleared, "tool-drift", NOW + 20))
+            .upsert_plane_record(demotion(&srv_cleared, "tool-drift", NOW + 20).view())
             .expect("upsert a demotion");
         store
             .delete_plane_record("demotion", &srv_cleared)

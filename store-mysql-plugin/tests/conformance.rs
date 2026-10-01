@@ -189,19 +189,22 @@ fn transcript(registry: &PluginRegistry, alias: &str, url: Option<&str>) -> serd
             disposition: PlaneDisposition::Active,
             body: b"{\"state\":\"working\"}".to_vec(),
         };
-        store.upsert_plane_record(&task).expect("upsert");
+        store.upsert_plane_record(task.view()).expect("upsert");
         let task_body = store.get_plane_record("task", TASK_ID).expect("get");
         for seq in 1..=3u64 {
             store
-                .append_plane_record(&PlaneRecord {
-                    kind: "task_event".into(),
-                    id: format!("{TASK_ID}-e{seq}"),
-                    parent: Some(PARENT.into()),
-                    seq,
-                    ts: 1_700_000_100 + seq,
-                    disposition: PlaneDisposition::Terminal,
-                    body: format!("event {seq}").into_bytes(),
-                })
+                .append_plane_record(
+                    (PlaneRecord {
+                        kind: "task_event".into(),
+                        id: format!("{TASK_ID}-e{seq}"),
+                        parent: Some(PARENT.into()),
+                        seq,
+                        ts: 1_700_000_100 + seq,
+                        disposition: PlaneDisposition::Terminal,
+                        body: format!("event {seq}").into_bytes(),
+                    })
+                    .view(),
+                )
                 .expect("append");
         }
         let chain: Vec<_> = store

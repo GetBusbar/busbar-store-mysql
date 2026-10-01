@@ -1881,7 +1881,7 @@ fn a_call_chain_survives_dropping_the_store_and_reconnecting() {
         let store = MysqlStore::connect(&url).expect("connect");
         reset_plane(&store, "call", &[p]);
         for r in &written {
-            store.append_plane_record(r).unwrap();
+            store.append_plane_record(r.view()).unwrap();
         }
         drop(store);
     }
@@ -1929,13 +1929,13 @@ fn call_principals_are_enumerable_after_a_reconnect() {
         let store = MysqlStore::connect(&url).expect("connect");
         reset_plane(&store, "call", &[a, b]);
         store
-            .append_plane_record(&call_rec(a, 1, 2_000_000_100, "", "a1"))
+            .append_plane_record(call_rec(a, 1, 2_000_000_100, "", "a1").view())
             .unwrap();
         store
-            .append_plane_record(&call_rec(b, 1, 2_000_000_100, "", "b1"))
+            .append_plane_record(call_rec(b, 1, 2_000_000_100, "", "b1").view())
             .unwrap();
         store
-            .append_plane_record(&call_rec(a, 2, 2_000_000_101, "a1", "a2"))
+            .append_plane_record(call_rec(a, 2, 2_000_000_101, "a1", "a2").view())
             .unwrap();
         drop(store);
     }
@@ -1977,13 +1977,13 @@ fn purge_calls_before_deletes_and_returns_a_real_count() {
     // Retention is KIND-WIDE by `ts`, so this test owns the low band under `PLANE_PURGE_LOCK` and
     // every other call test sits ABOVE the highest cutoff used here.
     store
-        .append_plane_record(&call_rec(p, 1, 1_000_000_100, "", "h1"))
+        .append_plane_record(call_rec(p, 1, 1_000_000_100, "", "h1").view())
         .unwrap();
     store
-        .append_plane_record(&call_rec(p, 2, 1_000_000_200, "h1", "h2"))
+        .append_plane_record(call_rec(p, 2, 1_000_000_200, "h1", "h2").view())
         .unwrap();
     store
-        .append_plane_record(&call_rec(p, 3, 1_000_000_300, "h2", "h3"))
+        .append_plane_record(call_rec(p, 3, 1_000_000_300, "h2", "h3").view())
         .unwrap();
 
     let purged = store
@@ -2024,9 +2024,9 @@ fn a_purge_is_confined_to_its_own_kind() {
     reset_plane(&store, "demotion", &[s]);
     let mut demotion = demotion_rec(s, "tool-drift", 5);
     demotion.ts = 5;
-    store.upsert_plane_record(&demotion).unwrap();
+    store.upsert_plane_record(demotion.view()).unwrap();
     store
-        .append_plane_record(&call_rec(p, 1, 5, "", "h1"))
+        .append_plane_record(call_rec(p, 1, 5, "", "h1").view())
         .unwrap();
     store
         .purge_plane_records_before("call", 1_000_000_000)
@@ -2050,9 +2050,9 @@ fn a_replayed_call_is_idempotent_but_a_forked_one_is_refused() {
     reset_plane(&store, "call", &[p]);
 
     let rec = call_rec(p, 1, 2_000_000_100, "", "h1");
-    store.append_plane_record(&rec).unwrap();
+    store.append_plane_record(rec.view()).unwrap();
     store
-        .append_plane_record(&rec)
+        .append_plane_record(rec.view())
         .expect("an identical replay is the at-least-once retry and must succeed");
     assert_eq!(
         calls_of(&store, p).len(),
@@ -2062,7 +2062,7 @@ fn a_replayed_call_is_idempotent_but_a_forked_one_is_refused() {
 
     let forked = call_rec(p, 1, 2_000_000_100, "", "DIFFERENT");
     let err = store
-        .append_plane_record(&forked)
+        .append_plane_record(forked.view())
         .expect_err("a different record at an occupied (principal, seq) is a fork and must error");
     assert!(
         !format!("{err}").contains("DIFFERENT"),
@@ -2078,7 +2078,7 @@ fn a_replayed_call_is_idempotent_but_a_forked_one_is_refused() {
     let mut moved = rec.clone();
     moved.ts += 1;
     store
-        .append_plane_record(&moved)
+        .append_plane_record(moved.view())
         .expect_err("a record that differs only in its envelope is still a fork and must error");
     reset_plane(&store, "call", &[p]);
 }
@@ -2097,10 +2097,10 @@ fn principals_differing_only_in_case_are_distinct_chains() {
     reset_plane(&store, "call", &[lower, upper]);
 
     store
-        .append_plane_record(&call_rec(lower, 1, 2_000_000_100, "", "lower1"))
+        .append_plane_record(call_rec(lower, 1, 2_000_000_100, "", "lower1").view())
         .unwrap();
     store
-        .append_plane_record(&call_rec(upper, 1, 2_000_000_100, "", "upper1"))
+        .append_plane_record(call_rec(upper, 1, 2_000_000_100, "", "upper1").view())
         .expect(
             "a case-different principal is a DIFFERENT caller opening its own chain, never a fork \
              of the first caller's",
@@ -2247,13 +2247,13 @@ fn an_in_flight_task_survives_dropping_the_store_and_reconnecting() {
         let store = MysqlStore::connect(&url).expect("connect");
         reset_tasks(&store, &[t1, t2]);
         store
-            .upsert_plane_record(&active_task(t1, "working", TASK_LIVE_TS + 200))
+            .upsert_plane_record(active_task(t1, "working", TASK_LIVE_TS + 200).view())
             .unwrap();
         // The write-through on a state transition REPLACES the row rather than appending a second
         // one — an interrupted task waiting on a human is what a restart has to find.
-        store.upsert_plane_record(&interrupted).unwrap();
+        store.upsert_plane_record(interrupted.view()).unwrap();
         store
-            .upsert_plane_record(&active_task(t2, "submitted", TASK_LIVE_TS + 210))
+            .upsert_plane_record(active_task(t2, "submitted", TASK_LIVE_TS + 210).view())
             .unwrap();
         drop(store);
     }
@@ -2308,16 +2308,16 @@ fn listing_tasks_returns_every_row_including_terminal_ones_after_a_reconnect() {
         let store = MysqlStore::connect(&url).expect("connect");
         reset_tasks(&store, &ids);
         store
-            .upsert_plane_record(&active_task(ids[0], "working", TASK_LIVE_TS + 200))
+            .upsert_plane_record(active_task(ids[0], "working", TASK_LIVE_TS + 200).view())
             .unwrap();
         store
-            .upsert_plane_record(&active_task(ids[1], "input-required", TASK_LIVE_TS + 201))
+            .upsert_plane_record(active_task(ids[1], "input-required", TASK_LIVE_TS + 201).view())
             .unwrap();
         store
-            .upsert_plane_record(&terminal_task(ids[2], "completed", TASK_LIVE_TS + 202))
+            .upsert_plane_record(terminal_task(ids[2], "completed", TASK_LIVE_TS + 202).view())
             .unwrap();
         store
-            .upsert_plane_record(&terminal_task(ids[3], "failed", TASK_LIVE_TS + 203))
+            .upsert_plane_record(terminal_task(ids[3], "failed", TASK_LIVE_TS + 203).view())
             .unwrap();
         drop(store);
     }
@@ -2352,17 +2352,17 @@ fn a_task_event_chain_survives_a_reconnect_and_still_links() {
         reset_tasks(&store, &[t1, t2]);
         // Appended OUT of order: the read must come back by `seq`, not by insertion.
         store
-            .append_plane_record(&event_rec(t1, 2, "task.working", "e1", "e2"))
+            .append_plane_record(event_rec(t1, 2, "task.working", "e1", "e2").view())
             .unwrap();
         store
-            .append_plane_record(&event_rec(t1, 1, "task.submitted", "", "e1"))
+            .append_plane_record(event_rec(t1, 1, "task.submitted", "", "e1").view())
             .unwrap();
         store
-            .append_plane_record(&event_rec(t1, 3, "task.interrupted", "e2", "e3"))
+            .append_plane_record(event_rec(t1, 3, "task.interrupted", "e2", "e3").view())
             .unwrap();
         // A second task's chain is independent — it must not leak into the first one's read.
         store
-            .append_plane_record(&event_rec(t2, 1, "task.submitted", "", "f1"))
+            .append_plane_record(event_rec(t2, 1, "task.submitted", "", "f1").view())
             .unwrap();
         drop(store);
     }
@@ -2420,9 +2420,9 @@ fn a_replayed_task_event_is_idempotent_but_a_rewritten_one_is_refused() {
     reset_tasks(&store, &[t]);
 
     let e = event_rec(t, 1, "task.submitted", "", "e1");
-    store.append_plane_record(&e).unwrap();
+    store.append_plane_record(e.view()).unwrap();
     store
-        .append_plane_record(&e)
+        .append_plane_record(e.view())
         .expect("an identical replay must succeed, not be rejected as a fork");
     assert_eq!(
         events_of(&store, t).len(),
@@ -2432,7 +2432,7 @@ fn a_replayed_task_event_is_idempotent_but_a_rewritten_one_is_refused() {
 
     let rewritten = event_rec(t, 1, "task.submitted", "", "e1-rewritten");
     store
-        .append_plane_record(&rewritten)
+        .append_plane_record(rewritten.view())
         .expect_err("a DIFFERENT event at an occupied (task, seq) is a fork and must be refused");
     let got = events_of(&store, t);
     assert_eq!(got.len(), 1);
@@ -2479,31 +2479,25 @@ fn purge_tasks_before_drops_only_terminal_rows_and_returns_a_real_count() {
     let old = 1_000_000_100;
     for state in ["completed", "failed", "canceled", "rejected"] {
         store
-            .upsert_plane_record(&terminal_task(&format!("t_purge_old_{state}"), state, old))
+            .upsert_plane_record(terminal_task(&format!("t_purge_old_{state}"), state, old).view())
             .unwrap();
     }
     for state in ["input-required", "auth-required", "working", "submitted"] {
         store
-            .upsert_plane_record(&active_task(&format!("t_purge_old_{state}"), state, old))
+            .upsert_plane_record(active_task(&format!("t_purge_old_{state}"), state, old).view())
             .unwrap();
     }
     store
-        .upsert_plane_record(&active_task(
-            "t_purge_old_body_says_completed",
-            "completed",
-            old,
-        ))
+        .upsert_plane_record(
+            active_task("t_purge_old_body_says_completed", "completed", old).view(),
+        )
         .unwrap();
     // Terminal but at the cutoff exactly, and terminal but newer — both kept.
     store
-        .upsert_plane_record(&terminal_task(
-            "t_purge_at_cutoff",
-            "completed",
-            1_000_000_200,
-        ))
+        .upsert_plane_record(terminal_task("t_purge_at_cutoff", "completed", 1_000_000_200).view())
         .unwrap();
     store
-        .upsert_plane_record(&terminal_task("t_purge_newer", "completed", 1_000_000_300))
+        .upsert_plane_record(terminal_task("t_purge_newer", "completed", 1_000_000_300).view())
         .unwrap();
 
     let purged = store
@@ -2558,19 +2552,19 @@ fn purging_a_task_takes_its_provenance_chain_with_it_and_no_other() {
     let (gone, stays) = ("t_cascade_gone", "t_cascade_stays");
     reset_tasks(&store, &[gone, stays]);
     store
-        .upsert_plane_record(&terminal_task(gone, "completed", 1_000_000_100))
+        .upsert_plane_record(terminal_task(gone, "completed", 1_000_000_100).view())
         .unwrap();
     store
-        .upsert_plane_record(&active_task(stays, "working", 1_000_000_100))
+        .upsert_plane_record(active_task(stays, "working", 1_000_000_100).view())
         .unwrap();
     store
-        .append_plane_record(&event_rec(gone, 1, "task.submitted", "", "g1"))
+        .append_plane_record(event_rec(gone, 1, "task.submitted", "", "g1").view())
         .unwrap();
     store
-        .append_plane_record(&event_rec(gone, 2, "task.completed", "g1", "g2"))
+        .append_plane_record(event_rec(gone, 2, "task.completed", "g1", "g2").view())
         .unwrap();
     store
-        .append_plane_record(&event_rec(stays, 1, "task.submitted", "", "s1"))
+        .append_plane_record(event_rec(stays, 1, "task.submitted", "", "s1").view())
         .unwrap();
 
     assert_eq!(
@@ -2606,7 +2600,7 @@ fn the_plane_store_round_trips_the_full_u64_range() {
 
     let task = active_task(t, "working", u64::MAX);
     store
-        .upsert_plane_record(&task)
+        .upsert_plane_record(task.view())
         .expect("BIGINT UNSIGNED holds the whole u64 range; nothing here needs refusing");
     let got = get_task(&store, t).expect("the task must read back at all");
     assert_eq!(got["updated_at"].as_u64(), Some(u64::MAX));
@@ -2618,7 +2612,7 @@ fn the_plane_store_round_trips_the_full_u64_range() {
     let mut ev = event_rec(t, u64::MAX, "task.submitted", "", "e1");
     ev.ts = u64::MAX;
     store
-        .append_plane_record(&ev)
+        .append_plane_record(ev.view())
         .expect("seq/ts hold u64::MAX");
     let events = events_of(&store, t);
     assert_eq!(events.len(), 1);
@@ -2626,7 +2620,7 @@ fn the_plane_store_round_trips_the_full_u64_range() {
     // And the identical replay at that position is still recognised as identical — a column that
     // wrapped would read back as a different `ts` and report a fork.
     store
-        .append_plane_record(&ev)
+        .append_plane_record(ev.view())
         .expect("the replay at u64::MAX must compare identical");
     reset_tasks(&store, &[t]);
 }
@@ -2643,10 +2637,10 @@ fn task_ids_differing_only_in_case_are_distinct_tasks() {
     reset_tasks(&store, &[lower, upper]);
 
     store
-        .upsert_plane_record(&active_task(lower, "working", TASK_LIVE_TS + 1))
+        .upsert_plane_record(active_task(lower, "working", TASK_LIVE_TS + 1).view())
         .unwrap();
     store
-        .upsert_plane_record(&terminal_task(upper, "completed", TASK_LIVE_TS + 2))
+        .upsert_plane_record(terminal_task(upper, "completed", TASK_LIVE_TS + 2).view())
         .expect("a case-different id is a different task, not an upsert onto the first");
     let a = get_task(&store, lower).expect("the lower-case task");
     let b = get_task(&store, upper).expect("the upper-case task");
@@ -2661,10 +2655,10 @@ fn task_ids_differing_only_in_case_are_distinct_tasks() {
     );
 
     store
-        .append_plane_record(&event_rec(lower, 1, "task.submitted", "", "l1"))
+        .append_plane_record(event_rec(lower, 1, "task.submitted", "", "l1").view())
         .unwrap();
     store
-        .append_plane_record(&event_rec(upper, 1, "task.submitted", "", "u1"))
+        .append_plane_record(event_rec(upper, 1, "task.submitted", "", "u1").view())
         .unwrap();
     assert_eq!(events_of(&store, lower)[0]["hash"], "l1");
     assert_eq!(
@@ -2767,18 +2761,18 @@ fn a_demotion_survives_dropping_the_store_and_reconnecting() {
         let store = MysqlStore::connect(&url).expect("connect");
         reset_plane(&store, "demotion", &[&a, &b, &c]);
         store
-            .upsert_plane_record(&demotion_rec(&a, "tool-drift", TRUST_NOW))
+            .upsert_plane_record(demotion_rec(&a, "tool-drift", TRUST_NOW).view())
             .unwrap();
         // UPSERT by server: a second demotion of one upstream REPLACES the row rather than standing
         // a rival one beside it, so the boot read cannot hold two answers about one server.
         store
-            .upsert_plane_record(&demotion_rec(&a, "digest-mismatch", TRUST_NOW + 10))
+            .upsert_plane_record(demotion_rec(&a, "digest-mismatch", TRUST_NOW + 10).view())
             .unwrap();
         store
-            .upsert_plane_record(&demotion_rec(&b, "tool-drift", TRUST_NOW + 20))
+            .upsert_plane_record(demotion_rec(&b, "tool-drift", TRUST_NOW + 20).view())
             .unwrap();
         store
-            .upsert_plane_record(&demotion_rec(&c, "tool-drift", TRUST_NOW + 30))
+            .upsert_plane_record(demotion_rec(&c, "tool-drift", TRUST_NOW + 30).view())
             .unwrap();
         store
             .delete_plane_record("demotion", &c)
@@ -2820,10 +2814,10 @@ fn servers_differing_only_in_case_are_distinct_demotions() {
     reset_plane(&store, "demotion", &[&lower, &upper]);
 
     store
-        .upsert_plane_record(&demotion_rec(&lower, "tool-drift", TRUST_NOW))
+        .upsert_plane_record(demotion_rec(&lower, "tool-drift", TRUST_NOW).view())
         .unwrap();
     store
-        .upsert_plane_record(&demotion_rec(&upper, "digest-mismatch", TRUST_NOW + 1))
+        .upsert_plane_record(demotion_rec(&upper, "digest-mismatch", TRUST_NOW + 1).view())
         .unwrap();
     let servers = demotion_servers(&store);
     assert_eq!(
@@ -3028,7 +3022,7 @@ fn the_trust_state_stores_the_full_unsigned_range() {
     reset_tokens(&store, "ask", &[&nonce]);
 
     store
-        .upsert_plane_record(&demotion_rec(&server, "tool-drift", u64::MAX))
+        .upsert_plane_record(demotion_rec(&server, "tool-drift", u64::MAX).view())
         .expect("BIGINT UNSIGNED holds the whole u64 range");
     assert_eq!(
         demotions(&store)
@@ -3087,7 +3081,7 @@ fn plane_token_live_carries_a_task_and_dies_with_it() {
         "an unknown token holds no capability"
     );
     store
-        .upsert_plane_record(&push_config(id, PlaneDisposition::Active))
+        .upsert_plane_record(push_config(id, PlaneDisposition::Active).view())
         .unwrap();
     for _ in 0..2 {
         assert!(
@@ -3116,7 +3110,7 @@ fn plane_token_live_carries_a_task_and_dies_with_it() {
         "the capability is scoped to its kind"
     );
     store
-        .upsert_plane_record(&push_config(id, PlaneDisposition::Terminal))
+        .upsert_plane_record(push_config(id, PlaneDisposition::Terminal).view())
         .unwrap();
     assert!(
         !store
@@ -3580,7 +3574,7 @@ fn a_released_1_5_database_upgrades_in_place() {
     assert_eq!(meter[0].requests, 5, "the 1.5 cell accumulates in place");
     // The new tables are live.
     store
-        .upsert_plane_record(&active_task("t_after_upgrade", "working", TASK_LIVE_TS))
+        .upsert_plane_record(active_task("t_after_upgrade", "working", TASK_LIVE_TS).view())
         .unwrap();
     assert!(store
         .get_plane_record("task", "t_after_upgrade")

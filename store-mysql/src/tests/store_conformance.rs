@@ -581,7 +581,7 @@ pub fn assert_plane_task_upsert_get_list(store: &dyn RecordStore, ns: &str) {
     let expected: SampleTask =
         serde_json::from_slice(&record.body).expect("decode the expected task body");
     store
-        .upsert_plane_record(&record)
+        .upsert_plane_record(record.view())
         .expect("upsert the task plane record");
 
     let got = store
@@ -622,11 +622,11 @@ pub fn assert_plane_event_chain_is_ordered_by_seq(store: &dyn RecordStore, ns: &
     // Append seq 2 BEFORE seq 1: a backend that returns insertion order rather than `seq` order fails.
     for seq in [2u64, 1u64] {
         store
-            .append_plane_record(&plane_event(&parent, seq))
+            .append_plane_record(plane_event(&parent, seq).view())
             .expect("append a task-event plane record");
     }
     let seqs: Vec<u64> = store
-        .list_plane_records("task_event", &PlaneSelector::Parent(parent.clone()))
+        .list_plane_records("task_event", &PlaneSelector::Parent(parent.clone().into()))
         .expect("list the task events for the parent")
         .iter()
         .map(|b| {
@@ -650,7 +650,7 @@ pub fn assert_plane_call_parents_enumerated(store: &dyn RecordStore, ns: &str) {
     const PARENT_ENUM_TS: u64 = 500_000_000_000;
     for principal in [&p1, &p2] {
         store
-            .append_plane_record(&plane_call(principal, 1, PARENT_ENUM_TS))
+            .append_plane_record(plane_call(principal, 1, PARENT_ENUM_TS).view())
             .expect("append a call plane record");
     }
     let parents = store
@@ -673,7 +673,7 @@ pub fn assert_plane_demotion_upsert_list_delete(store: &dyn RecordStore, ns: &st
     let s2 = format!("{ns}_srvB");
     for server in [&s1, &s2] {
         store
-            .upsert_plane_record(&plane_demotion(server))
+            .upsert_plane_record(plane_demotion(server).view())
             .expect("upsert a demotion plane record");
     }
     let servers = |store: &dyn RecordStore| -> Vec<String> {
@@ -743,7 +743,7 @@ pub fn assert_plane_purge_honours_the_cutoff(store: &dyn RecordStore, ns: &str) 
     // that drops "the first N" rather than "the ones older than `before`" cannot pass by accident.
     for (seq, ts) in [(2u64, new_ts), (1u64, old_ts)] {
         store
-            .append_plane_record(&plane_call(&parent, seq, ts))
+            .append_plane_record(plane_call(&parent, seq, ts).view())
             .expect("append a call plane record");
     }
 
@@ -756,7 +756,7 @@ pub fn assert_plane_purge_honours_the_cutoff(store: &dyn RecordStore, ns: &str) 
     // Namespace-scoped evidence: this run's OWN older row must be gone and its OWN newer row must
     // survive, regardless of which sweep (this one, or a concurrent sibling's) actually did the work.
     let survivors: Vec<u64> = store
-        .list_plane_records("call", &PlaneSelector::Parent(parent.clone()))
+        .list_plane_records("call", &PlaneSelector::Parent(parent.clone().into()))
         .expect("list the calls for the parent")
         .iter()
         .map(|b| {
@@ -779,7 +779,7 @@ pub fn assert_plane_purge_honours_the_cutoff(store: &dyn RecordStore, ns: &str) 
         .purge_plane_records_before("call", cutoff)
         .expect("re-purge at the same cutoff");
     let resurvivors: Vec<u64> = store
-        .list_plane_records("call", &PlaneSelector::Parent(parent))
+        .list_plane_records("call", &PlaneSelector::Parent(parent.into()))
         .expect("list the calls for the parent again")
         .iter()
         .map(|b| {
@@ -821,7 +821,7 @@ pub fn assert_plane_purge_task_keeps_active_rows(store: &dyn RecordStore, ns: &s
     fresh_terminal.disposition = PlaneDisposition::Terminal;
     for record in [&old_active, &old_terminal, &fresh_terminal] {
         store
-            .upsert_plane_record(record)
+            .upsert_plane_record(record.view())
             .expect("upsert a task plane record");
     }
 
