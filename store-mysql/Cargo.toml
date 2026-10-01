@@ -17,7 +17,7 @@ crate-type = ["rlib"]
 [dependencies]
 # The ONE busbar crate a plugin names (#40: contract only; DECISIONS #84 merged the plugin SDK into it
 # as `busbar_contract::abi::sdk`). Pinned by git rev to the busbar commit in `.busbar-ref`.
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "7a5b429041752e00375e120ab1547a8928c3dee4" }
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "23d8a6b46deb158839df8bc02115b09023633040" }
 mysql = { version = "26", default-features = false, features = ["minimal"] }
 serde_json = "1"
 ulid = "1"
