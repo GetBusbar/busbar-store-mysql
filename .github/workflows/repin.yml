@@ -1,5 +1,5 @@
-# RENDERED by `cargo xtask fleet render busbar-store-mysql` from GetBusbar/busbar's plugins.yaml and
-# .github/fleet/ templates; `cargo xtask fleet check` is red on any edit here. Moves this repo's
+# RENDERED by `busbar-release plugin sync busbar-store-mysql` from GetBusbar/busbar-release template/; a hand
+# edit is overwritten by the next sync. Moves this repo's
 # busbar pin (busbar's plugin-repin.yml) when busbar dispatches `busbar-repin` or on demand; the
 # cut/skip decision is by commit, and the commit goes to dev only.
 name: repin
