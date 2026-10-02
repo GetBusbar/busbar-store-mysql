@@ -497,6 +497,50 @@ fn usage_with_no_model_breakdown_still_records_its_request_counters() {
     assert_eq!(back.billable_requests, 2);
 }
 
+/// THE SPLIT FLUSH (busbar ADV-1.6.0-2). The engine charges a request at ADMISSION and its tokens
+/// at COMPLETION, and the write-behind flusher ticks on its own clock, so a request slower than one
+/// tick reaches the store as TWO deltas: `{requests: +1, models: []}`, then
+/// `{requests: 0, models: [<tokens>]}`. The published 1.5.x store kept request counters on its
+/// per-model rows, had nowhere to put the first delta, answered `Ok(())` and dropped it: after a
+/// restart the row read `requests=0 tokens_input=11 tokens_output=7`, spend intact and the
+/// requests cap reset. This drives exactly that sequence through `add_usage`, reconnects (a new
+/// process reading the same database), and requires the whole request back. busbar's
+/// `plugins.store-persist|store-mysql` oracle cell pins the flush tick out of its boots so the
+/// 1.5.5 golden stays deterministic; this test is where the split itself stays proven.
+#[test]
+fn a_request_split_across_two_flushes_keeps_its_count_across_a_reconnect() {
+    let _guard = lock_usage_windows();
+    let Some(s) = fresh_store() else { return };
+    let admission = UsageDelta {
+        requests: 1,
+        billable_requests: 1,
+        models: vec![],
+    };
+    let completion = UsageDelta {
+        requests: 0,
+        billable_requests: 0,
+        models: vec![ModelTokensDelta {
+            model: "m-split".to_string(),
+            usage_units: units(&[(UNIT_INPUT, 11), (UNIT_OUTPUT, 7)]),
+        }],
+    };
+    s.add_usage("vk_split_flush", 1_000_103, &admission)
+        .unwrap();
+    s.add_usage("vk_split_flush", 1_000_103, &completion)
+        .unwrap();
+    drop(s);
+    let reopened = MysqlStore::connect(&test_url().unwrap()).expect("reconnect");
+    let back = reopened.get_usage("vk_split_flush", 1_000_103).unwrap();
+    assert_eq!(
+        (back.requests, back.billable_requests),
+        (1, 1),
+        "the admission flush's request count was dropped; the completion's tokens alone survived: {back:?}"
+    );
+    assert_eq!(back.models.len(), 1, "{back:?}");
+    assert_eq!(back.models[0].tier(UNIT_INPUT), 11, "{back:?}");
+    assert_eq!(back.models[0].tier(UNIT_OUTPUT), 7, "{back:?}");
+}
+
 /// `purge_metering_before` must match the rows `add_metering` actually wrote. The bucket column is
 /// `CHAR(10)` and both the write and the read zero-pad into it; only the purge compared the caller's
 /// raw string, so a caller passing the unpadded form matched nothing and got a successful purge of
