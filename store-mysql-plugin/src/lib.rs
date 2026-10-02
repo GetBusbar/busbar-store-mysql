@@ -7,12 +7,21 @@
 //! boot. One MySQL/MariaDB behind a fleet of busbar nodes means shared virtual keys, budgets, and
 //! usage across the cluster.
 //!
-//! All the store lives in the `busbar-store-mysql` crate, including its one door registration
-//! (`export_store_plugin!(open)`): the frozen symbols the loader looks up are the contract SDK's,
-//! defined once, and they answer through that door. This crate re-exports the logic crate so the
-//! library it builds carries exactly the code a busbar build that links the store runs — one source,
-//! both doors (DECISIONS #2 rule (1)).
+//! All the store lives in the `busbar-store-mysql` crate, including its door
+//! (`busbar_store_mysql::door`, `store_door!`). This crate re-exports the logic crate and exports
+//! that door as the image's ONE symbol, `busbar_plugin_door` (`export_door!`, unconditionally),
+//! so the library carries exactly the code a busbar build that links the store runs
+//! — one source, both doors (DECISIONS #2 rule (1)).
+//!
+//! This crate is `deny`, not `forbid`: the export macro's `#[unsafe(no_mangle)]` is the one
+//! reviewed exemption (a `forbid` cannot be lifted for it). No other `unsafe` exists here.
 
 #![deny(unsafe_code)]
 
 pub use busbar_store_mysql::*;
+
+/// The exported door: the macro's `#[no_mangle]` symbol is the one exemption.
+#[allow(unsafe_code)]
+mod exported {
+    busbar_contract::export_door!(busbar_store_mysql::door);
+}

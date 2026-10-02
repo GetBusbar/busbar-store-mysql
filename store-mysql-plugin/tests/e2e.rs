@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! End-to-end coverage of the `busbar-store-mysql-plugin` cdylib, loaded the way a REAL operator
-//! actually loads a plugin — not via a direct in-process `busbar_plugin_loader::load_store()` call
+//! actually loads a plugin — not via a direct in-process `load()` call
 //! (that mechanism no end user ever uses: nobody imports `busbar-plugin-loader` and calls its
 //! internal function). Converted from the prior direct-call test to mirror store-postgres's proven
 //! file-drop pattern exactly.
@@ -20,15 +20,44 @@
 //!   2. A second, independent `MysqlStore::connect` (bypassing the plugin/ABI/loader entirely)
 //!      confirms real MySQL was actually touched, not an in-process fake.
 //!
-//! The ABI-contract error-path test below (`bad_config_fails_over_abi`) is DELIBERATELY left calling
-//! `load_store()` directly — it tests the loader's own error-surface contract in isolation ("does a
-//! bad config produce a clean Err across the ABI, never a panic"), a different question from "does a
-//! real end-user install work," matching store-postgres's rationale for the same split.
+//! The ABI-contract tests below load the cdylib DIRECTLY through the loader's dropped-in door
+//! ([`load`]: the Statement rendered as `busbar-plugin-pack` renders it, `load_dropped`, then
+//! `LoadedStore::open`, the way the host opens a store) — they test the store table's own contract
+//! in isolation ("does a bad config produce a clean Err across the ABI, never a panic"; "does
+//! every verb relay"), a different question from "does a real end-user install work".
 
+use busbar_contract::records::RecordStore;
+use busbar_plugin_loader::dispatch::kinds::store::Store;
+use busbar_plugin_loader::dispatch::{
+    load_dropped, rendering_of_library, Bind, DispatchConfig, Dispatcher, NoSink,
+};
+use busbar_plugin_loader::store_v3::LoadedStore;
 use busbar_store_mysql::MysqlStore;
 use mysql::params;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+
+/// Load the store library at `path` through the DROPPED-IN DOOR and open it on `cfg`, the way the
+/// host opens a store: its Statement rendered as `busbar-plugin-pack` signs it into the manifest,
+/// `load_dropped` (dlopen, `busbar_plugin_door`, the Statement compared byte for byte), then
+/// `LoadedStore::open`. Dropping the handle closes the instance and unloads the library.
+fn load(path: &Path, cfg: &str) -> Result<Box<dyn RecordStore>, String> {
+    let stated = rendering_of_library(path)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "the library exports no busbar_plugin_door".to_string())?;
+    let dispatcher = Arc::new(Dispatcher::new(DispatchConfig::default()));
+    let bind = Bind {
+        instance: Arc::from("store-mysql-e2e"),
+        max_inflight_cap: 64,
+        sink: Arc::new(NoSink),
+        dispatcher: dispatcher.adopter(),
+        conns: None,
+    };
+    let plugin = load_dropped::<Store>(path, &stated, bind).map_err(|e| e.to_string())?;
+    let store = LoadedStore::open(plugin, dispatcher, cfg.as_bytes(), 1)?;
+    Ok(Box::new(store))
+}
 
 fn mysql_url() -> Option<String> {
     match std::env::var("BUSBAR_TEST_MYSQL_URL") {
@@ -269,7 +298,7 @@ fn build_real_binaries() -> (PathBuf, PathBuf) {
 
 /// THE REAL END-TO-END INSTALL PROOF: pack the plugin, drop it in a real `plugins.dir`, run the real
 /// `busbar --validate` against a config naming `store: { module: mysql }`, and confirm real MySQL was
-/// actually touched — via the documented file-drop mechanism, never a direct `load_store()` call.
+/// actually touched — via the documented file-drop mechanism, never a direct `load()` call.
 #[test]
 fn load_and_exercise_mysql_plugin_via_file_drop() {
     let Some(url) = mysql_url() else { return };
@@ -396,13 +425,13 @@ fn load_and_exercise_mysql_plugin_via_file_drop() {
 }
 
 /// END-TO-END FAILURE (ABI-contract unit test, see module doc for why this stays a direct
-/// `load_store()` call): an `open()` config that cannot produce a usable store surfaces back across
+/// `load()` call): an `open()` config that cannot produce a usable store surfaces back across
 /// the C ABI as a clean `Err`, never a panic or a silently-succeeded load.
 #[test]
 fn load_and_exercise_mysql_plugin_bad_config_fails_over_abi() {
     let path = plugin_path();
 
-    let err = busbar_plugin_loader::load_store(&path, "{ not json")
+    let err = load(&path, "{ not json")
         .err()
         .expect("malformed config JSON must fail to load, not silently succeed");
     assert!(
@@ -410,7 +439,7 @@ fn load_and_exercise_mysql_plugin_bad_config_fails_over_abi() {
         "the plugin's own error message should survive the ABI crossing intact: {err}"
     );
 
-    let err = busbar_plugin_loader::load_store(&path, "{}")
+    let err = load(&path, "{}")
         .err()
         .expect("a config missing url must fail to load");
     assert!(
@@ -418,7 +447,7 @@ fn load_and_exercise_mysql_plugin_bad_config_fails_over_abi() {
         "expected the plugin's own missing-url message, got: {err}"
     );
 
-    let err = busbar_plugin_loader::load_store(
+    let err = load(
         &path,
         &cfg("mysql://u:p@127.0.0.1:1/definitely_not_a_real_db"),
     )
@@ -435,14 +464,11 @@ fn load_and_exercise_mysql_plugin_bad_config_fails_over_abi() {
 /// ABI-contract-unit-test rationale as above.
 #[test]
 fn refuses_non_plugin() {
-    let err = match busbar_plugin_loader::load_store(
-        std::path::Path::new("/definitely/not/a/plugin.so"),
-        "{}",
-    ) {
+    let err = match load(std::path::Path::new("/definitely/not/a/plugin.so"), "{}") {
         Err(e) => e,
         Ok(_) => panic!("a missing library must not load"),
     };
-    assert!(err.contains("failed to load plugin"), "got: {err}");
+    assert!(err.contains("did not load"), "got: {err}");
 }
 
 /// Wipe the durable plane-record tables so this run's exact counts mean something.
@@ -484,16 +510,16 @@ fn decode(b: &[u8]) -> serde_json::Value {
 /// while reporting success. That is not hypothetical — the ABI once carried four store methods while
 /// the trait carried ten, so a task write took the trait default and reported success.
 ///
-/// So it goes through `busbar_plugin_loader::load_store`: a REAL `dlopen` of the built cdylib, the
-/// real C ABI, the real `DynStore`. It writes AT ARITY > 1 (three tasks across two dispositions,
+/// So it goes through [`load`]: a REAL `dlopen` of the built cdylib, the
+/// store v3 table, the real `LoadedStore`. It writes AT ARITY > 1 (three tasks across two dispositions,
 /// three events on one task and one on another, three call records for one principal and one for a
-/// second), DROPS the handle — which runs `busbar_close` and UNLOADS the library — then `dlopen`s
+/// second), DROPS the handle — which runs `close` and UNLOADS the library — then `dlopen`s
 /// AGAIN over the same file and reads everything back. A third leg reads the same rows through the
 /// plain `MysqlStore`, never touching the cdylib, the C ABI or the loader — so a plugin that
 /// answered from its own in-process cache still fails here.
 #[test]
 fn tasks_and_call_log_survive_an_unload_and_reload_over_the_real_plugin_abi() {
-    use busbar_contract::records::{PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore};
+    use busbar_contract::records::{PlaneDisposition, PlaneRecord, PlaneSelector};
 
     let path = plugin_path();
     let Some(url) = mysql_url() else {
@@ -563,8 +589,7 @@ fn tasks_and_call_log_survive_an_unload_and_reload_over_the_real_plugin_abi() {
 
     {
         // BOOT 1 — a real dlopen of the cdylib; every call below crosses the C ABI.
-        let store = busbar_plugin_loader::load_store(&path, &config)
-            .expect("the mysql plugin must load over the real ABI");
+        let store = load(&path, &config).expect("the mysql plugin must load over the real ABI");
         for (id, state, updated, d) in [
             ("t_alpha", "working", 10_u64, PlaneDisposition::Active),
             ("t_beta", "input-required", 20, PlaneDisposition::Active),
@@ -591,14 +616,13 @@ fn tasks_and_call_log_survive_an_unload_and_reload_over_the_real_plugin_abi() {
         store
             .append_plane_record(call("vk_other", 1, "", "o1").view())
             .expect("append a call");
-        // Dropping the boxed store drops the loader's `Library` handle: `busbar_close` runs and the
+        // Dropping the boxed store drops the loader's `Library` handle: the instance closes and the
         // dylib is UNLOADED. Nothing this process still holds can be answering the reads below.
         drop(store);
     }
 
     // BOOT 2 — a second, independent dlopen over the same file.
-    let store = busbar_plugin_loader::load_store(&path, &config)
-        .expect("the mysql plugin must load again over the real ABI");
+    let store = load(&path, &config).expect("the mysql plugin must load again over the real ABI");
 
     let tasks = store
         .list_plane_records("task", &PlaneSelector::All)
@@ -753,7 +777,7 @@ fn clear_trust_rows(url: &str, servers: &[&str], nonces: &[&str]) {
 /// of two properties whose unimplemented form is silently green.
 #[test]
 fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
-    use busbar_contract::records::{PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore};
+    use busbar_contract::records::{PlaneDisposition, PlaneRecord, PlaneSelector};
 
     let path = plugin_path();
     let url = std::env::var("BUSBAR_TEST_MYSQL_URL").unwrap_or_else(|_| {
@@ -808,8 +832,7 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     };
 
     {
-        let store = busbar_plugin_loader::load_store(&path, &config)
-            .expect("the mysql plugin must load over the real ABI");
+        let store = load(&path, &config).expect("the mysql plugin must load over the real ABI");
         store
             .upsert_plane_record(demotion(&srv_demoted, "tool-drift", NOW).view())
             .expect("upsert a demotion");
@@ -832,8 +855,7 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         drop(store);
     }
 
-    let store = busbar_plugin_loader::load_store(&path, &config)
-        .expect("the mysql plugin must load again over the real ABI");
+    let store = load(&path, &config).expect("the mysql plugin must load again over the real ABI");
     assert_eq!(
         mine(store.as_ref()),
         vec![decode(
@@ -850,7 +872,7 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     );
 
     // THE FLEET: a second, simultaneous dlopen against the same database.
-    let node_b = busbar_plugin_loader::load_store(&path, &config)
+    let node_b = load(&path, &config)
         .expect("a second node loads the same plugin against the same database");
     assert!(store
         .redeem_plane_token("ask", &nonce_fleet, NOW + 900, NOW + 2)
@@ -906,8 +928,7 @@ fn a_non_pool_scope_grant_crosses_the_plugin_abi() {
     let id = "vk_abi_scope_kinds";
     let _direct = MysqlStore::connect(&url).expect("migrate");
     cleanup(&url, id);
-    let store = busbar_plugin_loader::load_store(&path, &cfg(&url))
-        .expect("the mysql plugin must load over the real ABI");
+    let store = load(&path, &cfg(&url)).expect("the mysql plugin must load over the real ABI");
     let key = VirtualKey {
         id: id.into(),
         generation_hash: "g".into(),

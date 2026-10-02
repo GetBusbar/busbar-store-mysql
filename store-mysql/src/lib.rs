@@ -33,6 +33,11 @@
 //!   *looks* validated can silently accept garbage. A live functional probe (attempt a CHECK
 //!   violation, confirm it's rejected) is the only way to catch this; a version-string check alone
 //!   is not sufficient since parsing-without-enforcing doesn't show up as a version mismatch.
+//! - The store v3 additions (`slots`: `op_id` dedupe, the journal, sessions, kernel records, the
+//!   money slots and window caps) live in their own tables (schema v8), each written in ONE
+//!   transaction with the `op_id` it is deduped on, so the dedupe is as durable as the effect.
+
+#![forbid(unsafe_code)]
 
 use mysql::prelude::*;
 use mysql::{params, Opts, Pool, PooledConn, TxOpts};
@@ -99,7 +104,10 @@ fn store_err<E: std::fmt::Display>(e: E) -> RecordStoreError {
 /// name-keyed `usage_units` map, and a metering cell is now keyed by `priced_from_ms` as well
 /// (DECISION #79) and carries open `usage_units`. Every existing table is upgraded IN PLACE and no
 /// existing row is dropped or rewritten -- see `run_v7_upgrade`. A released 1.5.x database is v3.
-const SCHEMA_VERSION: u32 = 7;
+/// v8: the store v3 door (busbar 1.6.0's plugin ABI). Six NEW tables (`store_ops`, `store_caps`,
+/// `store_slices`, `store_journal`, `store_sessions`, `store_records`); purely additive, no
+/// existing table or row is touched.
+const SCHEMA_VERSION: u32 = 8;
 
 /// The version each one-time migration step targets crossing INTO — named so a gate reads as "did
 /// this database predate step N" rather than a bare magic number, and so a future step can't be
@@ -325,6 +333,71 @@ const SCHEMA: &[&str] = &[
         PRIMARY KEY (key_id, bucket, model, provider, priced_from_ms, unit)
     ) ENGINE=InnoDB",
     "CREATE INDEX idx_metering_units_bucket ON usage_metering_units (bucket)",
+    // ── v8 (busbar 1.6.0, the store v3 door) ──────────────────────────────────────────────────
+    //
+    // THE DURABLE `op_id` DEDUPE LOG (`abi::store` S1-S4). One row per op that APPLIED: its value
+    // fields (`body`, compared byte for byte on a replay) and what it answered (`answer`, replayed
+    // verbatim). The row is inserted FIRST in the op's own transaction, so two racing calls with
+    // one `op_id` serialise on its primary key: the second waits, then reads the first's committed
+    // row. A failed op rolls its row back with its effect: nothing is recorded (S3). Rows older
+    // than the retention are swept (`recorded_at`, epoch seconds).
+    "CREATE TABLE IF NOT EXISTS store_ops (
+        op_id BINARY(16) PRIMARY KEY,
+        recorded_at BIGINT UNSIGNED NOT NULL,
+        body LONGBLOB NOT NULL,
+        answer LONGBLOB NOT NULL
+    ) ENGINE=InnoDB",
+    "CREATE INDEX idx_store_ops_recorded ON store_ops (recorded_at)",
+    // THE WINDOW CAPS AND WHAT IS DRAWN AGAINST THEM: one row per slot `(bucket, pool, dimension,
+    // class_key, window_start)`. `pooled` tells an absent pool (every pool) from a named one, so
+    // `pool` can sit in the key as ''. `used` is the slot's drawn-and-not-released total; a cap
+    // push never touches it. utf8mb4_bin for the reason the v7 tables give.
+    "CREATE TABLE IF NOT EXISTS store_caps (
+        bucket VARCHAR(191) COLLATE utf8mb4_bin NOT NULL,
+        pooled BOOLEAN NOT NULL,
+        pool VARCHAR(191) COLLATE utf8mb4_bin NOT NULL,
+        dimension INT UNSIGNED NOT NULL,
+        class_key VARCHAR(191) COLLATE utf8mb4_bin NOT NULL,
+        window_start BIGINT UNSIGNED NOT NULL,
+        cap BIGINT UNSIGNED NOT NULL,
+        config_gen BIGINT UNSIGNED NOT NULL,
+        used BIGINT UNSIGNED NOT NULL DEFAULT 0,
+        PRIMARY KEY (bucket, pooled, pool, dimension, class_key, window_start)
+    ) ENGINE=InnoDB",
+    // THE OPEN SLICES: what each grant still holds against its slot, until `slice_release` takes
+    // it back. A slice released to zero is deleted.
+    "CREATE TABLE IF NOT EXISTS store_slices (
+        slice_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+        bucket VARCHAR(191) COLLATE utf8mb4_bin NOT NULL,
+        pooled BOOLEAN NOT NULL,
+        pool VARCHAR(191) COLLATE utf8mb4_bin NOT NULL,
+        dimension INT UNSIGNED NOT NULL,
+        class_key VARCHAR(191) COLLATE utf8mb4_bin NOT NULL,
+        window_start BIGINT UNSIGNED NOT NULL,
+        remaining BIGINT UNSIGNED NOT NULL
+    ) ENGINE=InnoDB",
+    // THE JOURNAL (`append_batch`/`heads`): fixed-size records per stream, at seq 1.. in order.
+    "CREATE TABLE IF NOT EXISTS store_journal (
+        stream VARCHAR(191) COLLATE utf8mb4_bin NOT NULL,
+        seq BIGINT UNSIGNED NOT NULL,
+        record VARBINARY(512) NOT NULL,
+        PRIMARY KEY (stream, seq)
+    ) ENGINE=InnoDB",
+    // THE SESSION TABLE (`session_put`/`session_remove`/`sessions_for`).
+    "CREATE TABLE IF NOT EXISTS store_sessions (
+        session BIGINT UNSIGNED PRIMARY KEY,
+        node TEXT NOT NULL,
+        principal VARCHAR(191) COLLATE utf8mb4_bin NOT NULL
+    ) ENGINE=InnoDB",
+    "CREATE INDEX idx_store_sessions_principal ON store_sessions (principal)",
+    // THE KERNEL'S DURABLE RECORDS (`record_put`/`record_get`/`record_scan`): `(schema, key) ->
+    // value`, read back in KEY ORDER under a prefix. VARBINARY keys compare byte for byte.
+    "CREATE TABLE IF NOT EXISTS store_records (
+        schema_id VARCHAR(191) COLLATE utf8mb4_bin NOT NULL,
+        rkey VARBINARY(2048) NOT NULL,
+        value VARBINARY(512) NOT NULL,
+        PRIMARY KEY (schema_id, rkey)
+    ) ENGINE=InnoDB",
 ];
 
 /// MySQL/MariaDB-backed [`Store`]. A single mutex-guarded pooled connection is used for all control-
@@ -1158,6 +1231,292 @@ fn reserved_units(
     m
 }
 
+impl MysqlStore {
+    /// [`RecordStore::add_usage`] on `tx`: the caller's transaction, so a deduped `op_id` write
+    /// records its `op_id` atomically with the effect.
+    fn add_usage_on(
+        tx: &mut impl Queryable,
+        bucket_id: &str,
+        window_start: u64,
+        delta: &UsageDelta,
+    ) -> RecordStoreResult<()> {
+        // Pre-dedupe by (bucket_id, window_start, model) — a batch with duplicate PKs in one
+        // multi-row upsert would hit "cannot affect row a second time" on Postgres and undefined
+        // last-writer-wins on MySQL; the caller is trusted to flush one model at most once per
+        // call here (this is the per-delta path, not a batch upsert), so this loop just applies
+        // each model delta as its own upsert.
+        // The window's request counters accumulate ONCE, on the reserved `model = ''` sentinel row,
+        // not once per model. Applied inside the per-model loop instead, a single delta added its
+        // request count once for every model it carried, and a delta with no models recorded
+        // nothing. This is the fleet flush primitive, so both errors compounded permanently across
+        // every node and every flush interval.
+        tx.exec_drop(
+            "INSERT INTO usage_windows
+                (window_start, bucket_scope, bucket_id, model, requests, billable_requests)
+             VALUES (:w, 'key', :b, '', GREATEST(0, :req), GREATEST(0, :breq))
+             ON DUPLICATE KEY UPDATE
+                requests = GREATEST(0, CAST(requests AS SIGNED) + :req),
+                billable_requests = GREATEST(0, CAST(billable_requests AS SIGNED) + :breq)",
+            params! {
+                "w" => window_start, "b" => bucket_id,
+                "req" => delta.requests, "breq" => delta.billable_requests,
+            },
+        )
+        .map_err(store_err)?;
+        // Deterministic order, same reason as `put_usage`: the primary key orders by model name, so
+        // caller-order inserts from two concurrent flushes can deadlock on overlapping windows.
+        let mut models: Vec<&ModelTokensDelta> = delta.models.iter().collect();
+        models.sort_by(|a, b| a.model.cmp(&b.model));
+        for m in models {
+            let (ti, to, cr, cw, open) = split_units(&m.usage_units);
+            // The VALUES(...) row constructor is type-checked against the target UNSIGNED columns
+            // even on rows where ON DUPLICATE KEY UPDATE will fire instead of the INSERT -- MySQL
+            // validates the whole statement's row shape up front. A refund delta's negative i64
+            // would out-of-range error there even though it's never actually inserted as-is. Clamp
+            // each VALUES(...) literal at 0 with its own `GREATEST(0, :x)` (a negative delta on a
+            // brand-new, never-charged row is nonsensical anyway); the UPDATE arithmetic below still
+            // uses the RAW (possibly negative) bound value, which is where the real floor-at-0 signed
+            // accumulation happens.
+            tx.exec_drop(
+                "INSERT INTO usage_windows
+                    (window_start, bucket_scope, bucket_id, model,
+                     tokens_input, tokens_output, tokens_cache_read, tokens_cache_write)
+                 VALUES (:w, 'key', :b, :model,
+                         GREATEST(0, :ti), GREATEST(0, :to_), GREATEST(0, :cr), GREATEST(0, :cw))
+                 ON DUPLICATE KEY UPDATE
+                    tokens_input = GREATEST(0, CAST(tokens_input AS SIGNED) + :ti),
+                    tokens_output = GREATEST(0, CAST(tokens_output AS SIGNED) + :to_),
+                    tokens_cache_read = GREATEST(0, CAST(tokens_cache_read AS SIGNED) + :cr),
+                    tokens_cache_write = GREATEST(0, CAST(tokens_cache_write AS SIGNED) + :cw)",
+                params! {
+                    "w" => window_start, "b" => bucket_id, "model" => &m.model,
+                    "ti" => ti, "to_" => to, "cr" => cr, "cw" => cw,
+                },
+            )
+            .map_err(store_err)?;
+            // Every OPEN unit accumulates the same way, floored at 0, one atomic upsert per unit
+            // (BTreeMap order, so concurrent flushes take the rows in one order).
+            for (unit, d) in open {
+                tx.exec_drop(
+                    "INSERT INTO usage_window_units
+                        (window_start, bucket_scope, bucket_id, model, unit, count)
+                     VALUES (:w, 'key', :b, :model, :unit, GREATEST(0, :d))
+                     ON DUPLICATE KEY UPDATE count = GREATEST(0, CAST(count AS SIGNED) + :d)",
+                    params! {
+                        "w" => window_start, "b" => bucket_id, "model" => &m.model,
+                        "unit" => unit, "d" => d,
+                    },
+                )
+                .map_err(store_err)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// [`RecordStore::add_metering`] on `tx` (see [`Self::add_usage_on`]). ONE transaction for the
+    /// cell and its open units, so a reader never sees a cell's token counts advanced without the
+    /// units the same response accrued (or the reverse).
+    fn add_metering_on(tx: &mut impl Queryable, delta: &MeteringDelta) -> RecordStoreResult<()> {
+        let bucket = format!("{:010}", delta.bucket); // matches the CHAR(10) 'YYYY-MM-DD'-shaped bucket
+                                                      // `priced_from_ms` is part of the KEY (DECISION #79): a rate-card edit inside the UTC day
+                                                      // opens a SECOND cell for that day, so each half keeps the card it was earned under rather
+                                                      // than one card repricing the whole day.
+        tx.exec_drop(
+            "INSERT INTO usage_metering
+                (bucket, key_id, provider, model, key_group_at_use, pricing_version, priced_from_ms,
+                 requests, billable_requests, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write)
+             VALUES (:bucket, :key, :provider, :model, :grp, :pv, :pfm, :req, :breq, :ti, :to_, :cr, :cw)
+             ON DUPLICATE KEY UPDATE
+                requests = requests + VALUES(requests),
+                billable_requests = billable_requests + VALUES(billable_requests),
+                tokens_input = tokens_input + VALUES(tokens_input),
+                tokens_output = tokens_output + VALUES(tokens_output),
+                tokens_cache_read = tokens_cache_read + VALUES(tokens_cache_read),
+                tokens_cache_write = tokens_cache_write + VALUES(tokens_cache_write)",
+            params! {
+                "bucket" => &bucket, "key" => &delta.key_id, "provider" => &delta.provider,
+                "model" => &delta.model, "grp" => &delta.key_group_at_use, "pv" => &delta.pricing_version,
+                "pfm" => delta.priced_from_ms,
+                "req" => delta.requests, "breq" => delta.billable_requests,
+                "ti" => delta.tokens_input, "to_" => delta.tokens_output,
+                "cr" => delta.tokens_cache_read, "cw" => delta.tokens_cache_write,
+            },
+        )
+        .map_err(store_err)?;
+        // Every ledgered class the token columns do not hold, additive like them (BTreeMap order,
+        // so concurrent writers take the unit rows in one order).
+        for (unit, n) in &delta.usage_units {
+            tx.exec_drop(
+                "INSERT INTO usage_metering_units
+                    (bucket, key_id, provider, model, priced_from_ms, unit, count)
+                 VALUES (:bucket, :key, :provider, :model, :pfm, :unit, :n)
+                 ON DUPLICATE KEY UPDATE count = count + VALUES(count)",
+                params! {
+                    "bucket" => &bucket, "key" => &delta.key_id, "provider" => &delta.provider,
+                    "model" => &delta.model, "pfm" => delta.priced_from_ms, "unit" => unit, "n" => *n,
+                },
+            )
+            .map_err(store_err)?;
+        }
+        Ok(())
+    }
+
+    /// [`RecordStore::append_audit`] on `q` (see [`Self::add_usage_on`]).
+    fn append_audit_on(q: &mut impl Queryable, entry: &AuditRecord) -> RecordStoreResult<()> {
+        // `ON DUPLICATE KEY UPDATE seq = seq` kept the stored record and said nothing, which is
+        // right for ONE of the two ways a seq collides and wrong for the other. Compare them and
+        // let the difference decide (see the trait contract):
+        //   identical -> the write-through retrying after a lost commit ACK. Common, benign, Ok.
+        //   different -> two records claiming one chain position: a forked or tampered log, and the
+        //                single most important thing an audit store can report.
+        //
+        // INSERT FIRST, and deliberately with NO preceding `SELECT ... FOR UPDATE`.
+        //
+        // The obvious shape — take a row lock, look, then insert — DEADLOCKS here, and measurably:
+        // `SELECT ... FOR UPDATE` on a MISSING row takes a next-key/gap lock under REPEATABLE READ
+        // (which is what `TxOpts::default()` leaves the server on). Two appends of DIFFERENT, both
+        // new seqs land in the same gap; the gap locks are mutually compatible, but each side's
+        // following INSERT needs an insert-intention lock that conflicts with the other's gap lock.
+        // Four threads appending 200 distinct seqs each produced 39 deadlocks that way against 0
+        // for the plain autocommit insert. `append_audit` is also the one control-plane path that
+        // does not call `bump_revision`, so it sits OUTSIDE the `store_sequence` serialization that
+        // makes every other admin-plane transaction deadlock-free — it has no other protection.
+        //
+        // A bare INSERT takes only an insert-intention lock and no gap lock, so the ordinary path
+        // keeps the baseline's concurrency exactly, and the read only happens on the rare collision.
+        //
+        // The loop covers the row being deleted between the insert and the read-back: the seq is
+        // free again, so inserting is the right move. Bounded, and exhausting the bound is an error
+        // rather than a success, so no path here returns Ok without the record being stored.
+        const MAX_ATTEMPTS: u32 = 3;
+        for _ in 0..MAX_ATTEMPTS {
+            let inserted = q
+                .exec_iter(
+                "INSERT INTO audit_log (seq, ts, action, resource, outcome, principal, prev_hash, hash) \
+                 VALUES (:seq, :ts, :action, :resource, :outcome, :principal, :prev, :hash) \
+                 ON DUPLICATE KEY UPDATE seq = seq",
+                params! {
+                    "seq" => entry.seq, "ts" => entry.ts, "action" => &entry.action,
+                    "resource" => &entry.resource, "outcome" => &entry.outcome,
+                    "principal" => &entry.principal, "prev" => &entry.prev_hash, "hash" => &entry.hash,
+                },
+            )
+            .map_err(store_err)?
+            .affected_rows();
+            // 1 = inserted. 0 = the seq was already occupied and `seq = seq` changed nothing.
+            if inserted == 1 {
+                return Ok(());
+            }
+            let existing: Option<AuditRowTuple> = q
+                .exec_first(
+                    "SELECT seq, ts, action, resource, outcome, principal, prev_hash, hash \
+                     FROM audit_log WHERE seq = :seq",
+                    params! { "seq" => entry.seq },
+                )
+                .map_err(store_err)?;
+            let Some((seq, ts, action, resource, outcome, principal, prev_hash, hash)) = existing
+            else {
+                continue; // gone between the insert and the read: the seq is free, try again
+            };
+            let stored = AuditRecord {
+                seq,
+                ts,
+                action,
+                resource,
+                outcome,
+                principal,
+                prev_hash,
+                hash,
+            };
+            if stored == *entry {
+                return Ok(());
+            }
+            return Err(store_err(format!(
+                "append_audit: seq {} already holds a DIFFERENT record; the audit chain has forked \
+                 (stored action '{}', incoming '{}')",
+                entry.seq, stored.action, entry.action
+            )));
+        }
+        Err(store_err(format!(
+            "append_audit: seq {} kept being freed between the insert and the read-back after \
+             {MAX_ATTEMPTS} attempts; something is deleting audit rows concurrently and the record \
+             was NOT stored",
+            entry.seq
+        )))
+    }
+
+    /// [`RecordStore::append_plane_record`] on `q` (see [`Self::add_usage_on`]).
+    fn append_plane_record_on(
+        q: &mut impl Queryable,
+        record: PlaneRecordRef<'_>,
+    ) -> RecordStoreResult<()> {
+        // This store binds owned rows: the one copy of the borrowed view happens here.
+        let record = &record.to_record();
+        // APPEND-ONLY at a chain position `(parent, seq)`. A record arriving on a position that
+        // already holds one is settled by comparing the two, exactly as `append_audit` settles a
+        // duplicate `seq`:
+        //   identical -> the write-through retrying after a lost ACK. Common, benign, Ok.
+        //   different -> two records claiming one chain position: a forked or tampered chain, and
+        //                an error. Overwriting would destroy exactly the case worth reporting; this
+        //                store never restates a digest it was handed.
+        //
+        // INSERT FIRST, with no preceding `SELECT ... FOR UPDATE`, for the reason `append_audit`
+        // gives: a locking read of a MISSING row takes a gap lock under REPEATABLE READ, and two
+        // appends into the same gap then deadlock on each other's insert-intention lock. `kind =
+        // kind` makes the duplicate a no-op whose affected-row count is 0; NOT `INSERT IGNORE`,
+        // which would also downgrade every OTHER error -- a body or id too long for its column -- to a
+        // warning and a silently truncated row.
+        //
+        // The loop covers the row being purged between the insert and the read-back: the position
+        // is free again, so inserting is right. Bounded, and exhausting it is an error.
+        const MAX_ATTEMPTS: u32 = 3;
+        let ident = plane_ident(record);
+        for _ in 0..MAX_ATTEMPTS {
+            let inserted = q
+                .exec_iter(
+                    "INSERT INTO plane_records (kind, ident, seq, id, parent, ts, terminal, body) \
+                 VALUES (:kind, :ident, :seq, :id, :parent, :ts, :terminal, :body) \
+                 ON DUPLICATE KEY UPDATE kind = kind",
+                    plane_params(record),
+                )
+                .map_err(store_err)?
+                .affected_rows();
+            if inserted == 1 {
+                return Ok(());
+            }
+            let existing: Option<PlaneRowTuple> = q
+                .exec_first(
+                    "SELECT id, parent, ts, terminal, body FROM plane_records \
+                     WHERE kind = :kind AND ident = :ident AND seq = :seq",
+                    params! { "kind" => &record.kind, "ident" => ident, "seq" => record.seq },
+                )
+                .map_err(store_err)?;
+            let Some((id, parent, ts, terminal, body)) = existing else {
+                continue; // purged between the insert and the read: the position is free, retry
+            };
+            if id == record.id
+                && parent == record.parent
+                && ts == record.ts
+                && terminal == is_terminal(record.disposition)
+                && body == record.body
+            {
+                return Ok(());
+            }
+            // Names the position and nothing else -- it must not echo stored (or caller) content.
+            return Err(store_err(format!(
+                "append_plane_record: kind '{}' seq {} already holds a different record for this \
+                 parent; the chain has forked",
+                record.kind, record.seq
+            )));
+        }
+        Err(store_err(format!(
+            "append_plane_record: kind '{}' seq {} kept being freed between the insert and the \
+             read-back after {MAX_ATTEMPTS} attempts; the record was NOT stored",
+            record.kind, record.seq
+        )))
+    }
+}
+
 impl RecordStore for MysqlStore {
     fn put_key(&self, key: &VirtualKey) -> RecordStoreResult<()> {
         let mut conn = self.conn()?;
@@ -1530,128 +1889,16 @@ impl RecordStore for MysqlStore {
         let mut tx = conn
             .start_transaction(TxOpts::default())
             .map_err(store_err)?;
-
-        // Pre-dedupe by (bucket_id, window_start, model) — a batch with duplicate PKs in one
-        // multi-row upsert would hit "cannot affect row a second time" on Postgres and undefined
-        // last-writer-wins on MySQL; the caller is trusted to flush one model at most once per
-        // call here (this is the per-delta path, not a batch upsert), so this loop just applies
-        // each model delta as its own upsert.
-        // The window's request counters accumulate ONCE, on the reserved `model = ''` sentinel row,
-        // not once per model. Applied inside the per-model loop instead, a single delta added its
-        // request count once for every model it carried, and a delta with no models recorded
-        // nothing. This is the fleet flush primitive, so both errors compounded permanently across
-        // every node and every flush interval.
-        tx.exec_drop(
-            "INSERT INTO usage_windows
-                (window_start, bucket_scope, bucket_id, model, requests, billable_requests)
-             VALUES (:w, 'key', :b, '', GREATEST(0, :req), GREATEST(0, :breq))
-             ON DUPLICATE KEY UPDATE
-                requests = GREATEST(0, CAST(requests AS SIGNED) + :req),
-                billable_requests = GREATEST(0, CAST(billable_requests AS SIGNED) + :breq)",
-            params! {
-                "w" => window_start, "b" => bucket_id,
-                "req" => delta.requests, "breq" => delta.billable_requests,
-            },
-        )
-        .map_err(store_err)?;
-        // Deterministic order, same reason as `put_usage`: the primary key orders by model name, so
-        // caller-order inserts from two concurrent flushes can deadlock on overlapping windows.
-        let mut models: Vec<&ModelTokensDelta> = delta.models.iter().collect();
-        models.sort_by(|a, b| a.model.cmp(&b.model));
-        for m in models {
-            let (ti, to, cr, cw, open) = split_units(&m.usage_units);
-            // The VALUES(...) row constructor is type-checked against the target UNSIGNED columns
-            // even on rows where ON DUPLICATE KEY UPDATE will fire instead of the INSERT -- MySQL
-            // validates the whole statement's row shape up front. A refund delta's negative i64
-            // would out-of-range error there even though it's never actually inserted as-is. Clamp
-            // each VALUES(...) literal at 0 with its own `GREATEST(0, :x)` (a negative delta on a
-            // brand-new, never-charged row is nonsensical anyway); the UPDATE arithmetic below still
-            // uses the RAW (possibly negative) bound value, which is where the real floor-at-0 signed
-            // accumulation happens.
-            tx.exec_drop(
-                "INSERT INTO usage_windows
-                    (window_start, bucket_scope, bucket_id, model,
-                     tokens_input, tokens_output, tokens_cache_read, tokens_cache_write)
-                 VALUES (:w, 'key', :b, :model,
-                         GREATEST(0, :ti), GREATEST(0, :to_), GREATEST(0, :cr), GREATEST(0, :cw))
-                 ON DUPLICATE KEY UPDATE
-                    tokens_input = GREATEST(0, CAST(tokens_input AS SIGNED) + :ti),
-                    tokens_output = GREATEST(0, CAST(tokens_output AS SIGNED) + :to_),
-                    tokens_cache_read = GREATEST(0, CAST(tokens_cache_read AS SIGNED) + :cr),
-                    tokens_cache_write = GREATEST(0, CAST(tokens_cache_write AS SIGNED) + :cw)",
-                params! {
-                    "w" => window_start, "b" => bucket_id, "model" => &m.model,
-                    "ti" => ti, "to_" => to, "cr" => cr, "cw" => cw,
-                },
-            )
-            .map_err(store_err)?;
-            // Every OPEN unit accumulates the same way, floored at 0, one atomic upsert per unit
-            // (BTreeMap order, so concurrent flushes take the rows in one order).
-            for (unit, d) in open {
-                tx.exec_drop(
-                    "INSERT INTO usage_window_units
-                        (window_start, bucket_scope, bucket_id, model, unit, count)
-                     VALUES (:w, 'key', :b, :model, :unit, GREATEST(0, :d))
-                     ON DUPLICATE KEY UPDATE count = GREATEST(0, CAST(count AS SIGNED) + :d)",
-                    params! {
-                        "w" => window_start, "b" => bucket_id, "model" => &m.model,
-                        "unit" => unit, "d" => d,
-                    },
-                )
-                .map_err(store_err)?;
-            }
-        }
+        Self::add_usage_on(&mut tx, bucket_id, window_start, delta)?;
         tx.commit().map_err(store_err)
     }
 
     fn add_metering(&self, delta: &MeteringDelta) -> RecordStoreResult<()> {
-        let bucket = format!("{:010}", delta.bucket); // matches the CHAR(10) 'YYYY-MM-DD'-shaped bucket
         let mut conn = self.conn()?;
-        // ONE transaction for the cell and its open units, so a reader never sees a cell's token
-        // counts advanced without the units the same response accrued (or the reverse).
         let mut tx = conn
             .start_transaction(TxOpts::default())
             .map_err(store_err)?;
-        // `priced_from_ms` is part of the KEY (DECISION #79): a rate-card edit inside the UTC day
-        // opens a SECOND cell for that day, so each half keeps the card it was earned under rather
-        // than one card repricing the whole day.
-        tx.exec_drop(
-            "INSERT INTO usage_metering
-                (bucket, key_id, provider, model, key_group_at_use, pricing_version, priced_from_ms,
-                 requests, billable_requests, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write)
-             VALUES (:bucket, :key, :provider, :model, :grp, :pv, :pfm, :req, :breq, :ti, :to_, :cr, :cw)
-             ON DUPLICATE KEY UPDATE
-                requests = requests + VALUES(requests),
-                billable_requests = billable_requests + VALUES(billable_requests),
-                tokens_input = tokens_input + VALUES(tokens_input),
-                tokens_output = tokens_output + VALUES(tokens_output),
-                tokens_cache_read = tokens_cache_read + VALUES(tokens_cache_read),
-                tokens_cache_write = tokens_cache_write + VALUES(tokens_cache_write)",
-            params! {
-                "bucket" => &bucket, "key" => &delta.key_id, "provider" => &delta.provider,
-                "model" => &delta.model, "grp" => &delta.key_group_at_use, "pv" => &delta.pricing_version,
-                "pfm" => delta.priced_from_ms,
-                "req" => delta.requests, "breq" => delta.billable_requests,
-                "ti" => delta.tokens_input, "to_" => delta.tokens_output,
-                "cr" => delta.tokens_cache_read, "cw" => delta.tokens_cache_write,
-            },
-        )
-        .map_err(store_err)?;
-        // Every ledgered class the token columns do not hold, additive like them (BTreeMap order,
-        // so concurrent writers take the unit rows in one order).
-        for (unit, n) in &delta.usage_units {
-            tx.exec_drop(
-                "INSERT INTO usage_metering_units
-                    (bucket, key_id, provider, model, priced_from_ms, unit, count)
-                 VALUES (:bucket, :key, :provider, :model, :pfm, :unit, :n)
-                 ON DUPLICATE KEY UPDATE count = count + VALUES(count)",
-                params! {
-                    "bucket" => &bucket, "key" => &delta.key_id, "provider" => &delta.provider,
-                    "model" => &delta.model, "pfm" => delta.priced_from_ms, "unit" => unit, "n" => *n,
-                },
-            )
-            .map_err(store_err)?;
-        }
+        Self::add_metering_on(&mut tx, delta)?;
         tx.commit().map_err(store_err)
     }
 
@@ -2058,85 +2305,7 @@ impl RecordStore for MysqlStore {
     }
 
     fn append_audit(&self, entry: &AuditRecord) -> RecordStoreResult<()> {
-        // `ON DUPLICATE KEY UPDATE seq = seq` kept the stored record and said nothing, which is
-        // right for ONE of the two ways a seq collides and wrong for the other. Compare them and
-        // let the difference decide (see the trait contract):
-        //   identical -> the write-through retrying after a lost commit ACK. Common, benign, Ok.
-        //   different -> two records claiming one chain position: a forked or tampered log, and the
-        //                single most important thing an audit store can report.
-        //
-        // INSERT FIRST, and deliberately with NO preceding `SELECT ... FOR UPDATE`.
-        //
-        // The obvious shape — take a row lock, look, then insert — DEADLOCKS here, and measurably:
-        // `SELECT ... FOR UPDATE` on a MISSING row takes a next-key/gap lock under REPEATABLE READ
-        // (which is what `TxOpts::default()` leaves the server on). Two appends of DIFFERENT, both
-        // new seqs land in the same gap; the gap locks are mutually compatible, but each side's
-        // following INSERT needs an insert-intention lock that conflicts with the other's gap lock.
-        // Four threads appending 200 distinct seqs each produced 39 deadlocks that way against 0
-        // for the plain autocommit insert. `append_audit` is also the one control-plane path that
-        // does not call `bump_revision`, so it sits OUTSIDE the `store_sequence` serialization that
-        // makes every other admin-plane transaction deadlock-free — it has no other protection.
-        //
-        // A bare INSERT takes only an insert-intention lock and no gap lock, so the ordinary path
-        // keeps the baseline's concurrency exactly, and the read only happens on the rare collision.
-        //
-        // The loop covers the row being deleted between the insert and the read-back: the seq is
-        // free again, so inserting is the right move. Bounded, and exhausting the bound is an error
-        // rather than a success, so no path here returns Ok without the record being stored.
-        const MAX_ATTEMPTS: u32 = 3;
-        let mut conn = self.conn()?;
-        for _ in 0..MAX_ATTEMPTS {
-            conn.exec_drop(
-                "INSERT INTO audit_log (seq, ts, action, resource, outcome, principal, prev_hash, hash) \
-                 VALUES (:seq, :ts, :action, :resource, :outcome, :principal, :prev, :hash) \
-                 ON DUPLICATE KEY UPDATE seq = seq",
-                params! {
-                    "seq" => entry.seq, "ts" => entry.ts, "action" => &entry.action,
-                    "resource" => &entry.resource, "outcome" => &entry.outcome,
-                    "principal" => &entry.principal, "prev" => &entry.prev_hash, "hash" => &entry.hash,
-                },
-            )
-            .map_err(store_err)?;
-            // 1 = inserted. 0 = the seq was already occupied and `seq = seq` changed nothing.
-            if conn.affected_rows() == 1 {
-                return Ok(());
-            }
-            let existing: Option<AuditRowTuple> = conn
-                .exec_first(
-                    "SELECT seq, ts, action, resource, outcome, principal, prev_hash, hash \
-                     FROM audit_log WHERE seq = :seq",
-                    params! { "seq" => entry.seq },
-                )
-                .map_err(store_err)?;
-            let Some((seq, ts, action, resource, outcome, principal, prev_hash, hash)) = existing
-            else {
-                continue; // gone between the insert and the read: the seq is free, try again
-            };
-            let stored = AuditRecord {
-                seq,
-                ts,
-                action,
-                resource,
-                outcome,
-                principal,
-                prev_hash,
-                hash,
-            };
-            if stored == *entry {
-                return Ok(());
-            }
-            return Err(store_err(format!(
-                "append_audit: seq {} already holds a DIFFERENT record; the audit chain has forked \
-                 (stored action '{}', incoming '{}')",
-                entry.seq, stored.action, entry.action
-            )));
-        }
-        Err(store_err(format!(
-            "append_audit: seq {} kept being freed between the insert and the read-back after \
-             {MAX_ATTEMPTS} attempts; something is deleting audit rows concurrently and the record \
-             was NOT stored",
-            entry.seq
-        )))
+        Self::append_audit_on(&mut self.conn()?, entry)
     }
 
     fn list_audit(&self) -> RecordStoreResult<Vec<AuditRecord>> {
@@ -2259,69 +2428,7 @@ impl RecordStore for MysqlStore {
     }
 
     fn append_plane_record(&self, record: PlaneRecordRef<'_>) -> RecordStoreResult<()> {
-        // This store binds owned rows: the one copy of the borrowed view happens here.
-        let record = &record.to_record();
-        // APPEND-ONLY at a chain position `(parent, seq)`. A record arriving on a position that
-        // already holds one is settled by comparing the two, exactly as `append_audit` settles a
-        // duplicate `seq`:
-        //   identical -> the write-through retrying after a lost ACK. Common, benign, Ok.
-        //   different -> two records claiming one chain position: a forked or tampered chain, and
-        //                an error. Overwriting would destroy exactly the case worth reporting; this
-        //                store never restates a digest it was handed.
-        //
-        // INSERT FIRST, with no preceding `SELECT ... FOR UPDATE`, for the reason `append_audit`
-        // gives: a locking read of a MISSING row takes a gap lock under REPEATABLE READ, and two
-        // appends into the same gap then deadlock on each other's insert-intention lock. `kind =
-        // kind` makes the duplicate a no-op whose affected-row count is 0; NOT `INSERT IGNORE`,
-        // which would also downgrade every OTHER error -- a body or id too long for its column -- to a
-        // warning and a silently truncated row.
-        //
-        // The loop covers the row being purged between the insert and the read-back: the position
-        // is free again, so inserting is right. Bounded, and exhausting it is an error.
-        const MAX_ATTEMPTS: u32 = 3;
-        let ident = plane_ident(record);
-        let mut conn = self.conn()?;
-        for _ in 0..MAX_ATTEMPTS {
-            conn.exec_drop(
-                "INSERT INTO plane_records (kind, ident, seq, id, parent, ts, terminal, body) \
-                 VALUES (:kind, :ident, :seq, :id, :parent, :ts, :terminal, :body) \
-                 ON DUPLICATE KEY UPDATE kind = kind",
-                plane_params(record),
-            )
-            .map_err(store_err)?;
-            if conn.affected_rows() == 1 {
-                return Ok(());
-            }
-            let existing: Option<PlaneRowTuple> = conn
-                .exec_first(
-                    "SELECT id, parent, ts, terminal, body FROM plane_records \
-                     WHERE kind = :kind AND ident = :ident AND seq = :seq",
-                    params! { "kind" => &record.kind, "ident" => ident, "seq" => record.seq },
-                )
-                .map_err(store_err)?;
-            let Some((id, parent, ts, terminal, body)) = existing else {
-                continue; // purged between the insert and the read: the position is free, retry
-            };
-            if id == record.id
-                && parent == record.parent
-                && ts == record.ts
-                && terminal == is_terminal(record.disposition)
-                && body == record.body
-            {
-                return Ok(());
-            }
-            // Names the position and nothing else -- it must not echo stored (or caller) content.
-            return Err(store_err(format!(
-                "append_plane_record: kind '{}' seq {} already holds a different record for this \
-                 parent; the chain has forked",
-                record.kind, record.seq
-            )));
-        }
-        Err(store_err(format!(
-            "append_plane_record: kind '{}' seq {} kept being freed between the insert and the \
-             read-back after {MAX_ATTEMPTS} attempts; the record was NOT stored",
-            record.kind, record.seq
-        )))
+        Self::append_plane_record_on(&mut self.conn()?, record)
     }
 
     fn list_plane_records(
@@ -2555,49 +2662,47 @@ fn crate_now() -> u64 {
 
 // ── THE DOOR (DECISIONS #2 rule (1): compiled in or dropped in, one contract, one loading path) ──
 //
-// The store's one door registration lives HERE, in the logic crate: a busbar build that links this
-// crate registers `linked::STORE` (its `BUSBAR_COLD_ENTRY`), and the sibling
-// `busbar-store-mysql-plugin` cdylib only re-exports this crate, so the frozen symbols the loader
-// looks up in the library answer through this same registration. One source, both doors.
+// The store's door lives HERE, in the logic crate (`slots`: `store_door!` over this store's
+// `StoreSlots`): a busbar build that links this crate registers `door` as its compiled-in row
+// (`LinkedRow::of(door)`), and the sibling `busbar-store-mysql-plugin` cdylib exports the same
+// `door` as the image's one symbol (`export_door!`). One source, both doors.
 
-/// The store's package name — the name its signed tarball states and a linked row registers.
+/// The store's package name: the name its Statement states and its signed tarball carries.
 pub const NAME: &str = "busbar-store-mysql";
 
-/// The alias `store.module` selects it by.
-pub const ALIAS: &str = "mysql";
-
-/// Construct a MySQL/MariaDB store from the JSON config the engine passes through `open`:
-///
-/// ```json
-/// { "url": "mysql://user:pass@host:3306/busbar" }
-/// ```
-pub fn open(cfg: &str) -> Result<Box<dyn RecordStore>, String> {
-    let v: serde_json::Value = if cfg.trim().is_empty() {
-        serde_json::Value::Object(Default::default())
-    } else {
-        serde_json::from_str(cfg).map_err(|e| format!("invalid mysql plugin config: {e}"))?
-    };
-    let url = v
-        .get("url")
-        .and_then(|x| x.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            "mysql plugin config requires a \"url\" (a mysql:// connection string)".to_string()
-        })?;
-    let store = MysqlStore::connect(url).map_err(|e| e.0)?;
-    Ok(Box::new(store))
+impl MysqlStore {
+    /// Construct a MySQL/MariaDB store from the settings JSON the host hands `open`:
+    ///
+    /// ```json
+    /// { "url": "mysql://user:pass@host:3306/busbar" }
+    /// ```
+    ///
+    /// # Errors
+    /// A text naming why the settings do not open a store.
+    pub fn from_settings(settings: &[u8]) -> Result<Self, String> {
+        let v: serde_json::Value = if settings.iter().all(u8::is_ascii_whitespace) {
+            serde_json::Value::Object(Default::default())
+        } else {
+            serde_json::from_slice(settings)
+                .map_err(|e| format!("invalid mysql plugin config: {e}"))?
+        };
+        let url = v
+            .get("url")
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                "mysql plugin config requires a \"url\" (a mysql:// connection string)".to_string()
+            })?;
+        MysqlStore::connect(url).map_err(|e| e.0)
+    }
 }
 
-busbar_contract::abi::sdk::export_store_plugin!(open);
+mod slots;
 
-/// THE LINKED ENTRY: what a build that links this store registers onto the cold-kind axis — the same
-/// row the dropped-in tarball states, over the boundary the one cold load runs.
-pub mod linked {
-    /// `(name, alias, boundary)`.
-    pub const STORE: (&str, &str, &busbar_contract::abi::sdk::ColdEntry) =
-        (super::NAME, super::ALIAS, &super::BUSBAR_COLD_ENTRY);
-}
+/// THE STORE DOOR (store v3, `busbar_contract::abi::store`): every slot of the store v3 table over
+/// [`MysqlStore`], through the contract's store SDK.
+pub use slots::door;
 
 #[cfg(test)]
 mod tests;

@@ -9,9 +9,9 @@ description = "The MySQL/MariaDB backend for busbar's durable governance store â
 license = "Apache-2.0"
 
 [lib]
-# rlib: THE LOGIC, and the store's one door registration (`export_store_plugin!(open)`, its
-# `linked::STORE` row and `BUSBAR_COLD_ENTRY`). The sibling `busbar-store-mysql-plugin` cdylib
-# re-exports it as the dropped-in door. One source, both doors (DECISIONS #2 rule (1)).
+# rlib: THE LOGIC, and the store's door (`store_door!` over its `StoreSlots`: `door`, the row a
+# busbar build that links this crate registers). The sibling `busbar-store-mysql-plugin` cdylib
+# exports the same `door` as the dropped-in door. One source, both doors (DECISIONS #2 rule (1)).
 crate-type = ["rlib"]
 
 [dependencies]

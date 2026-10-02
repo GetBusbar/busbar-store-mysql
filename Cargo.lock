@@ -184,6 +184,7 @@ dependencies = [
  "mysql",
  "reqwest",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

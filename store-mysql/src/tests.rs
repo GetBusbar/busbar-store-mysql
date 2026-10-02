@@ -3372,6 +3372,10 @@ fn metering_cells_split_on_priced_from_ms_and_carry_open_units() {
     );
 }
 
+// ── The store v3 slots (the door's additions to the 1.5.5 op set) ─────────────────────────────
+
+mod slots_tests;
+
 // ── Upgrading an existing database IN PLACE ─────────────────────────────────────────────────────
 
 mod schema_fixtures;
