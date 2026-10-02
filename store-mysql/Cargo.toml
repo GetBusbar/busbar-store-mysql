@@ -17,10 +17,10 @@ crate-type = ["rlib"]
 [dependencies]
 # The ONE busbar crate a plugin names (#40: contract only; DECISIONS #84 merged the plugin SDK into it
 # as `busbar_contract::abi::sdk`). Pinned by git rev to the busbar commit in `.busbar-ref`.
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "934a016e20fc1a67c209b671d137c8cc28092767" }
-mysql = { version = "26", default-features = false, features = ["minimal"] }
-serde_json = "1"
-ulid = "1"
+busbar-contract = { workspace = true }
+mysql = { workspace = true }
+serde_json = { workspace = true }
+ulid = { workspace = true }
 
 [dev-dependencies]
 # The `Store` contract conformance suite used to arrive here as `busbar-plugin-testkit`; the owner
@@ -28,4 +28,4 @@ ulid = "1"
 # this crate owns its copy at `src/tests/store_conformance.rs`. Its plane-record battery serializes
 # throwaway stand-in rows into the opaque bodies it writes, which is the one thing it needs beyond
 # `busbar-contract` (a normal dependency above) and `serde_json`.
-serde = { version = "1", features = ["derive"] }
+serde = { workspace = true }

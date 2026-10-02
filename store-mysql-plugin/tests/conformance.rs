@@ -14,7 +14,7 @@
 //! (window caps, a whole-cell reserve, its replay, a release, the journal, sessions and records).
 //! The two transcripts must agree line for line.
 //!
-//! THE RED ARMS, same test: the library asked for as another kind is refused before `dlopen`; a
+//! THE RED ARMS, each its own test: the library asked for as another kind is refused before `dlopen`; a
 //! manifest rendering that is not the library's own Statement is refused; and the comparison is
 //! not vacuous (the live scenario reads back what it wrote).
 //!
@@ -357,8 +357,8 @@ fn same(linked: &[String], dropped: &[String]) {
     );
 }
 
-/// The MySQL store behaves as ONE store through either door — and the library asked for as another
-/// kind, or under a Statement that is not its own, is refused (the RED arms).
+/// The MySQL store behaves as ONE store through either door (the RED arms below: the library asked
+/// for as another kind, or under a Statement that is not its own, is refused).
 #[test]
 fn the_linked_and_the_dropped_in_mysql_store_are_one_store() {
     let url = mysql_url();
@@ -415,8 +415,14 @@ fn the_linked_and_the_dropped_in_mysql_store_are_one_store() {
         linked[4].starts_with("open") && linked[4].contains("Err("),
         "{linked:#?}"
     );
+}
 
-    // RED ARM 1: the library asked for as another kind is refused before it is opened.
+/// RED ARM 1: the library asked for as another kind is refused before it is opened. No database
+/// needed.
+#[test]
+fn a_store_library_loaded_as_another_kind_is_refused() {
+    let lib = cdylib();
+    let stated = packed_rendering(&lib);
     let d = dispatcher();
     let e = match load_dropped::<Secret>(&lib, &stated, bind(&d)) {
         Ok(_) => panic!("a store library loaded as secret"),
@@ -426,8 +432,13 @@ fn the_linked_and_the_dropped_in_mysql_store_are_one_store() {
         e.contains("the manifest states kind Store, not Secret"),
         "{e}"
     );
+}
 
-    // RED ARM 2: a manifest whose Statement is not the library's own is refused.
+/// RED ARM 2: a manifest whose Statement is not the library's own is refused. No database needed.
+#[test]
+fn a_statement_that_is_not_the_librarys_own_is_refused() {
+    let lib = cdylib();
+    let stated = packed_rendering(&lib);
     let mut other = stated.clone();
     other.push(0);
     let d = dispatcher();
