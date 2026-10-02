@@ -152,13 +152,23 @@ fn clear(url: &str) {
     }
 }
 
-/// A fresh op id (the dedupe is durable: an op id from an earlier run would replay).
-fn op(counter: u64) -> OpId {
-    let node = std::time::SystemTime::now()
+/// A node id no earlier run or instance used, for `LoadedStore::open`: its bridge mints each op id
+/// as `(node, counter from 0)`, and this store's dedupe is DURABLE, so two instances sharing a node
+/// would replay each other's op ids (the kernel draws the node from the OS CSPRNG per process).
+fn node() -> u64 {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let t = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos() as u64;
-    OpId::from_parts(node | 1, counter * 2 + 1)
+    (t ^ (u64::from(std::process::id()) << 32))
+        .wrapping_add(N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) << 48)
+        | 1
+}
+
+/// A fresh op id (the dedupe is durable: an op id from an earlier run would replay).
+fn op(counter: u64) -> OpId {
+    OpId::from_parts(node(), counter * 2 + 1)
 }
 
 /// What one door does with `url`, as one comparable transcript. `load` loads the door afresh: a
@@ -173,7 +183,7 @@ fn transcript(load: impl Fn() -> Loaded, url: Option<&str>) -> Vec<String> {
         r#"{"url": "mysql://nobody:none@127.0.0.1:9/nowhere"}"#,
     ] {
         let (plugin, dispatcher) = load();
-        let answer = LoadedStore::open(plugin, dispatcher, cfg.as_bytes(), 1).map(|_| ());
+        let answer = LoadedStore::open(plugin, dispatcher, cfg.as_bytes(), node()).map(|_| ());
         t.push(format!("open {cfg:?} = {answer:?}"));
     }
     let Some(url) = url else {
@@ -182,7 +192,8 @@ fn transcript(load: impl Fn() -> Loaded, url: Option<&str>) -> Vec<String> {
     let (plugin, dispatcher) = load();
     clear(url);
     let settings = serde_json::json!({ "url": url }).to_string();
-    let s = LoadedStore::open(plugin, dispatcher, settings.as_bytes(), 1).expect("the store opens");
+    let s = LoadedStore::open(plugin, dispatcher, settings.as_bytes(), node())
+        .expect("the store opens");
     t.push(format!("facts = {:?}", s.facts()));
 
     // The 1.5.5 op set.

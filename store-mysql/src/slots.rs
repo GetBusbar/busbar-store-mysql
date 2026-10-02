@@ -180,7 +180,7 @@ impl MysqlStore {
                     )
                     .map_err(backend::<E, _>)?;
                     tx.commit().map_err(backend::<E, _>)?;
-                    if op.counter() % OPS_SWEEP_EVERY == 0 {
+                    if op.counter().is_multiple_of(OPS_SWEEP_EVERY) {
                         // Best effort: a sweep that fails is retried by the next one.
                         let _ = conn.exec_drop(
                             "DELETE FROM store_ops WHERE recorded_at < :cut LIMIT 1000",

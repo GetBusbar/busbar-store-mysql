@@ -38,6 +38,20 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
+/// A node id no earlier run or instance used, for `LoadedStore::open`: its bridge mints each op id
+/// as `(node, counter from 0)`, and this store's dedupe is DURABLE, so two instances sharing a node
+/// would replay each other's op ids (the kernel draws the node from the OS CSPRNG per process).
+fn node() -> u64 {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    (t ^ (u64::from(std::process::id()) << 32))
+        .wrapping_add(N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) << 48)
+        | 1
+}
+
 /// Load the store library at `path` through the DROPPED-IN DOOR and open it on `cfg`, the way the
 /// host opens a store: its Statement rendered as `busbar-plugin-pack` signs it into the manifest,
 /// `load_dropped` (dlopen, `busbar_plugin_door`, the Statement compared byte for byte), then
@@ -55,7 +69,7 @@ fn load(path: &Path, cfg: &str) -> Result<Box<dyn RecordStore>, String> {
         conns: None,
     };
     let plugin = load_dropped::<Store>(path, &stated, bind).map_err(|e| e.to_string())?;
-    let store = LoadedStore::open(plugin, dispatcher, cfg.as_bytes(), 1)?;
+    let store = LoadedStore::open(plugin, dispatcher, cfg.as_bytes(), node())?;
     Ok(Box::new(store))
 }
 
