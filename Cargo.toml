@@ -10,8 +10,8 @@
 # `.busbar-ref`; no sibling-checkout path dependency ships in any manifest.
 #
 # THIRD-PARTY VERSIONS ARE THE FLEET'S, NOT THIS REPO'S. The table below is busbar's own root
-# `[workspace.dependencies]` (third-party rows) at busbar 934a016e20fc1a67c209b671d137c8cc28092767, followed by the plugin-only rows
-# of busbar's `.github/fleet/deps.toml` at dd9637da0c849b811238e108cbafabcb4c7c22a2. A member takes a crate with
+# `[workspace.dependencies]` (third-party rows) at busbar 8fc3b1b2a6d123575a77ce505e501b595fb24cef, followed by the plugin-only rows
+# of busbar's `.github/fleet/deps.toml` at 8fc3b1b2a6d123575a77ce505e501b595fb24cef. A member takes a crate with
 # `{ workspace = true }` (adding features if it needs them); a crate in neither table is a new
 # `deps.toml` row in busbar first. CI holds this repo's Cargo.lock to busbar's lock at the pin.
 [workspace]
@@ -29,15 +29,15 @@ publish = false
 repository = "https://github.com/GetBusbar/busbar-store-mysql"
 
 [workspace.dependencies]
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "934a016e20fc1a67c209b671d137c8cc28092767" }
-busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "934a016e20fc1a67c209b671d137c8cc28092767" }
-# busbar's root [workspace.dependencies], third-party rows, at 934a016e20fc1a67c209b671d137c8cc28092767
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "8fc3b1b2a6d123575a77ce505e501b595fb24cef" }
+busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "8fc3b1b2a6d123575a77ce505e501b595fb24cef" }
+# busbar's root [workspace.dependencies], third-party rows, at 8fc3b1b2a6d123575a77ce505e501b595fb24cef
 a2a-lf = "0.3.0"
 a2a-pb = "0.2.0"
 arc-swap = "1"
 async-trait = "0.1"
 axum = "0.8"
-base64 = "0.23"
+base64 = "0.22"
 bumpalo = "3"
 bytes = "1"
 core_affinity = "0.8"
@@ -59,7 +59,7 @@ hyper = { version = "1", default-features = false, features = ["server", "client
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "webpki-tokio"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "http2", "server-auto", "server-graceful", "service", "tokio"] }
 indexmap = { version = "2", features = ["serde"] }
-jsonschema = "0.49"
+jsonschema = { version = "0.49", default-features = false }
 libc = "0.2"
 libloading = "0.9"
 log = "0.4"
@@ -73,7 +73,7 @@ opentelemetry-proto = { version = "0.32", default-features = false, features = [
 proc-macro2 = { version = "1", features = ["span-locations"] }
 proptest = "1"
 prost = { version = "0.14", default-features = false, features = ["std"] }
-rcgen = "0.14"
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 ring = "0.17"
 rmcp = { version = "3.1.2", default-features = false }
@@ -89,7 +89,7 @@ smallvec = "1"
 socket2 = { version = "0.6", features = ["all"] }
 sonic-rs = "0.5"
 syn = { version = "2", features = ["full", "visit", "parsing", "printing"] }
-tar = "0.4"
+tar = { version = "0.4", default-features = false }
 tikv-jemalloc-ctl = "0.6"
 tikv-jemallocator = "0.6"
 tokio = "1"
@@ -108,7 +108,7 @@ url = "2"
 webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["std", "ring"] }
 webpki-roots = "1"
 zeroize = "1"
-# busbar .github/fleet/deps.toml [plugin-deps], at dd9637da0c849b811238e108cbafabcb4c7c22a2
+# busbar .github/fleet/deps.toml [plugin-deps], at 8fc3b1b2a6d123575a77ce505e501b595fb24cef
 ldap3 = { version = "0.12", default-features = false, features = ["sync"] }
 mysql = { version = "26", default-features = false, features = ["minimal"] }
 postgres = "0.19"

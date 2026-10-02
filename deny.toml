@@ -1,5 +1,5 @@
 # RENDERED by `busbar-release plugin sync` from GetBusbar/busbar-release template/ and busbar's
-# `.github/fleet/deps.toml` at dd9637da0c849b811238e108cbafabcb4c7c22a2; a hand edit is overwritten by the next sync. CI runs
+# `.github/fleet/deps.toml` at 8fc3b1b2a6d123575a77ce505e501b595fb24cef; a hand edit is overwritten by the next sync. CI runs
 # `cargo deny check` on it (busbar's plugin-ci.yml at the pin). The license allowlist is busbar's own;
 # the one reviewed git source is busbar itself, at the pin.
 [graph]
@@ -136,8 +136,8 @@ deny = [
     { crate = "prost:>=0.15.0", reason = "busbar resolves prost to 0.14.3; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "rcgen:<0.14.0", reason = "busbar resolves rcgen to 0.14.10; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "rcgen:>=0.15.0", reason = "busbar resolves rcgen to 0.14.10; a plugin may not pull a second version (OWNER 2026-10-02)" },
-    { crate = "reqwest:<0.12.0", reason = "busbar resolves reqwest to 0.12.28, 0.13.4; a plugin may not pull a second version (OWNER 2026-10-02)" },
-    { crate = "reqwest:>=0.14.0", reason = "busbar resolves reqwest to 0.12.28, 0.13.4; a plugin may not pull a second version (OWNER 2026-10-02)" },
+    { crate = "reqwest:<0.12.0", reason = "busbar resolves reqwest to 0.12.28; a plugin may not pull a second version (OWNER 2026-10-02)" },
+    { crate = "reqwest:>=0.13.0", reason = "busbar resolves reqwest to 0.12.28; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "ring:<0.17.0", reason = "busbar resolves ring to 0.17.14; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "ring:>=0.18.0", reason = "busbar resolves ring to 0.17.14; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "rmcp:<3.0.0", reason = "busbar resolves rmcp to 3.1.2; a plugin may not pull a second version (OWNER 2026-10-02)" },
@@ -241,8 +241,6 @@ skip = [
     { crate = "rand_core@0.10.1", reason = "busbar's own lock holds this duplicate" },
     { crate = "rand_core@0.6.4", reason = "busbar's own lock holds this duplicate" },
     { crate = "rand_core@0.9.5", reason = "busbar's own lock holds this duplicate" },
-    { crate = "reqwest@0.12.28", reason = "busbar's own lock holds this duplicate" },
-    { crate = "reqwest@0.13.4", reason = "busbar's own lock holds this duplicate" },
     { crate = "sha2@0.10.9", reason = "busbar's own lock holds this duplicate" },
     { crate = "sha2@0.11.0", reason = "busbar's own lock holds this duplicate" },
     { crate = "syn@2.0.117", reason = "busbar's own lock holds this duplicate" },

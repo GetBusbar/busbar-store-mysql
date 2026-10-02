@@ -37,4 +37,4 @@ mysql = { workspace = true }
 # OUT-OF-PROCESS busbar, fully synchronous (no tokio runtime — matches store-postgres-plugin's own
 # admin_api_e2e.rs rationale for `reqwest::blocking`).
 reqwest = { workspace = true, features = ["blocking", "json"] }
-base64 = "0.22"
+base64 = { workspace = true }
