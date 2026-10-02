@@ -524,8 +524,10 @@ fn a_request_split_across_two_flushes_keeps_its_count_across_a_reconnect() {
             usage_units: units(&[(UNIT_INPUT, 11), (UNIT_OUTPUT, 7)]),
         }],
     };
-    s.add_usage("vk_split_flush", 1_000_103, &admission).unwrap();
-    s.add_usage("vk_split_flush", 1_000_103, &completion).unwrap();
+    s.add_usage("vk_split_flush", 1_000_103, &admission)
+        .unwrap();
+    s.add_usage("vk_split_flush", 1_000_103, &completion)
+        .unwrap();
     drop(s);
     let reopened = MysqlStore::connect(&test_url().unwrap()).expect("reconnect");
     let back = reopened.get_usage("vk_split_flush", 1_000_103).unwrap();
