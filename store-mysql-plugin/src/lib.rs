@@ -9,7 +9,7 @@
 //!
 //! All the store lives in the `busbar-store-mysql` crate, including its door
 //! (`busbar_store_mysql::door`, `store_door!`). This crate re-exports the logic crate and exports
-//! that door as the image's ONE symbol, `busbar_plugin_door` (`export_door!`, unconditionally),
+//! that door as the image's ONE symbol, `busbar_plugin_door` (`export_door!`, behind the `dropped-in` feature),
 //! so the library carries exactly the code a busbar build that links the store runs
 //! — one source, both doors (DECISIONS #2 rule (1)).
 //!
@@ -20,7 +20,9 @@
 
 pub use busbar_store_mysql::*;
 
-/// The exported door: the macro's `#[no_mangle]` symbol is the one exemption.
+/// The exported door, behind `dropped-in` (the cdylib build only): the macro's `#[no_mangle]` symbol is
+/// the one exemption.
+#[cfg(feature = "dropped-in")]
 #[allow(unsafe_code)]
 mod exported {
     busbar_contract::export_door!(busbar_store_mysql::door);
