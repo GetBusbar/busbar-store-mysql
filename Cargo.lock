@@ -181,6 +181,7 @@ dependencies = [
  "busbar-contract",
  "busbar-plugin-loader",
  "busbar-store-mysql",
+ "busbar-store-mysql-plugin",
  "mysql",
  "reqwest",
  "serde_json",
