@@ -1,12 +1,13 @@
-# RENDERED by `cargo xtask fleet render busbar-store-mysql` from GetBusbar/busbar's plugins.yaml and
-# .github/fleet/ templates; `cargo xtask fleet check` is red on any edit here. On a v* tag: this
-# repo's CI on the tagged commit, then busbar's plugin-release.yml (build, sign, pack, publish), then
-# the consumer verification of what was published, each at the busbar commit this repo pins.
+# RENDERED by `busbar-release plugin sync busbar-store-mysql` from GetBusbar/busbar-release template/; a hand
+# edit is overwritten by the next sync. On a v* tag: this repo's own ci.yml (the fleet harness) on the
+# tagged commit, then busbar's plugin-release.yml (build, sign, pack, publish), then the consumer
+# verification of what was published, each at the busbar commit this repo pins.
 name: release
 
 on:
   push:
-    tags: ["v*", "!v*-*"]
+    # `vX.Y.Z-dev.N` is a signed PRE-RELEASE from dev (never main/qa); other suffixed tags start nothing.
+    tags: ["v*", "!v*-*", "v*-dev.*"]
   # A tag pushed with GITHUB_TOKEN starts no workflow, so a workflow that tags dispatches this on
   # the tag ref (`gh workflow run release.yml --ref <tag>`).
   workflow_dispatch: {}
@@ -20,12 +21,7 @@ permissions:
 
 jobs:
   ci:
-    uses: GetBusbar/busbar/.github/workflows/plugin-ci.yml@0db7ee2ea048217ea3fc10f0d92fbda19ee1f133
-    with:
-      service: mysql
-      busbar_checkout: true
-      macos_test: "env -u CI cargo test --locked -p busbar-store-mysql-plugin --test conformance"
-      extra_test: ""
+    uses: ./.github/workflows/ci.yml
     secrets: inherit
   release:
     needs: ci

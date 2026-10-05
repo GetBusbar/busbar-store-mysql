@@ -1,6 +1,8 @@
-# RENDERED by `cargo xtask fleet render busbar-store-mysql` from GetBusbar/busbar's plugins.yaml and
-# .github/fleet/ templates; `cargo xtask fleet check` is red on any edit here. The CI itself is
-# busbar's plugin-ci.yml, taken at the busbar commit this repo pins (.busbar-ref).
+# RENDERED by `busbar-release plugin sync busbar-store-mysql` from GetBusbar/busbar-release template/; a hand
+# edit is overwritten by the next sync. THIS REPO TESTS ITSELF AGAINST BUSBAR with the fleet's ONE
+# harness: busbar's reusable plugin-ci.yml, taken at the busbar commit this repo pins (.busbar-ref), so
+# the CI logic, the gates (busbar scripts/fleet/plugin-gates.py), the dependency policy
+# (.github/fleet/deps.toml) and the contract move together (OWNER 2026-10-02). No CI logic lives here.
 name: ci
 
 on:
@@ -9,6 +11,8 @@ on:
   pull_request:
     branches: [dev, qa, main]
   workflow_dispatch: {}
+  # release.yml runs this file on the tagged commit before it publishes.
+  workflow_call: {}
 
 permissions:
   contents: read

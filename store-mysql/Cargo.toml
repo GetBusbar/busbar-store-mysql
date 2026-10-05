@@ -17,7 +17,7 @@ crate-type = ["rlib"]
 [dependencies]
 # The ONE busbar crate a plugin names (#40: contract only; DECISIONS #84 merged the plugin SDK into it
 # as `busbar_contract::abi::sdk`). Pinned by git rev to the busbar commit in `.busbar-ref`.
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "0db7ee2ea048217ea3fc10f0d92fbda19ee1f133" }
+busbar-contract = { workspace = true }
 # THE MYSQL CLIENT PROTOCOL WITHOUT A SOCKET (busbar THE DESIGN, the connections section: the store
 # reaches its server only over the host's connector, ARCHITECT rulings 2026-10-03 on Q-L14-1 /
 # Q-L16-2): `mysql_common` is the sans-IO core the 1.5.5 `mysql` driver is built on (packets, the
@@ -26,23 +26,23 @@ busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "0db7ee2e
 # driver's connection logic, every byte over the op's wire.
 mysql_common = { version = "0.35", default-features = false }
 # The compressed protocol's deflate (`compress=` in the URL), pure Rust (busbar's own flate2 row).
-flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-bytes = "1"
+flate2 = { workspace = true }
+bytes = { workspace = true }
 # The 1.5.5 driver's URL reading (`mysql://...`): pure parsing, no socket.
-url = "2"
+url = { workspace = true }
 percent-encoding = "2"
-serde_json = "1"
+serde_json = { workspace = true }
 [dev-dependencies]
 # The `Store` contract conformance suite used to arrive here as `busbar-plugin-testkit`; the owner
 # ruled that crate DELETED on 2026-09-22 and #2/#31 forbid a shared test util between plugins, so
 # this crate owns its copy at `src/tests/store_conformance.rs`. Its plane-record battery serializes
 # throwaway stand-in rows into the opaque bodies it writes, which is the one thing it needs beyond
 # `busbar-contract` (a normal dependency above) and `serde_json`.
-serde = { version = "1", features = ["derive"] }
-ulid = "1"
+serde = { workspace = true }
+ulid = { workspace = true }
 # The live tests open the store the way the host does: its door through the REAL loader on a
 # dispatcher (`load_linked`, `LoadedStore`), every connection over the loader's test connection table
 # (`TcpConns`, `test-support`). The 1.5.5 `mysql` driver verifies what landed INDEPENDENTLY of the
 # store (tests only; never in the shipped image).
-busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "0db7ee2ea048217ea3fc10f0d92fbda19ee1f133", features = ["test-support"] }
+busbar-plugin-loader = { workspace = true, features = ["test-support"] }
 mysql = { version = "28", default-features = false, features = ["minimal-rust"] }
