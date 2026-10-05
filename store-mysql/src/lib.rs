@@ -28,7 +28,7 @@
 //!   MySQL 8's native JSON type normalizes on write (reorders keys, strips whitespace); MariaDB
 //!   stores JSON as `LONGTEXT`, byte-identical. Canonicalize in the caller before hashing if ever
 //!   needed — this store never does.
-//! - Boot-time invariant probes (see [`MysqlStore::connect`]) hard-fail rather than warn: MySQL
+//! - Boot-time invariant probes (see [`MysqlStore::connect_step`]) hard-fail rather than warn: MySQL
 //!   < 8.0.16 and Aurora MySQL 2.x PARSE `CHECK` constraints but ENFORCE none — a schema that
 //!   *looks* validated can silently accept garbage. A live functional probe (attempt a CHECK
 //!   violation, confirm it's rejected) is the only way to catch this; a version-string check alone
@@ -36,17 +36,29 @@
 //! - The store v3 additions (`slots`: `op_id` dedupe, the journal, sessions, kernel records, the
 //!   money slots and window caps) live in their own tables (schema v8), each written in ONE
 //!   transaction with the `op_id` it is deduped on, so the dedupe is as durable as the effect.
+//! - CONNECTIONS: no socket of the store's own (busbar THE DESIGN, the connections section). The
+//!   door declares one outbound `tcp` need (`slots::NEEDS`, `operator-infrastructure`); every op
+//!   runs on a connection the host's connector dials, kept across ops in a set of at most
+//!   [`KEPT_CONNECTIONS`] (1.5.5's pool bound), speaking the MySQL client protocol through
+//!   [`mysqlwire`] (the 1.5.5 driver's protocol core, `mysql_common`). `open` parses the settings;
+//!   its connect step reaches the server, creates the schema and runs the probes, so an
+//!   unreachable or refusing server still fails the load at open, in the driver's words.
 
 #![forbid(unsafe_code)]
 
-use mysql::prelude::*;
-use mysql::{params, Opts, Pool, PooledConn, TxOpts};
+use std::sync::Arc;
+
+use busbar_contract::abi::sdk::store::wire::Pool;
+use mysql_common::params;
+
+pub(crate) mod mysqlwire;
+use mysqlwire::{Conn, Error, Opts, Params, Row, Transaction};
 
 use busbar_contract::records::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, ModelTokens,
-    ModelTokensDelta, PlaneDisposition, PlaneRecord, PlaneRecordRef, PlaneSelector, RecordStore,
-    RecordStoreError, RecordStoreResult, ScopeRef, SecretForm, UsageDelta, UsageLedger, VirtualKey,
-    UNIT_CACHE_READ, UNIT_CACHE_WRITE, UNIT_INPUT, UNIT_OUTPUT,
+    ModelTokensDelta, PlaneDisposition, PlaneRecord, PlaneSelector, RecordStoreError,
+    RecordStoreResult, ScopeRef, SecretForm, UsageDelta, UsageLedger, VirtualKey, UNIT_CACHE_READ,
+    UNIT_CACHE_WRITE, UNIT_INPUT, UNIT_OUTPUT,
 };
 use std::collections::BTreeMap;
 
@@ -400,49 +412,62 @@ const SCHEMA: &[&str] = &[
     ) ENGINE=InnoDB",
 ];
 
-/// MySQL/MariaDB-backed [`Store`]. A single mutex-guarded pooled connection is used for all control-
-/// plane (keys/credentials/denylist) work — low frequency, correctness over throughput; usage/audit
-/// writes go through the same pool without an explicit app-level mutex since the pool itself
-/// serializes checkouts safely.
+/// How many connections the store keeps (the 1.5.5 pool's bound, `PoolConstraints::new(1, 8)`):
+/// this store is control-plane-frequency (key/credential CRUD) plus write-behind usage flush, not a
+/// high-fan-out OLTP workload, and an unbounded set across many instances (a multi-process fleet
+/// booting simultaneously) is what exhausts MySQL's default `max_connections`.
+pub const KEPT_CONNECTIONS: usize = 8;
+
+/// ESTABLISHED on every connection the store ever opens -- including a reconnect after a dropped
+/// connection, or the set growing past the one connection `probe_invariants` checks at boot -- and
+/// again after each reset, rather than verifying it once and trusting every future connection
+/// inherits the same posture. Appends (never replaces) to whatever sql_mode the server/session
+/// already carries, so an operator's other modes survive. CHECK-constraint enforcement (the other
+/// boot-probe invariant) is a server-wide, not session-scoped, property -- it can't diverge per
+/// connection the way sql_mode can, so the one-time probe remains sufficient for that half.
+pub(crate) const INIT: &[&str] =
+    &["SET SESSION sql_mode = CONCAT(@@sql_mode, ',STRICT_ALL_TABLES')"];
+
+/// MySQL/MariaDB-backed store: the connection URL and the kept connections every op runs on (one
+/// connection per op at a time, as 1.5.5's pool checked one out per call).
 pub struct MysqlStore {
-    pool: Pool,
+    shared: Arc<Shared>,
+}
+
+/// What every op of one instance shares.
+pub(crate) struct Shared {
+    pub(crate) opts: Arc<Opts>,
+    pub(crate) pool: Arc<Pool>,
 }
 
 impl MysqlStore {
-    /// Connect, create the schema if absent, and run the boot-time invariant probes. Hard-fails
-    /// (returns `Err`, never silently degrades) if the server can't actually enforce what the schema
-    /// declares — see the module doc for why a version check alone is insufficient.
+    /// The store on `url`: the URL is parsed here (the driver's refusal texts); the server is
+    /// reached by `open`'s connect step ([`Self::connect_step`]).
     ///
-    /// The pool is capped small (8 connections) — this store is control-plane-frequency (key/
-    /// credential CRUD) plus write-behind usage flush, not a high-fan-out OLTP workload, and an
-    /// unbounded pool across many `MysqlStore::connect()` calls (e.g. one per test, or a multi-
-    /// process fleet booting simultaneously) is what exhausts MySQL's default `max_connections`.
-    pub fn connect(url: &str) -> RecordStoreResult<Self> {
+    /// # Errors
+    /// The URL does not parse.
+    pub fn new(url: &str) -> RecordStoreResult<Self> {
         let opts = Opts::from_url(url).map_err(store_err)?;
-        let opts = mysql::OptsBuilder::from_opts(opts)
-            .pool_opts(mysql::PoolOpts::default().with_constraints(
-                mysql::PoolConstraints::new(1, 8).expect("1 <= 8 is a valid pool constraint"),
-            ))
-            // ESTABLISH strict mode on every connection this pool ever creates -- including a
-            // reconnect after a dropped connection, or the pool growing past the one connection
-            // `probe_invariants` (below) checks at boot -- rather than verifying it once and
-            // trusting every future connection inherits the same posture. Appends (never replaces)
-            // to whatever sql_mode the server/session already carries, so an operator's other
-            // modes survive. CHECK-constraint enforcement (the other boot-probe invariant) is a
-            // server-wide, not session-scoped, property -- it can't diverge per connection the way
-            // sql_mode can, so the one-time probe below remains sufficient for that half.
-            .init(vec![
-                "SET SESSION sql_mode = CONCAT(@@sql_mode, ',STRICT_ALL_TABLES')",
-            ]);
-        let pool = Pool::new(opts).map_err(store_err)?;
+        Ok(Self {
+            shared: Arc::new(Shared {
+                opts: Arc::new(opts),
+                pool: Pool::new(KEPT_CONNECTIONS),
+            }),
+        })
+    }
 
-        Self::init_schema(&pool)?;
+    pub(crate) fn shared(&self) -> Arc<Shared> {
+        self.shared.clone()
+    }
 
-        let mut conn = pool.get_conn().map_err(store_err)?;
-        Self::probe_invariants(&mut conn)?;
-        drop(conn);
-
-        Ok(Self { pool })
+    /// `open`'s connect step: create the schema if absent, and run the boot-time invariant probes,
+    /// on the op's connection. Hard-fails (returns `Err`, never silently degrades) if the server
+    /// can't actually enforce what the schema declares — see the module doc for why a version check
+    /// alone is insufficient.
+    pub(crate) async fn connect_step(conn: &mut Conn) -> RecordStoreResult<()> {
+        Self::init_schema(conn).await?;
+        Self::probe_invariants(conn).await?;
+        Ok(())
     }
 
     /// Schema creation, retried on deadlock. Concurrent `CREATE TABLE`/`CREATE INDEX` from more than
@@ -452,10 +477,10 @@ impl MysqlStore {
     /// same schema (`ERROR 1213`). A bounded retry-with-backoff is the correct response (the losing
     /// transaction is safe to retry — DDL here is idempotent via the `IF NOT EXISTS`/duplicate-error
     /// swallowing below), not a crash.
-    fn init_schema(pool: &Pool) -> RecordStoreResult<()> {
+    async fn init_schema(conn: &mut Conn) -> RecordStoreResult<()> {
         const MAX_ATTEMPTS: u32 = 8;
         for attempt in 1..=MAX_ATTEMPTS {
-            match Self::try_init_schema(pool) {
+            match Self::try_init_schema(conn).await {
                 Ok(()) => return Ok(()),
                 Err(e) if attempt < MAX_ATTEMPTS && e.0.contains("Deadlock found") => {
                     // Linear backoff plus a per-process/per-thread jitter, so two booters that
@@ -530,8 +555,8 @@ impl MysqlStore {
     /// manual reconciliation query after a rolling upgrade completes — safe to do since the
     /// predicate is idempotent (a row already at `billable_requests > 0` never matches it again).
     /// See `characterize_v2_backfill_loses_a_row_to_a_racing_live_write` below for a reproduction.
-    fn run_v2_backfill_if_needed(
-        conn: &mut PooledConn,
+    pub(crate) async fn run_v2_backfill_if_needed(
+        conn: &mut Conn,
         prior_version: u32,
         table: &str,
     ) -> RecordStoreResult<()> {
@@ -546,6 +571,7 @@ impl MysqlStore {
                     "UPDATE {table} SET billable_requests = requests \
                      WHERE billable_requests = 0 AND requests > 0 LIMIT 5000"
                 ))
+                .await
                 .map_err(store_err)?;
                 if conn.affected_rows() < 5000 {
                     break;
@@ -566,8 +592,8 @@ impl MysqlStore {
     ///
     /// Same `table` parameter for test isolation as `run_v2_backfill_if_needed` -- see that
     /// function's doc comment for why (no `CREATE DATABASE` privilege in CI).
-    fn run_v3_ascii_bin_fix_if_needed(
-        conn: &mut PooledConn,
+    pub(crate) async fn run_v3_ascii_bin_fix_if_needed(
+        conn: &mut Conn,
         prior_version: u32,
         table: &str,
     ) -> RecordStoreResult<()> {
@@ -576,6 +602,7 @@ impl MysqlStore {
                 "ALTER TABLE {table} MODIFY COLUMN key_group_at_use \
                  VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT ''"
             ))
+            .await
             .map_err(store_err)?;
         }
         Ok(())
@@ -583,37 +610,40 @@ impl MysqlStore {
 
     /// Whether `table` exists in the connected database. `DATABASE()` scopes the lookup to this
     /// store's own schema, so a same-named table in a sibling database on the server never answers.
-    fn table_exists(conn: &mut PooledConn, table: &str) -> RecordStoreResult<bool> {
+    async fn table_exists(conn: &mut Conn, table: &str) -> RecordStoreResult<bool> {
         let n: Option<u64> = conn
             .exec_first(
                 "SELECT COUNT(*) FROM information_schema.tables \
                  WHERE table_schema = DATABASE() AND table_name = :t",
                 params! { "t" => table },
             )
+            .await
             .map_err(store_err)?;
         Ok(n.unwrap_or(0) > 0)
     }
 
     /// Whether index `index` exists on `table` in the connected database.
-    fn index_exists(conn: &mut PooledConn, table: &str, index: &str) -> RecordStoreResult<bool> {
+    async fn index_exists(conn: &mut Conn, table: &str, index: &str) -> RecordStoreResult<bool> {
         let n: Option<u64> = conn
             .exec_first(
                 "SELECT COUNT(*) FROM information_schema.statistics \
                  WHERE table_schema = DATABASE() AND table_name = :t AND index_name = :i",
                 params! { "t" => table, "i" => index },
             )
+            .await
             .map_err(store_err)?;
         Ok(n.unwrap_or(0) > 0)
     }
 
     /// Whether `table.column` exists in the connected database.
-    fn column_exists(conn: &mut PooledConn, table: &str, column: &str) -> RecordStoreResult<bool> {
+    async fn column_exists(conn: &mut Conn, table: &str, column: &str) -> RecordStoreResult<bool> {
         let n: Option<u64> = conn
             .exec_first(
                 "SELECT COUNT(*) FROM information_schema.columns \
                  WHERE table_schema = DATABASE() AND table_name = :t AND column_name = :c",
                 params! { "t" => table, "c" => column },
             )
+            .await
             .map_err(store_err)?;
         Ok(n.unwrap_or(0) > 0)
     }
@@ -622,20 +652,23 @@ impl MysqlStore {
     /// so the check is explicit; a node booting concurrently can still win the race between the
     /// check and the ALTER, and its `ER_DUP_FIELDNAME` (1060) is exactly "already there", so it is
     /// swallowed. Every other error propagates.
-    fn ensure_column(
-        conn: &mut PooledConn,
+    async fn ensure_column(
+        conn: &mut Conn,
         table: &str,
         column: &str,
         definition: &str,
     ) -> RecordStoreResult<()> {
-        if Self::column_exists(conn, table, column)? {
+        if Self::column_exists(conn, table, column).await? {
             return Ok(());
         }
-        match conn.query_drop(format!(
-            "ALTER TABLE {table} ADD COLUMN {column} {definition}"
-        )) {
+        match conn
+            .query_drop(format!(
+                "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+            ))
+            .await
+        {
             Ok(()) => Ok(()),
-            Err(mysql::Error::MySqlError(e)) if e.code == 1060 => Ok(()),
+            Err(Error::MySqlError(e)) if e.code == 1060 => Ok(()),
             Err(e) => Err(store_err(format!(
                 "schema upgrade failed adding {table}.{column}: {e}"
             ))),
@@ -663,21 +696,22 @@ impl MysqlStore {
     ///
     /// `keys_table`/`metering_table` exist for test isolation only, like the `table` parameter on
     /// the v2/v3 steps; production passes `"api_keys"`/`"usage_metering"`.
-    fn run_v7_schema_upgrade(
-        conn: &mut PooledConn,
+    pub(crate) async fn run_v7_schema_upgrade(
+        conn: &mut Conn,
         keys_table: &str,
         metering_table: &str,
     ) -> RecordStoreResult<()> {
-        Self::ensure_column(conn, keys_table, "allowed_scopes_ext", "JSON NULL")?;
-        Self::ensure_column(conn, keys_table, "idp_subject", "TEXT NULL")?;
-        Self::ensure_column(conn, keys_table, "binding_mode", "TEXT NULL")?;
-        Self::ensure_column(conn, keys_table, "minted_by", "TEXT NULL")?;
+        Self::ensure_column(conn, keys_table, "allowed_scopes_ext", "JSON NULL").await?;
+        Self::ensure_column(conn, keys_table, "idp_subject", "TEXT NULL").await?;
+        Self::ensure_column(conn, keys_table, "binding_mode", "TEXT NULL").await?;
+        Self::ensure_column(conn, keys_table, "minted_by", "TEXT NULL").await?;
         Self::ensure_column(
             conn,
             metering_table,
             "priced_from_ms",
             "BIGINT UNSIGNED NOT NULL DEFAULT 0",
-        )?;
+        )
+        .await?;
         let pk_has_it: Option<u64> = conn
             .exec_first(
                 "SELECT COUNT(*) FROM information_schema.statistics \
@@ -685,12 +719,14 @@ impl MysqlStore {
                  AND index_name = 'PRIMARY' AND column_name = 'priced_from_ms'",
                 params! { "t" => metering_table },
             )
+            .await
             .map_err(store_err)?;
         if pk_has_it.unwrap_or(0) == 0 {
             conn.query_drop(format!(
                 "ALTER TABLE {metering_table} DROP PRIMARY KEY, \
                  ADD PRIMARY KEY (key_id, bucket, model, provider, priced_from_ms)"
             ))
+            .await
             .map_err(|e| {
                 store_err(format!(
                     "schema upgrade failed re-keying {metering_table} on priced_from_ms: {e}"
@@ -725,14 +761,14 @@ impl MysqlStore {
     /// `ON DUPLICATE KEY UPDATE <table>.kind = <table>.kind` (a no-op), not `INSERT IGNORE`: a node booting concurrently makes
     /// the duplicate case real, and IGNORE would also downgrade every OTHER error -- a value too long
     /// for the new column, say -- to a warning and a silently truncated row.
-    fn run_v7_plane_record_copy_if_needed(
-        conn: &mut PooledConn,
+    pub(crate) async fn run_v7_plane_record_copy_if_needed(
+        conn: &mut Conn,
         prior_version: u32,
     ) -> RecordStoreResult<()> {
         if !(4..V7_PLANE_RECORDS).contains(&prior_version) {
             return Ok(());
         }
-        if Self::table_exists(conn, "tasks")? {
+        if Self::table_exists(conn, "tasks").await? {
             let terminal = TERMINAL_TASK_STATES
                 .iter()
                 .map(|s| format!("'{s}'"))
@@ -750,9 +786,10 @@ impl MysqlStore {
                  FROM tasks \
                  ON DUPLICATE KEY UPDATE plane_records.kind = plane_records.kind"
             ))
+            .await
             .map_err(store_err)?;
         }
-        if Self::table_exists(conn, "task_events")? {
+        if Self::table_exists(conn, "task_events").await? {
             conn.query_drop(format!(
                 "INSERT INTO plane_records (kind, ident, seq, id, parent, ts, terminal, body) \
                  SELECT '{KIND_TASK_EVENT}', task_id, seq, task_id, task_id, ts, FALSE, \
@@ -764,9 +801,10 @@ impl MysqlStore {
                  FROM task_events \
                  ON DUPLICATE KEY UPDATE plane_records.kind = plane_records.kind"
             ))
+            .await
             .map_err(store_err)?;
         }
-        if Self::table_exists(conn, "mcp_demotions")? {
+        if Self::table_exists(conn, "mcp_demotions").await? {
             conn.query_drop(
                 "INSERT INTO plane_records (kind, ident, seq, id, parent, ts, terminal, body) \
                  SELECT 'demotion', server, 0, server, NULL, recorded_at, FALSE, \
@@ -775,14 +813,16 @@ impl MysqlStore {
                  FROM mcp_demotions \
                  ON DUPLICATE KEY UPDATE plane_records.kind = plane_records.kind",
             )
+            .await
             .map_err(store_err)?;
         }
-        if Self::table_exists(conn, "spent_ask_states")? {
+        if Self::table_exists(conn, "spent_ask_states").await? {
             conn.query_drop(
                 "INSERT INTO plane_tokens (kind, token, expires_at) \
                  SELECT 'ask', nonce, expires_at FROM spent_ask_states \
                  ON DUPLICATE KEY UPDATE plane_tokens.kind = plane_tokens.kind",
             )
+            .await
             .map_err(store_err)?;
         }
         Ok(())
@@ -801,11 +841,12 @@ impl MysqlStore {
     /// `run_v2_backfill_if_needed` takes its own `table` param (see that function's doc comment):
     /// `store_meta` is a single shared row the whole test binary's `connect()` calls race on.
     /// Production always calls this with `"store_meta"`.
-    fn read_prior_version(conn: &mut PooledConn, table: &str) -> RecordStoreResult<u32> {
+    pub(crate) async fn read_prior_version(conn: &mut Conn, table: &str) -> RecordStoreResult<u32> {
         match conn
-            .query_first::<Option<String>, _>(format!(
+            .query_first::<Option<String>>(format!(
                 "SELECT v FROM {table} WHERE k = 'schema_version'"
             ))
+            .await
             .map_err(store_err)?
             .flatten()
         {
@@ -818,16 +859,14 @@ impl MysqlStore {
         }
     }
 
-    fn try_init_schema(pool: &Pool) -> RecordStoreResult<()> {
-        let mut conn = pool.get_conn().map_err(store_err)?;
-
+    async fn try_init_schema(conn: &mut Conn) -> RecordStoreResult<()> {
         // `read_prior_version` needs `store_meta` to already exist -- create it FIRST (SCHEMA[0],
         // `IF NOT EXISTS` so harmless to re-run when the full loop below reaches it again) so a
         // genuinely fresh database's read is a real "no row" (Ok(None) -> version 0), not a
         // "table doesn't exist" query ERROR that read_prior_version's error-propagation would now
         // (correctly, for every OTHER failure) treat as a hard failure.
-        conn.query_drop(SCHEMA[0]).map_err(store_err)?;
-        let prior_version = Self::read_prior_version(&mut conn, "store_meta")?;
+        conn.query_drop(SCHEMA[0]).await.map_err(store_err)?;
+        let prior_version = Self::read_prior_version(conn, "store_meta").await?;
 
         for stmt in SCHEMA {
             // An index that is ALREADY THERE is skipped without issuing the DDL at all. A
@@ -838,14 +877,14 @@ impl MysqlStore {
             // makes a steady-state boot DDL-free apart from `CREATE TABLE IF NOT EXISTS`, which
             // only takes a shared lock on a table that exists.
             if let Some((index, table)) = parse_create_index(stmt) {
-                if Self::index_exists(&mut conn, table, index)? {
+                if Self::index_exists(conn, table, index).await? {
                     continue;
                 }
             }
             // IF NOT EXISTS on tables; CREATE INDEX has no IF NOT EXISTS in MySQL/MariaDB, so a
             // "duplicate key name" error (a concurrent booter won the race after the check above)
             // is swallowed here — every other error propagates.
-            if let Err(e) = conn.query_drop(*stmt) {
+            if let Err(e) = conn.query_drop(*stmt).await {
                 let msg = e.to_string();
                 if !(msg.contains("Duplicate key name") || msg.contains("already exists")) {
                     return Err(store_err(format!(
@@ -855,10 +894,10 @@ impl MysqlStore {
             }
         }
 
-        Self::run_v2_backfill_if_needed(&mut conn, prior_version, "usage_windows")?;
-        Self::run_v3_ascii_bin_fix_if_needed(&mut conn, prior_version, "usage_metering")?;
-        Self::run_v7_schema_upgrade(&mut conn, "api_keys", "usage_metering")?;
-        Self::run_v7_plane_record_copy_if_needed(&mut conn, prior_version)?;
+        Self::run_v2_backfill_if_needed(conn, prior_version, "usage_windows").await?;
+        Self::run_v3_ascii_bin_fix_if_needed(conn, prior_version, "usage_metering").await?;
+        Self::run_v7_schema_upgrade(conn, "api_keys", "usage_metering").await?;
+        Self::run_v7_plane_record_copy_if_needed(conn, prior_version).await?;
 
         conn.query_drop(
             "INSERT INTO store_meta (k, v) VALUES ('schema_version', :v) \
@@ -866,11 +905,13 @@ impl MysqlStore {
                 .replace(':', "?")
                 .replace("?v", &format!("'{SCHEMA_VERSION}'")),
         )
+        .await
         .map_err(store_err)?;
         conn.query_drop(
             "INSERT INTO store_sequence (id, revision) VALUES (1, 0) \
              ON DUPLICATE KEY UPDATE id = id",
         )
+        .await
         .map_err(store_err)?;
 
         Ok(())
@@ -881,8 +922,8 @@ impl MysqlStore {
     /// `ER_CHECK_CONSTRAINT_VIOLATED` (3819) or MariaDB's `ER_CONSTRAINT_FAILED` (4025). Any other
     /// error (a lock timeout, a connection blip) is inconclusive and must never be silently read as
     /// "enforced" -- that was the bug: the prior code treated ANY error as proof.
-    fn is_check_constraint_violation(e: &mysql::Error) -> bool {
-        matches!(e, mysql::Error::MySqlError(inner) if inner.code == 3819 || inner.code == 4025)
+    pub(crate) fn is_check_constraint_violation(e: &Error) -> bool {
+        matches!(e, Error::MySqlError(inner) if inner.code == 3819 || inner.code == 4025)
     }
 
     /// Live functional probes for the two failure modes a schema-shape check cannot catch:
@@ -891,9 +932,10 @@ impl MysqlStore {
     ///     instead of erroring). (1) is probed via a session-private `TEMPORARY` table (never the
     ///     real shared schema — zero contention with real traffic or another node's simultaneous
     ///     probe), dropped immediately after; no probe row ever touches real data.
-    fn probe_invariants(conn: &mut PooledConn) -> RecordStoreResult<()> {
+    pub(crate) async fn probe_invariants(conn: &mut Conn) -> RecordStoreResult<()> {
         let sql_mode: String = conn
             .query_first("SELECT @@sql_mode")
+            .await
             .map_err(store_err)?
             .unwrap_or_default();
         if !sql_mode.contains("STRICT_ALL_TABLES") && !sql_mode.contains("STRICT_TRANS_TABLES") {
@@ -915,9 +957,14 @@ impl MysqlStore {
                 id INT PRIMARY KEY, CONSTRAINT ck_probe CHECK (id = 1)\
              ) ENGINE=InnoDB",
         )
+        .await
         .map_err(store_err)?;
-        let probe_result = conn.query_drop("INSERT INTO busbar_check_probe (id) VALUES (999)");
-        let _ = conn.query_drop("DROP TEMPORARY TABLE busbar_check_probe");
+        let probe_result = conn
+            .query_drop("INSERT INTO busbar_check_probe (id) VALUES (999)")
+            .await;
+        let _ = conn
+            .query_drop("DROP TEMPORARY TABLE busbar_check_probe")
+            .await;
 
         // ER_CHECK_CONSTRAINT_VIOLATED (3819, MySQL 8.0.16+) / ER_CONSTRAINT_FAILED (4025,
         // MariaDB) -- the two vendor-specific codes this schema's CHECK enforcement actually
@@ -948,23 +995,21 @@ impl MysqlStore {
         Ok(())
     }
 
-    fn conn(&self) -> RecordStoreResult<PooledConn> {
-        self.pool.get_conn().map_err(store_err)
-    }
-
     /// Bump `store_sequence` and return the new revision. MUST be the first statement of every
     /// control-plane transaction (mint/revoke/rotate/delete) — this fixed lock order
     /// (store_sequence -> api_keys -> credentials -> denylist) is what makes deadlock across the
     /// admin plane structurally impossible. Never call this outside an active transaction.
-    fn bump_revision(tx: &mut mysql::Transaction<'_>) -> RecordStoreResult<u64> {
+    async fn bump_revision(tx: &mut Transaction<'_>) -> RecordStoreResult<u64> {
         tx.query_drop("UPDATE store_sequence SET revision = revision + 1 WHERE id = 1")
+            .await
             .map_err(store_err)?;
         tx.query_first("SELECT revision FROM store_sequence WHERE id = 1")
+            .await
             .map_err(store_err)?
             .ok_or_else(|| store_err("store_sequence row missing"))
     }
 
-    fn row_to_key(mut row: mysql::Row) -> RecordStoreResult<VirtualKey> {
+    fn row_to_key(mut row: Row) -> RecordStoreResult<VirtualKey> {
         let id: String = row
             .take("id")
             .ok_or_else(|| store_err("missing column: id"))?;
@@ -1027,7 +1072,7 @@ impl MysqlStore {
     /// `row.take()`n an extra column (e.g. `secret`) out of a wider `SELECT`, which a positional
     /// `mysql::from_row_opt` tuple conversion cannot tolerate (it requires an exact column count
     /// match and errors on any row shape it doesn't recognize as a valid conversion target).
-    fn row_to_cred_meta(mut row: mysql::Row) -> RecordStoreResult<CredentialMeta> {
+    fn row_to_cred_meta(mut row: Row) -> RecordStoreResult<CredentialMeta> {
         let id: String = row
             .take("id")
             .ok_or_else(|| store_err("missing column: id"))?;
@@ -1232,10 +1277,10 @@ fn reserved_units(
 }
 
 impl MysqlStore {
-    /// [`RecordStore::add_usage`] on `tx`: the caller's transaction, so a deduped `op_id` write
+    /// [`busbar_contract::records::RecordStore::add_usage`] on `tx`: the caller's transaction, so a deduped `op_id` write
     /// records its `op_id` atomically with the effect.
-    fn add_usage_on(
-        tx: &mut impl Queryable,
+    pub(crate) async fn add_usage_on(
+        tx: &mut Conn,
         bucket_id: &str,
         window_start: u64,
         delta: &UsageDelta,
@@ -1262,6 +1307,7 @@ impl MysqlStore {
                 "req" => delta.requests, "breq" => delta.billable_requests,
             },
         )
+        .await
         .map_err(store_err)?;
         // Deterministic order, same reason as `put_usage`: the primary key orders by model name, so
         // caller-order inserts from two concurrent flushes can deadlock on overlapping windows.
@@ -1293,6 +1339,7 @@ impl MysqlStore {
                     "ti" => ti, "to_" => to, "cr" => cr, "cw" => cw,
                 },
             )
+            .await
             .map_err(store_err)?;
             // Every OPEN unit accumulates the same way, floored at 0, one atomic upsert per unit
             // (BTreeMap order, so concurrent flushes take the rows in one order).
@@ -1307,16 +1354,20 @@ impl MysqlStore {
                         "unit" => unit, "d" => d,
                     },
                 )
+                .await
                 .map_err(store_err)?;
             }
         }
         Ok(())
     }
 
-    /// [`RecordStore::add_metering`] on `tx` (see [`Self::add_usage_on`]). ONE transaction for the
+    /// [`busbar_contract::records::RecordStore::add_metering`] on `tx` (see [`Self::add_usage_on`]). ONE transaction for the
     /// cell and its open units, so a reader never sees a cell's token counts advanced without the
     /// units the same response accrued (or the reverse).
-    fn add_metering_on(tx: &mut impl Queryable, delta: &MeteringDelta) -> RecordStoreResult<()> {
+    pub(crate) async fn add_metering_on(
+        tx: &mut Conn,
+        delta: &MeteringDelta,
+    ) -> RecordStoreResult<()> {
         let bucket = format!("{:010}", delta.bucket); // matches the CHAR(10) 'YYYY-MM-DD'-shaped bucket
                                                       // `priced_from_ms` is part of the KEY (DECISION #79): a rate-card edit inside the UTC day
                                                       // opens a SECOND cell for that day, so each half keeps the card it was earned under rather
@@ -1341,7 +1392,7 @@ impl MysqlStore {
                 "ti" => delta.tokens_input, "to_" => delta.tokens_output,
                 "cr" => delta.tokens_cache_read, "cw" => delta.tokens_cache_write,
             },
-        )
+        ).await
         .map_err(store_err)?;
         // Every ledgered class the token columns do not hold, additive like them (BTreeMap order,
         // so concurrent writers take the unit rows in one order).
@@ -1355,14 +1406,17 @@ impl MysqlStore {
                     "bucket" => &bucket, "key" => &delta.key_id, "provider" => &delta.provider,
                     "model" => &delta.model, "pfm" => delta.priced_from_ms, "unit" => unit, "n" => *n,
                 },
-            )
+            ).await
             .map_err(store_err)?;
         }
         Ok(())
     }
 
-    /// [`RecordStore::append_audit`] on `q` (see [`Self::add_usage_on`]).
-    fn append_audit_on(q: &mut impl Queryable, entry: &AuditRecord) -> RecordStoreResult<()> {
+    /// [`busbar_contract::records::RecordStore::append_audit`] on `q` (see [`Self::add_usage_on`]).
+    pub(crate) async fn append_audit_on(
+        q: &mut Conn,
+        entry: &AuditRecord,
+    ) -> RecordStoreResult<()> {
         // `ON DUPLICATE KEY UPDATE seq = seq` kept the stored record and said nothing, which is
         // right for ONE of the two ways a seq collides and wrong for the other. Compare them and
         // let the difference decide (see the trait contract):
@@ -1400,7 +1454,7 @@ impl MysqlStore {
                     "resource" => &entry.resource, "outcome" => &entry.outcome,
                     "principal" => &entry.principal, "prev" => &entry.prev_hash, "hash" => &entry.hash,
                 },
-            )
+            ).await
             .map_err(store_err)?
             .affected_rows();
             // 1 = inserted. 0 = the seq was already occupied and `seq = seq` changed nothing.
@@ -1413,6 +1467,7 @@ impl MysqlStore {
                      FROM audit_log WHERE seq = :seq",
                     params! { "seq" => entry.seq },
                 )
+                .await
                 .map_err(store_err)?;
             let Some((seq, ts, action, resource, outcome, principal, prev_hash, hash)) = existing
             else {
@@ -1445,13 +1500,11 @@ impl MysqlStore {
         )))
     }
 
-    /// [`RecordStore::append_plane_record`] on `q` (see [`Self::add_usage_on`]).
-    fn append_plane_record_on(
-        q: &mut impl Queryable,
-        record: PlaneRecordRef<'_>,
+    /// [`busbar_contract::records::RecordStore::append_plane_record`] on `q` (see [`Self::add_usage_on`]).
+    pub(crate) async fn append_plane_record_on(
+        q: &mut Conn,
+        record: &PlaneRecord,
     ) -> RecordStoreResult<()> {
-        // This store binds owned rows: the one copy of the borrowed view happens here.
-        let record = &record.to_record();
         // APPEND-ONLY at a chain position `(parent, seq)`. A record arriving on a position that
         // already holds one is settled by comparing the two, exactly as `append_audit` settles a
         // duplicate `seq`:
@@ -1479,6 +1532,7 @@ impl MysqlStore {
                  ON DUPLICATE KEY UPDATE kind = kind",
                     plane_params(record),
                 )
+                .await
                 .map_err(store_err)?
                 .affected_rows();
             if inserted == 1 {
@@ -1490,6 +1544,7 @@ impl MysqlStore {
                      WHERE kind = :kind AND ident = :ident AND seq = :seq",
                     params! { "kind" => &record.kind, "ident" => ident, "seq" => record.seq },
                 )
+                .await
                 .map_err(store_err)?;
             let Some((id, parent, ts, terminal, body)) = existing else {
                 continue; // purged between the insert and the read: the position is free, retry
@@ -1517,13 +1572,11 @@ impl MysqlStore {
     }
 }
 
-impl RecordStore for MysqlStore {
-    fn put_key(&self, key: &VirtualKey) -> RecordStoreResult<()> {
-        let mut conn = self.conn()?;
-        let mut tx = conn
-            .start_transaction(TxOpts::default())
-            .map_err(store_err)?;
-        let rev = Self::bump_revision(&mut tx)?;
+/// THE 1.5.5 OP SET (store slots 0-32), each one body on the op's connection.
+impl MysqlStore {
+    pub(crate) async fn put_key(conn: &mut Conn, key: &VirtualKey) -> RecordStoreResult<()> {
+        let mut tx = conn.start_transaction().await.map_err(store_err)?;
+        let rev = Self::bump_revision(&mut tx).await?;
 
         // TOMBSTONE PRECONDITION (see `RecordStore::put_key`): a live-shaped write must not overwrite a
         // tombstoned row, which would reissue an id the contract says is never reissued and revive
@@ -1542,9 +1595,10 @@ impl RecordStore for MysqlStore {
                     "SELECT deleted_at FROM api_keys WHERE id = :id FOR UPDATE",
                     params! { "id" => &key.id },
                 )
+                .await
                 .map_err(store_err)?;
             if let Some((Some(_),)) = existing {
-                tx.rollback().map_err(store_err)?;
+                tx.rollback().await.map_err(store_err)?;
                 return Err(store_err(format!(
                     "put_key: '{}' is tombstoned and its id is never reissued; refusing to clear \
                      the tombstone",
@@ -1590,38 +1644,44 @@ impl RecordStore for MysqlStore {
                 "binding" => &key.binding_mode,
                 "minted_by" => &key.minted_by,
             },
-        )
+        ).await
         .map_err(store_err)?;
 
-        tx.commit().map_err(store_err)
+        tx.commit().await.map_err(store_err)
     }
 
-    fn get_key(&self, id: &str) -> RecordStoreResult<Option<VirtualKey>> {
-        let mut conn = self.conn()?;
-        let row: Option<mysql::Row> = conn
+    pub(crate) async fn get_key(
+        conn: &mut Conn,
+        id: &str,
+    ) -> RecordStoreResult<Option<VirtualKey>> {
+        let row: Option<Row> = conn
             .exec_first(
                 format!("SELECT {KEY_COLUMNS} FROM api_keys WHERE id = :id"),
                 params! { "id" => id },
             )
+            .await
             .map_err(store_err)?;
         row.map(Self::row_to_key).transpose()
     }
 
-    fn list_keys(&self) -> RecordStoreResult<Vec<VirtualKey>> {
-        let mut conn = self.conn()?;
-        let rows: Vec<mysql::Row> = conn
+    pub(crate) async fn list_keys(conn: &mut Conn) -> RecordStoreResult<Vec<VirtualKey>> {
+        let rows: Vec<Row> = conn
             .query(format!("SELECT {KEY_COLUMNS} FROM api_keys"))
+            .await
             .map_err(store_err)?;
         rows.into_iter().map(Self::row_to_key).collect()
     }
 
-    fn list_keys_since(&self, since: u64) -> RecordStoreResult<Vec<VirtualKey>> {
-        let mut conn = self.conn()?;
-        let rows: Vec<mysql::Row> = conn
+    pub(crate) async fn list_keys_since(
+        conn: &mut Conn,
+        since: u64,
+    ) -> RecordStoreResult<Vec<VirtualKey>> {
+        let rows: Vec<Row> = conn
             .exec(
                 format!("SELECT {KEY_COLUMNS} FROM api_keys WHERE revision > :since"),
                 params! { "since" => since },
             )
+            .await
             .map_err(store_err)?;
         rows.into_iter().map(Self::row_to_key).collect()
     }
@@ -1630,18 +1690,15 @@ impl RecordStore for MysqlStore {
     /// enabled=false + deleted_at, all in ONE transaction with ONE revision stamp on the api_keys
     /// row, so a hydrator reading a consistent snapshot can never observe the tombstone without the
     /// credentials already gone (the hard-delete-invisible-to-hydration fix).
-    fn delete_key(&self, id: &str) -> RecordStoreResult<()> {
-        let mut conn = self.conn()?;
-        let mut tx = conn
-            .start_transaction(TxOpts::default())
-            .map_err(store_err)?;
+    pub(crate) async fn delete_key(conn: &mut Conn, id: &str) -> RecordStoreResult<()> {
+        let mut tx = conn.start_transaction().await.map_err(store_err)?;
 
         // bump_revision FIRST, matching the crate's fixed lock order (store_sequence before
         // api_keys) — the existence/state check below still runs before any write, it just
         // acquires its FOR UPDATE lock second. A no-op path (unknown id / already tombstoned)
         // rolls the transaction back, so the revision it consumed is never observably committed;
         // per the locked design, gaps in the sequence are harmless, only inversions are fatal.
-        let rev = Self::bump_revision(&mut tx)?;
+        let rev = Self::bump_revision(&mut tx).await?;
 
         // Explicit existence/state check — rows_affected() alone can't distinguish
         // "not found" from "already tombstoned, no-op" (both report 0 rows changed).
@@ -1650,9 +1707,10 @@ impl RecordStore for MysqlStore {
                 "SELECT deleted_at FROM api_keys WHERE id = :id FOR UPDATE",
                 params! { "id" => id },
             )
+            .await
             .map_err(store_err)?;
         let Some((deleted_at,)) = existing else {
-            tx.rollback().map_err(store_err)?;
+            tx.rollback().await.map_err(store_err)?;
             // NOT the same case as already-tombstoned below. "Already tombstoned" means the
             // operator's intent is satisfied and the evidence is on disk; "no such id" means
             // nothing was touched, and Ok(()) there tells an operator who typo'd an id that a key
@@ -1660,7 +1718,7 @@ impl RecordStore for MysqlStore {
             return Err(store_err(format!("delete_key: unknown id '{id}'")));
         };
         if deleted_at.is_some() {
-            tx.rollback().map_err(store_err)?;
+            tx.rollback().await.map_err(store_err)?;
             return Ok(()); // already tombstoned: idempotent no-op per the trait doc
         }
 
@@ -1670,40 +1728,39 @@ impl RecordStore for MysqlStore {
             "DELETE FROM credentials WHERE key_id = :id",
             params! { "id" => id },
         )
+        .await
         .map_err(store_err)?;
 
         tx.exec_drop(
             "UPDATE api_keys SET enabled = FALSE, deleted_at = :now, updated_at = :now, revision = :rev \
              WHERE id = :id",
             params! { "now" => now, "rev" => rev, "id" => id },
-        )
+        ).await
         .map_err(store_err)?;
 
-        tx.commit().map_err(store_err)
+        tx.commit().await.map_err(store_err)
     }
 
-    fn scrub_key(&self, id: &str) -> RecordStoreResult<()> {
-        let mut conn = self.conn()?;
-        let mut tx = conn
-            .start_transaction(TxOpts::default())
-            .map_err(store_err)?;
+    pub(crate) async fn scrub_key(conn: &mut Conn, id: &str) -> RecordStoreResult<()> {
+        let mut tx = conn.start_transaction().await.map_err(store_err)?;
 
         // bump_revision FIRST — see delete_key's comment on the fixed lock order.
-        let rev = Self::bump_revision(&mut tx)?;
+        let rev = Self::bump_revision(&mut tx).await?;
 
         let existing: Option<(Option<u64>,)> = tx
             .exec_first(
                 "SELECT deleted_at FROM api_keys WHERE id = :id FOR UPDATE",
                 params! { "id" => id },
             )
+            .await
             .map_err(store_err)?;
         match existing {
             None => {
-                tx.rollback().map_err(store_err)?;
+                tx.rollback().await.map_err(store_err)?;
                 Err(store_err(format!("scrub_key: unknown id '{id}'")))
             }
             Some((None,)) => {
-                tx.rollback().map_err(store_err)?;
+                tx.rollback().await.map_err(store_err)?;
                 Err(store_err(format!(
                     "scrub_key: key '{id}' is not tombstoned — delete_key first"
                 )))
@@ -1714,21 +1771,25 @@ impl RecordStore for MysqlStore {
                     "UPDATE api_keys SET name = '', labels = '{}', updated_at = :now, revision = :rev \
                      WHERE id = :id",
                     params! { "now" => now, "rev" => rev, "id" => id },
-                )
+                ).await
                 .map_err(store_err)?;
-                tx.commit().map_err(store_err)
+                tx.commit().await.map_err(store_err)
             }
         }
     }
 
-    fn get_usage(&self, bucket_id: &str, window_start: u64) -> RecordStoreResult<UsageLedger> {
-        let mut conn = self.conn()?;
+    pub(crate) async fn get_usage(
+        conn: &mut Conn,
+        bucket_id: &str,
+        window_start: u64,
+    ) -> RecordStoreResult<UsageLedger> {
         let rows: Vec<(String, u64, u64, u64, u64)> = conn
             .exec(
                 "SELECT model, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write \
                  FROM usage_windows WHERE bucket_id = :b AND window_start = :w AND model <> ''",
                 params! { "b" => bucket_id, "w" => window_start },
             )
+            .await
             .map_err(store_err)?;
         // `SUM()` with no GROUP BY always returns exactly one row, even when zero rows match the
         // WHERE clause — it returns SQL NULL for each aggregate, not an empty result set. So
@@ -1746,6 +1807,7 @@ impl RecordStore for MysqlStore {
                  FROM usage_windows WHERE bucket_id = :b AND window_start = :w",
                 params! { "b" => bucket_id, "w" => window_start },
             )
+            .await
             .map_err(store_err)?;
         let (requests, billable_requests) = totals.unwrap_or((0, 0));
         // The OPEN units (everything but the reserved four) for this window, merged onto their
@@ -1759,6 +1821,7 @@ impl RecordStore for MysqlStore {
                  ORDER BY model, unit",
                 params! { "b" => bucket_id, "w" => window_start },
             )
+            .await
             .map_err(store_err)?;
 
         let mut models: Vec<ModelTokens> = rows
@@ -1794,16 +1857,13 @@ impl RecordStore for MysqlStore {
         })
     }
 
-    fn put_usage(
-        &self,
+    pub(crate) async fn put_usage(
+        conn: &mut Conn,
         bucket_id: &str,
         window_start: u64,
         ledger: &UsageLedger,
     ) -> RecordStoreResult<()> {
-        let mut conn = self.conn()?;
-        let mut tx = conn
-            .start_transaction(TxOpts::default())
-            .map_err(store_err)?;
+        let mut tx = conn.start_transaction().await.map_err(store_err)?;
         // `bucket_scope` is named EXPLICITLY even though this path only ever writes 'key'. The
         // primary key is (window_start, bucket_scope, bucket_id, model), so a predicate that skips
         // `bucket_scope` cannot use the key beyond its first column: InnoDB then takes a next-key
@@ -1816,6 +1876,7 @@ impl RecordStore for MysqlStore {
              WHERE window_start = :w AND bucket_scope = 'key' AND bucket_id = :b",
             params! { "b" => bucket_id, "w" => window_start },
         )
+        .await
         .map_err(store_err)?;
         // The window's OPEN units are part of the same absolute set: a unit the new ledger no
         // longer carries must not survive it.
@@ -1824,6 +1885,7 @@ impl RecordStore for MysqlStore {
              WHERE window_start = :w AND bucket_scope = 'key' AND bucket_id = :b",
             params! { "b" => bucket_id, "w" => window_start },
         )
+        .await
         .map_err(store_err)?;
         // The request counters belong to the WINDOW, not to any one model, so they live on a single
         // reserved `model = ''` sentinel row and the per-model rows carry tokens only. Written onto
@@ -1841,6 +1903,7 @@ impl RecordStore for MysqlStore {
                 "req" => ledger.requests, "breq" => ledger.billable_requests,
             },
         )
+        .await
         .map_err(store_err)?;
         // Insert the per-model rows in a DETERMINISTIC order. The primary key orders by model name,
         // so two transactions writing overlapping windows in caller order can acquire the same rows
@@ -1861,6 +1924,7 @@ impl RecordStore for MysqlStore {
                     "ti" => ti, "to_" => to, "cr" => cr, "cw" => cw,
                 },
             )
+            .await
             .map_err(store_err)?;
             // BTreeMap order, so the unit rows are acquired in one deterministic order too.
             for (unit, count) in open {
@@ -1873,45 +1937,25 @@ impl RecordStore for MysqlStore {
                         "unit" => unit, "n" => count,
                     },
                 )
+                .await
                 .map_err(store_err)?;
             }
         }
-        tx.commit().map_err(store_err)
+        tx.commit().await.map_err(store_err)
     }
 
-    fn add_usage(
-        &self,
-        bucket_id: &str,
-        window_start: u64,
-        delta: &UsageDelta,
-    ) -> RecordStoreResult<()> {
-        let mut conn = self.conn()?;
-        let mut tx = conn
-            .start_transaction(TxOpts::default())
-            .map_err(store_err)?;
-        Self::add_usage_on(&mut tx, bucket_id, window_start, delta)?;
-        tx.commit().map_err(store_err)
-    }
-
-    fn add_metering(&self, delta: &MeteringDelta) -> RecordStoreResult<()> {
-        let mut conn = self.conn()?;
-        let mut tx = conn
-            .start_transaction(TxOpts::default())
-            .map_err(store_err)?;
-        Self::add_metering_on(&mut tx, delta)?;
-        tx.commit().map_err(store_err)
-    }
-
-    fn list_metering(&self, bucket: u64) -> RecordStoreResult<Vec<MeteringRow>> {
+    pub(crate) async fn list_metering(
+        conn: &mut Conn,
+        bucket: u64,
+    ) -> RecordStoreResult<Vec<MeteringRow>> {
         let bucket_s = format!("{bucket:010}");
-        let mut conn = self.conn()?;
         let rows: Vec<MeteringRowTuple> = conn
             .exec(
                 "SELECT key_id, model, provider, tokens_input, tokens_output, tokens_cache_read, \
                  tokens_cache_write, requests, billable_requests, key_group_at_use, pricing_version, \
                  priced_from_ms FROM usage_metering WHERE bucket = :b",
                 params! { "b" => &bucket_s },
-            )
+            ).await
             .map_err(store_err)?;
         let units: Vec<(String, String, String, u64, String, u64)> = conn
             .exec(
@@ -1919,6 +1963,7 @@ impl RecordStore for MysqlStore {
                  FROM usage_metering_units WHERE bucket = :b",
                 params! { "b" => &bucket_s },
             )
+            .await
             .map_err(store_err)?;
         // The open units, keyed by their cell, so each lands on exactly the row it was accrued to.
         let mut by_cell: BTreeMap<(String, String, String, u64), BTreeMap<String, u64>> =
@@ -1977,20 +2022,23 @@ impl RecordStore for MysqlStore {
             .collect())
     }
 
-    fn purge_windows_before(&self, before: u64) -> RecordStoreResult<u64> {
+    pub(crate) async fn purge_windows_before(
+        conn: &mut Conn,
+        before: u64,
+    ) -> RecordStoreResult<u64> {
         // Batched AND LOOPED. The batch bound keeps any single DELETE's lock footprint and undo log
         // small, which is why it is here; without the loop it also silently capped the purge at one
         // batch, so a retention backlog larger than the cap was never swept and each tick returned a
         // nonzero count that looked like progress. The contract is "purge every window below the
         // cutoff", and the returned figure is the total actually deleted.
         const BATCH: u64 = 5000;
-        let mut conn = self.conn()?;
         let mut total = 0u64;
         loop {
             conn.exec_drop(
                 "DELETE FROM usage_windows WHERE window_start < :b LIMIT 5000",
                 params! { "b" => before },
             )
+            .await
             .map_err(store_err)?;
             let n = conn.affected_rows();
             total += n;
@@ -2005,6 +2053,7 @@ impl RecordStore for MysqlStore {
                 "DELETE FROM usage_window_units WHERE window_start < :b LIMIT 5000",
                 params! { "b" => before },
             )
+            .await
             .map_err(store_err)?;
             if conn.affected_rows() < BATCH {
                 break;
@@ -2013,7 +2062,10 @@ impl RecordStore for MysqlStore {
         Ok(total)
     }
 
-    fn purge_metering_before(&self, bucket: &str) -> RecordStoreResult<u64> {
+    pub(crate) async fn purge_metering_before(
+        conn: &mut Conn,
+        bucket: &str,
+    ) -> RecordStoreResult<u64> {
         // The `bucket` column is CHAR(10) and BOTH the write path (`add_metering`) and the read path
         // (`list_metering`) zero-pad into it. Only this method compared the caller's string as given,
         // so the obvious caller (a u64 bucket rendered the obvious way) matched zero of its own rows
@@ -2023,34 +2075,33 @@ impl RecordStore for MysqlStore {
             Ok(n) => format!("{n:010}"),
             Err(_) => bucket.to_string(),
         };
-        let mut conn = self.conn()?;
-        let mut tx = conn
-            .start_transaction(TxOpts::default())
-            .map_err(store_err)?;
+        let mut tx = conn.start_transaction().await.map_err(store_err)?;
         // The cells' open units go with them, in the same transaction.
         tx.exec_drop(
             "DELETE FROM usage_metering_units WHERE bucket = :b",
             params! { "b" => &padded },
         )
+        .await
         .map_err(store_err)?;
         tx.exec_drop(
             "DELETE FROM usage_metering WHERE bucket = :b",
             params! { "b" => &padded },
         )
+        .await
         .map_err(store_err)?;
         // Read BEFORE the commit: `affected_rows` reports the LAST statement on this connection,
         // and the COMMIT is one. This is the number of metering CELLS removed.
         let removed = tx.affected_rows();
-        tx.commit().map_err(store_err)?;
+        tx.commit().await.map_err(store_err)?;
         Ok(removed)
     }
 
-    fn put_credential(&self, secret: &CredentialSecret) -> RecordStoreResult<()> {
-        let mut conn = self.conn()?;
-        let mut tx = conn
-            .start_transaction(TxOpts::default())
-            .map_err(store_err)?;
-        let rev = Self::bump_revision(&mut tx)?;
+    pub(crate) async fn put_credential(
+        conn: &mut Conn,
+        secret: &CredentialSecret,
+    ) -> RecordStoreResult<()> {
+        let mut tx = conn.start_transaction().await.map_err(store_err)?;
+        let rev = Self::bump_revision(&mut tx).await?;
         let m = &secret.meta;
 
         // THE OWNING KEY MUST BE LIVE. `delete_key` cascades a key's credentials away precisely so
@@ -2066,17 +2117,18 @@ impl RecordStore for MysqlStore {
                 "SELECT deleted_at FROM api_keys WHERE id = :k FOR UPDATE",
                 params! { "k" => &m.key_id },
             )
+            .await
             .map_err(store_err)?;
         match owner {
             None => {
-                tx.rollback().map_err(store_err)?;
+                tx.rollback().await.map_err(store_err)?;
                 return Err(store_err(format!(
                     "put_credential: owning key '{}' does not exist",
                     m.key_id
                 )));
             }
             Some((Some(_),)) => {
-                tx.rollback().map_err(store_err)?;
+                tx.rollback().await.map_err(store_err)?;
                 return Err(store_err(format!(
                     "put_credential: owning key '{}' is tombstoned; a revoked key takes no new \
                      credentials",
@@ -2092,10 +2144,10 @@ impl RecordStore for MysqlStore {
             .exec_first(
                 "SELECT revoked_at FROM credentials WHERE key_id = :k AND kind = :kind AND slot = :s FOR UPDATE",
                 params! { "k" => &m.key_id, "kind" => &m.kind, "s" => m.slot },
-            )
+            ).await
             .map_err(store_err)?;
         if let Some((None,)) = occupied {
-            tx.rollback().map_err(store_err)?;
+            tx.rollback().await.map_err(store_err)?;
             return Err(store_err(format!(
                 "put_credential: slot {} for key {} kind {} holds a LIVE credential — revoke it first",
                 m.slot, m.key_id, m.kind
@@ -2126,7 +2178,7 @@ impl RecordStore for MysqlStore {
                     "form" => secret_form_str(&m.secret_form),
                     "updated" => m.updated_at, "expires" => m.expires_at, "rev" => rev,
                 },
-            )
+            ).await
         } else {
             tx.exec_drop(
                 "INSERT INTO credentials
@@ -2141,23 +2193,20 @@ impl RecordStore for MysqlStore {
                     "created" => m.created_at, "updated" => m.updated_at, "expires" => m.expires_at,
                     "rev" => rev,
                 },
-            )
+            ).await
         }
         .map_err(store_err)?;
 
-        tx.commit().map_err(store_err)
+        tx.commit().await.map_err(store_err)
     }
 
-    fn put_key_with_credential(
-        &self,
+    pub(crate) async fn put_key_with_credential(
+        conn: &mut Conn,
         key: &VirtualKey,
         secret: &CredentialSecret,
     ) -> RecordStoreResult<()> {
-        let mut conn = self.conn()?;
-        let mut tx = conn
-            .start_transaction(TxOpts::default())
-            .map_err(store_err)?;
-        let rev = Self::bump_revision(&mut tx)?;
+        let mut tx = conn.start_transaction().await.map_err(store_err)?;
+        let rev = Self::bump_revision(&mut tx).await?;
 
         let (pools_json, ext_json) = partition_scopes(&key.allowed_scopes)?;
         let labels_json = serde_json::to_string(&key.labels).map_err(store_err)?;
@@ -2178,7 +2227,7 @@ impl RecordStore for MysqlStore {
                 "rev" => rev, "idp" => &key.idp_subject, "binding" => &key.binding_mode,
                 "minted_by" => &key.minted_by,
             },
-        )
+        ).await
         .map_err(store_err)?;
 
         let m = &secret.meta;
@@ -2196,38 +2245,41 @@ impl RecordStore for MysqlStore {
                 "rev" => rev,
             },
         )
+        .await
         .map_err(store_err)?;
 
-        tx.commit().map_err(store_err)
+        tx.commit().await.map_err(store_err)
     }
 
-    fn list_credentials(&self, key_id: &str) -> RecordStoreResult<Vec<CredentialMeta>> {
-        let mut conn = self.conn()?;
-        let rows: Vec<mysql::Row> = conn
+    pub(crate) async fn list_credentials(
+        conn: &mut Conn,
+        key_id: &str,
+    ) -> RecordStoreResult<Vec<CredentialMeta>> {
+        let rows: Vec<Row> = conn
             .exec(
                 "SELECT id, key_id, kind, slot, public_id, secret_form, created_at, updated_at, \
                  expires_at, revoked_at, revoke_reason, revision FROM credentials WHERE key_id = :k",
                 params! { "k" => key_id },
-            )
+            ).await
             .map_err(store_err)?;
         rows.into_iter().map(Self::row_to_cred_meta).collect()
     }
 
-    fn lookup_credential_secret(
-        &self,
+    pub(crate) async fn lookup_credential_secret(
+        conn: &mut Conn,
         kind: &str,
         public_id: &str,
     ) -> RecordStoreResult<Option<CredentialSecret>> {
-        let mut conn = self.conn()?;
-        let row: Option<(mysql::Row, Option<String>)> = conn
+        let row: Option<(Row, Option<String>)> = conn
             .exec_first(
                 "SELECT id, key_id, kind, slot, public_id, secret_form, created_at, updated_at, \
                  expires_at, revoked_at, revoke_reason, revision, secret FROM credentials \
                  WHERE kind = :kind AND public_id = :pub",
                 params! { "kind" => kind, "pub" => public_id },
             )
+            .await
             .map_err(store_err)
-            .and_then(|r: Option<mysql::Row>| {
+            .and_then(|r: Option<Row>| {
                 r.map(|mut row| {
                     let secret: Option<String> = row.take("secret");
                     Ok((row, secret))
@@ -2247,12 +2299,13 @@ impl RecordStore for MysqlStore {
         }
     }
 
-    fn revoke_credential(&self, id: &str, reason: &str) -> RecordStoreResult<()> {
-        let mut conn = self.conn()?;
-        let mut tx = conn
-            .start_transaction(TxOpts::default())
-            .map_err(store_err)?;
-        let rev = Self::bump_revision(&mut tx)?;
+    pub(crate) async fn revoke_credential(
+        conn: &mut Conn,
+        id: &str,
+        reason: &str,
+    ) -> RecordStoreResult<()> {
+        let mut tx = conn.start_transaction().await.map_err(store_err)?;
+        let rev = Self::bump_revision(&mut tx).await?;
 
         // Explicit existence check, matching every other conditional mutation in this file
         // (e.g. put_credential's slot guard): `rows_affected()` alone can't distinguish "id
@@ -2264,9 +2317,10 @@ impl RecordStore for MysqlStore {
                 "SELECT revoked_at FROM credentials WHERE id = :id FOR UPDATE",
                 params! { "id" => id },
             )
+            .await
             .map_err(store_err)?;
         if existing.is_none() {
-            tx.rollback().map_err(store_err)?;
+            tx.rollback().await.map_err(store_err)?;
             return Err(store_err(format!(
                 "revoke_credential: unknown credential id {id}"
             )));
@@ -2277,20 +2331,23 @@ impl RecordStore for MysqlStore {
             "UPDATE credentials SET revoked_at = :now, revoke_reason = :reason, updated_at = :now, \
              revision = :rev WHERE id = :id AND revoked_at IS NULL",
             params! { "now" => now, "reason" => reason, "rev" => rev, "id" => id },
-        )
+        ).await
         .map_err(store_err)?;
-        tx.commit().map_err(store_err)
+        tx.commit().await.map_err(store_err)
     }
 
-    fn list_credentials_since(&self, since: u64) -> RecordStoreResult<Vec<CredentialSecret>> {
-        let mut conn = self.conn()?;
-        let rows: Vec<mysql::Row> = conn
+    pub(crate) async fn list_credentials_since(
+        conn: &mut Conn,
+        since: u64,
+    ) -> RecordStoreResult<Vec<CredentialSecret>> {
+        let rows: Vec<Row> = conn
             .exec(
                 "SELECT id, key_id, kind, slot, public_id, secret_form, created_at, updated_at, \
                  expires_at, revoked_at, revoke_reason, revision, secret FROM credentials \
                  WHERE revision > :since",
                 params! { "since" => since },
             )
+            .await
             .map_err(store_err)?;
         rows.into_iter()
             .map(|mut row| {
@@ -2304,14 +2361,9 @@ impl RecordStore for MysqlStore {
             .collect()
     }
 
-    fn append_audit(&self, entry: &AuditRecord) -> RecordStoreResult<()> {
-        Self::append_audit_on(&mut self.conn()?, entry)
-    }
-
-    fn list_audit(&self) -> RecordStoreResult<Vec<AuditRecord>> {
-        let mut conn = self.conn()?;
+    pub(crate) async fn list_audit(conn: &mut Conn) -> RecordStoreResult<Vec<AuditRecord>> {
         let rows: Vec<AuditRowTuple> = conn
-            .query("SELECT seq, ts, action, resource, outcome, principal, prev_hash, hash FROM audit_log ORDER BY seq")
+            .query("SELECT seq, ts, action, resource, outcome, principal, prev_hash, hash FROM audit_log ORDER BY seq").await
             .map_err(store_err)?;
         Ok(rows
             .into_iter()
@@ -2330,14 +2382,16 @@ impl RecordStore for MysqlStore {
             .collect())
     }
 
-    fn list_audit_tail(&self, limit: u64) -> RecordStoreResult<Vec<AuditRecord>> {
-        let mut conn = self.conn()?;
+    pub(crate) async fn list_audit_tail(
+        conn: &mut Conn,
+        limit: u64,
+    ) -> RecordStoreResult<Vec<AuditRecord>> {
         let rows: Vec<AuditRowTuple> = conn
             .exec(
                 "SELECT seq, ts, action, resource, outcome, principal, prev_hash, hash FROM audit_log \
                  ORDER BY seq DESC LIMIT :limit",
                 params! { "limit" => limit },
-            )
+            ).await
             .map_err(store_err)?;
         let mut out: Vec<AuditRecord> = rows
             .into_iter()
@@ -2358,12 +2412,13 @@ impl RecordStore for MysqlStore {
         Ok(out)
     }
 
-    fn add_denylist(&self, sub: &str, reason: &str) -> RecordStoreResult<()> {
-        let mut conn = self.conn()?;
-        let mut tx = conn
-            .start_transaction(TxOpts::default())
-            .map_err(store_err)?;
-        let rev = Self::bump_revision(&mut tx)?;
+    pub(crate) async fn add_denylist(
+        conn: &mut Conn,
+        sub: &str,
+        reason: &str,
+    ) -> RecordStoreResult<()> {
+        let mut tx = conn.start_transaction().await.map_err(store_err)?;
+        let rev = Self::bump_revision(&mut tx).await?;
         let now = crate_now();
         let max_ttl: u64 = 90 * 24 * 3600; // matches the 90d default token expiry ceiling documented in admin-api.md
         tx.exec_drop(
@@ -2375,14 +2430,15 @@ impl RecordStore for MysqlStore {
             params! {
                 "sub" => sub, "reason" => reason, "now" => now, "expires" => now + max_ttl, "rev" => rev,
             },
-        )
+        ).await
         .map_err(store_err)?;
-        tx.commit().map_err(store_err)
+        tx.commit().await.map_err(store_err)
     }
 
-    fn list_denylist(&self) -> RecordStoreResult<Vec<String>> {
-        let mut conn = self.conn()?;
-        conn.query("SELECT sub FROM denylist").map_err(store_err)
+    pub(crate) async fn list_denylist(conn: &mut Conn) -> RecordStoreResult<Vec<String>> {
+        conn.query("SELECT sub FROM denylist")
+            .await
+            .map_err(store_err)
     }
 
     // ── THE NEUTRAL KIND-TAGGED PLANE-RECORD VERBS (busbar 1.6.0) ─────────────────────────────
@@ -2394,9 +2450,10 @@ impl RecordStore for MysqlStore {
     // build persist through it unchanged. The one kind-aware rule is retention's, and it is the
     // contract's: `task` drops only TERMINAL rows, and takes its `task_event` chain with it.
 
-    fn upsert_plane_record(&self, record: PlaneRecordRef<'_>) -> RecordStoreResult<()> {
-        // This store binds owned rows: the one copy of the borrowed view happens here.
-        let record = &record.to_record();
+    pub(crate) async fn upsert_plane_record(
+        conn: &mut Conn,
+        record: &PlaneRecord,
+    ) -> RecordStoreResult<()> {
         // UPSERT by identity: a second write for one `(kind, id)` REPLACES the row -- the engine
         // writes a task through on every state transition, and the boot read must find one row per
         // id, holding the last state.
@@ -2404,7 +2461,6 @@ impl RecordStore for MysqlStore {
         // No `affected_rows` check, deliberately: MySQL reports 1 for an insert, 2 for a row it
         // changed and 0 for an update that changed nothing, so the number cannot tell "stored" from
         // "failed". Correctness rests on the statement succeeding.
-        let mut conn = self.conn()?;
         conn.exec_drop(
             "INSERT INTO plane_records (kind, ident, seq, id, parent, ts, terminal, body) \
              VALUES (:kind, :ident, :seq, :id, :parent, :ts, :terminal, :body) \
@@ -2412,27 +2468,28 @@ impl RecordStore for MysqlStore {
                 terminal = VALUES(terminal), body = VALUES(body)",
             plane_params(record),
         )
+        .await
         .map_err(store_err)
     }
 
-    fn get_plane_record(&self, kind: &str, id: &str) -> RecordStoreResult<Option<Vec<u8>>> {
+    pub(crate) async fn get_plane_record(
+        conn: &mut Conn,
+        kind: &str,
+        id: &str,
+    ) -> RecordStoreResult<Option<Vec<u8>>> {
         // No caller filter, deliberately: the contract puts caller-scoping ENGINE-side, because an
         // authorization check living in the backend is one an unauthorized reader bypasses by
         // configuring a different backend. An unknown id is `None`, never an error.
-        let mut conn = self.conn()?;
         conn.exec_first(
             "SELECT body FROM plane_records WHERE kind = :kind AND ident = :id AND seq = 0",
             params! { "kind" => kind, "id" => id },
         )
+        .await
         .map_err(store_err)
     }
 
-    fn append_plane_record(&self, record: PlaneRecordRef<'_>) -> RecordStoreResult<()> {
-        Self::append_plane_record_on(&mut self.conn()?, record)
-    }
-
-    fn list_plane_records(
-        &self,
+    pub(crate) async fn list_plane_records(
+        conn: &mut Conn,
         kind: &str,
         selector: &PlaneSelector<'_>,
     ) -> RecordStoreResult<Vec<Vec<u8>>> {
@@ -2440,37 +2497,48 @@ impl RecordStore for MysqlStore {
         // `All` is UNFILTERED (terminal rows included): the boot rehydrate wants the active rows,
         // retention the terminal ones and a scoped listing one caller's, and a store that
         // pre-filtered for one of them would break the other two.
-        let mut conn = self.conn()?;
         match selector {
-            PlaneSelector::All => conn.exec(
-                "SELECT body FROM plane_records WHERE kind = :kind ORDER BY seq, ident",
-                params! { "kind" => kind },
-            ),
-            PlaneSelector::Parent(parent) => conn.exec(
-                "SELECT body FROM plane_records \
+            PlaneSelector::All => {
+                conn.exec(
+                    "SELECT body FROM plane_records WHERE kind = :kind ORDER BY seq, ident",
+                    params! { "kind" => kind },
+                )
+                .await
+            }
+            PlaneSelector::Parent(parent) => {
+                conn.exec(
+                    "SELECT body FROM plane_records \
                  WHERE kind = :kind AND ident = :parent AND parent = :parent ORDER BY seq",
-                params! { "kind" => kind, "parent" => parent.as_ref() },
-            ),
+                    params! { "kind" => kind, "parent" => parent.as_ref() },
+                )
+                .await
+            }
         }
         .map_err(store_err)
     }
 
-    fn list_plane_record_parents(&self, kind: &str) -> RecordStoreResult<Vec<String>> {
+    pub(crate) async fn list_plane_record_parents(
+        conn: &mut Conn,
+        kind: &str,
+    ) -> RecordStoreResult<Vec<String>> {
         // The boot enumeration a restart resumes chains from: every distinct parent holding at
         // least one record of the kind, including one this process has never seen written.
-        let mut conn = self.conn()?;
         conn.exec(
             "SELECT DISTINCT parent FROM plane_records \
              WHERE kind = :kind AND parent IS NOT NULL ORDER BY parent",
             params! { "kind" => kind },
         )
+        .await
         .map_err(store_err)
     }
 
-    fn purge_plane_records_before(&self, kind: &str, before: u64) -> RecordStoreResult<u64> {
+    pub(crate) async fn purge_plane_records_before(
+        conn: &mut Conn,
+        kind: &str,
+        before: u64,
+    ) -> RecordStoreResult<u64> {
         // STRICTLY older than the cutoff: a row exactly at `before` is kept. The count returned is
         // one the DELETE actually performed (`affected_rows`), never an estimate.
-        let mut conn = self.conn()?;
         if kind == KIND_TASK {
             // TERMINAL ONLY. An interrupted task waiting on a human is exactly the row that sits
             // still for a long time; compacting it is losing the work, not reclaiming space.
@@ -2501,17 +2569,17 @@ impl RecordStore for MysqlStore {
                      WHERE kind = :kind AND seq = 0 AND ts < :before AND terminal ORDER BY ident",
                     params! { "kind" => KIND_TASK, "before" => before },
                 )
+                .await
                 .map_err(store_err)?;
             let mut removed = 0u64;
             for ident in candidates {
-                let mut tx = conn
-                    .start_transaction(TxOpts::default())
-                    .map_err(store_err)?;
+                let mut tx = conn.start_transaction().await.map_err(store_err)?;
                 tx.exec_drop(
                     "DELETE FROM plane_records WHERE kind = :kind AND ident = :ident AND seq = 0 \
                      AND ts < :before AND terminal",
                     params! { "kind" => KIND_TASK, "ident" => &ident, "before" => before },
                 )
+                .await
                 .map_err(store_err)?;
                 // Read BEFORE the next statement: `affected_rows` reports the LAST statement on
                 // this connection. 0 = a concurrent sweep took it first, or it is no longer
@@ -2521,10 +2589,11 @@ impl RecordStore for MysqlStore {
                         "DELETE FROM plane_records WHERE kind = :event_kind AND ident = :ident",
                         params! { "event_kind" => KIND_TASK_EVENT, "ident" => &ident },
                     )
+                    .await
                     .map_err(store_err)?;
                     removed += 1;
                 }
-                tx.commit().map_err(store_err)?;
+                tx.commit().await.map_err(store_err)?;
             }
             return Ok(removed);
         }
@@ -2539,6 +2608,7 @@ impl RecordStore for MysqlStore {
                 "DELETE FROM plane_records WHERE kind = :kind AND ts < :before LIMIT 5000",
                 params! { "kind" => kind, "before" => before },
             )
+            .await
             .map_err(store_err)?;
             let n = conn.affected_rows();
             total += n;
@@ -2549,27 +2619,30 @@ impl RecordStore for MysqlStore {
         Ok(total)
     }
 
-    fn delete_plane_record(&self, kind: &str, id: &str) -> RecordStoreResult<()> {
+    pub(crate) async fn delete_plane_record(
+        conn: &mut Conn,
+        kind: &str,
+        id: &str,
+    ) -> RecordStoreResult<()> {
         // Absent is a NO-OP, not an error: the engine clears a demotion on every observation that
         // agrees with the approval rather than tracking whether it had demoted, so the common call
         // is one against no row at all. Every `seq` under the identity goes, so deleting a parent's
         // record can never leave part of a chain behind.
-        let mut conn = self.conn()?;
         conn.exec_drop(
             "DELETE FROM plane_records WHERE kind = :kind AND ident = :id",
             params! { "kind" => kind, "id" => id },
         )
+        .await
         .map_err(store_err)
     }
 
-    fn redeem_plane_token(
-        &self,
+    pub(crate) async fn redeem_plane_token(
+        conn: &mut Conn,
         kind: &str,
         token: &str,
         expires_at: u64,
         now: u64,
     ) -> RecordStoreResult<bool> {
-        let mut conn = self.conn()?;
         // THE EVICTION SWEEP the redemption carries, so the ledger is bounded by one validity
         // window rather than growing forever: an entry recording a token that can no longer be
         // presented protects nothing. STRICTLY less-than, so an entry expiring exactly at `now` is
@@ -2586,6 +2659,7 @@ impl RecordStore for MysqlStore {
             "DELETE FROM plane_tokens WHERE expires_at < :now",
             params! { "now" => now },
         )
+        .await
         .map_err(store_err)?;
         // THE TEST AND SET, as ONE statement. `ON DUPLICATE KEY UPDATE token = token` makes the
         // duplicate case a no-op, so `affected_rows` is exactly 1 when THIS call inserted the row
@@ -2599,12 +2673,13 @@ impl RecordStore for MysqlStore {
              ON DUPLICATE KEY UPDATE token = token",
             params! { "kind" => kind, "token" => token, "exp" => expires_at },
         )
+        .await
         .map_err(store_err)?;
         Ok(conn.affected_rows() == 1)
     }
 
-    fn plane_token_live(
-        &self,
+    pub(crate) async fn plane_token_live(
+        conn: &mut Conn,
         kind: &str,
         token: &str,
         expires_at: u64,
@@ -2618,12 +2693,11 @@ impl RecordStore for MysqlStore {
         if now > expires_at {
             return Ok(false);
         }
-        let mut conn = self.conn()?;
         let terminal: Option<bool> = conn
             .exec_first(
                 "SELECT terminal FROM plane_records WHERE kind = :kind AND ident = :token AND seq = 0",
                 params! { "kind" => kind, "token" => token },
-            )
+            ).await
             .map_err(store_err)?;
         Ok(terminal == Some(false))
     }
@@ -2640,7 +2714,7 @@ fn is_terminal(d: PlaneDisposition) -> bool {
     matches!(d, PlaneDisposition::Terminal)
 }
 
-fn plane_params(record: &PlaneRecord) -> mysql::Params {
+fn plane_params(record: &PlaneRecord) -> Params {
     params! {
         "kind" => &record.kind,
         "ident" => plane_ident(record),
@@ -2671,15 +2745,15 @@ fn crate_now() -> u64 {
 pub const NAME: &str = "busbar-store-mysql";
 
 impl MysqlStore {
-    /// Construct a MySQL/MariaDB store from the settings JSON the host hands `open`:
+    /// The `url` of the settings JSON the host hands `open`:
     ///
     /// ```json
     /// { "url": "mysql://user:pass@host:3306/busbar" }
     /// ```
     ///
     /// # Errors
-    /// A text naming why the settings do not open a store.
-    pub fn from_settings(settings: &[u8]) -> Result<Self, String> {
+    /// A text naming why the settings do not name a store.
+    pub(crate) fn settings_url(settings: &[u8]) -> Result<String, String> {
         let v: serde_json::Value = if settings.iter().all(u8::is_ascii_whitespace) {
             serde_json::Value::Object(Default::default())
         } else {
@@ -2694,7 +2768,16 @@ impl MysqlStore {
             .ok_or_else(|| {
                 "mysql plugin config requires a \"url\" (a mysql:// connection string)".to_string()
             })?;
-        MysqlStore::connect(url).map_err(|e| e.0)
+        Ok(url.to_owned())
+    }
+
+    /// A MySQL/MariaDB store from the settings JSON the host hands `open`: parsed here (the same
+    /// refusal texts); the server is reached by `open`'s connect step.
+    ///
+    /// # Errors
+    /// A text naming why the settings do not open a store.
+    pub fn from_settings(settings: &[u8]) -> Result<Self, String> {
+        MysqlStore::new(&Self::settings_url(settings)?).map_err(|e| e.0)
     }
 }
 

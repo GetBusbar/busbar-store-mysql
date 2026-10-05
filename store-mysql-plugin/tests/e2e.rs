@@ -15,10 +15,10 @@
 //! real proof the plugin loads and initializes through busbar's own boot path, not a proxy for it.
 //!
 //! Persistence is then proven the same two independent ways the prior direct-call test used:
-//!   1. `--validate` itself (via the plugin's `open()`) causes a real `MysqlStore::connect`, which
-//!      runs the real schema migration — confirmed by checking the schema now exists.
-//!   2. A second, independent `MysqlStore::connect` (bypassing the plugin/ABI/loader entirely)
-//!      confirms real MySQL was actually touched, not an in-process fake.
+//!   1. `--validate` itself (via the plugin's `open()` and its connect step) runs the real schema
+//!      migration — confirmed by checking the schema now exists.
+//!   2. A second, independent store through the COMPILED-IN door (never the cdylib) confirms real
+//!      MySQL was actually touched, not an in-process fake.
 //!
 //! The ABI-contract tests below load the cdylib DIRECTLY through the loader's dropped-in door
 //! ([`load`]: the Statement rendered as `busbar-plugin-pack` renders it, `load_dropped`, then
@@ -32,7 +32,6 @@ use busbar_plugin_loader::dispatch::{
     load_dropped, rendering_of_library, Bind, DispatchConfig, Dispatcher, NoSink,
 };
 use busbar_plugin_loader::store_v3::LoadedStore;
-use busbar_store_mysql::MysqlStore;
 use mysql::params;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -52,6 +51,35 @@ fn node() -> u64 {
         | 1
 }
 
+/// The node's one `op_id` allocator (`LoadedStore::open` mints the bridge's writes from it): a node
+/// half no earlier run used (the dedupe is durable) and one counter.
+fn mint() -> busbar_contract::abi::store::OpId {
+    static NODE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let node = *NODE.get_or_init(node);
+    busbar_contract::abi::store::OpId::from_parts(
+        node,
+        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+    )
+}
+
+/// A dispatcher and a bind over the loader's test connection table (plain TCP, the host's
+/// connector path): every connection the store makes is one the "host" dials.
+fn host(instance: &str) -> (Arc<Dispatcher>, Bind) {
+    let dispatcher = Arc::new(Dispatcher::new(DispatchConfig::default()));
+    let conns: Arc<dyn busbar_contract::conn::DeclaredConns> = Arc::new(
+        busbar_plugin_loader::tcp_conns::TcpConns::new(dispatcher.conn_waker()),
+    );
+    let bind = Bind {
+        instance: Arc::from(instance),
+        max_inflight_cap: 64,
+        sink: Arc::new(NoSink),
+        dispatcher: dispatcher.adopter(),
+        conns: Some(conns),
+    };
+    (dispatcher, bind)
+}
+
 /// Load the store library at `path` through the DROPPED-IN DOOR and open it on `cfg`, the way the
 /// host opens a store: its Statement rendered as `busbar-plugin-pack` signs it into the manifest,
 /// `load_dropped` (dlopen, `busbar_plugin_door`, the Statement compared byte for byte), then
@@ -60,17 +88,26 @@ fn load(path: &Path, cfg: &str) -> Result<Box<dyn RecordStore>, String> {
     let stated = rendering_of_library(path)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "the library exports no busbar_plugin_door".to_string())?;
-    let dispatcher = Arc::new(Dispatcher::new(DispatchConfig::default()));
-    let bind = Bind {
-        instance: Arc::from("store-mysql-e2e"),
-        max_inflight_cap: 64,
-        sink: Arc::new(NoSink),
-        dispatcher: dispatcher.adopter(),
-        conns: None,
-    };
+    let (dispatcher, bind) = host("store-mysql-e2e");
     let plugin = load_dropped::<Store>(path, &stated, bind).map_err(|e| e.to_string())?;
-    let store = LoadedStore::open(plugin, dispatcher, cfg.as_bytes(), node())?;
+    let store = LoadedStore::open(plugin, dispatcher, cfg.as_bytes(), mint)?;
     Ok(Box::new(store))
+}
+
+/// The store through its COMPILED-IN door (`busbar_store_mysql::door`, never the cdylib): the
+/// independent leg the dropped-in store's writes are migrated, read back and cleaned up through.
+struct MysqlStore;
+
+impl MysqlStore {
+    fn connect(url: &str) -> Result<LoadedStore, String> {
+        let (dispatcher, bind) = host("store-mysql-e2e-direct");
+        let row = busbar_plugin_loader::dispatch::LinkedRow::of(busbar_store_mysql::door)
+            .map_err(|e| e.to_string())?;
+        let plugin = busbar_plugin_loader::dispatch::load_linked::<Store>(&row, bind)
+            .map_err(|e| e.to_string())?;
+        let cfg = serde_json::json!({ "url": url }).to_string();
+        LoadedStore::open(plugin, dispatcher, cfg.as_bytes(), mint)
+    }
 }
 
 fn mysql_url() -> Option<String> {

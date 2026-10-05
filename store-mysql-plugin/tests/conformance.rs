@@ -14,7 +14,7 @@
 //! (window caps, a whole-cell reserve, its replay, a release, the journal, sessions and records).
 //! The two transcripts must agree line for line.
 //!
-//! THE RED ARMS, same test: the library asked for as another kind is refused before `dlopen`; a
+//! THE RED ARMS, each its own test: the library asked for as another kind is refused before `dlopen`; a
 //! manifest rendering that is not the library's own Statement is refused; and the comparison is
 //! not vacuous (the live scenario reads back what it wrote).
 //!
@@ -71,14 +71,18 @@ fn cdylib() -> PathBuf {
         .unwrap_or_else(|| panic!("the busbar-store-mysql-plugin cdylib ({file}) is not built"))
 }
 
-/// What a door is bound to: its own dispatcher's adopter, no envelope sink, no connections.
+/// What a door is bound to: its own dispatcher's adopter, no envelope sink, and the loader's test
+/// connection table (plain TCP, the host's connector path) for the one `tcp` need the store states.
 fn bind(d: &Dispatcher) -> Bind {
+    let conns: Arc<dyn busbar_contract::conn::DeclaredConns> = Arc::new(
+        busbar_plugin_loader::tcp_conns::TcpConns::new(d.conn_waker()),
+    );
     Bind {
         instance: Arc::from("store-mysql-conformance"),
         max_inflight_cap: 64,
         sink: Arc::new(NoSink),
         dispatcher: d.adopter(),
-        conns: None,
+        conns: Some(conns),
     }
 }
 
@@ -166,6 +170,18 @@ fn node() -> u64 {
         | 1
 }
 
+/// The node's one `op_id` allocator (`LoadedStore::open` mints the bridge's writes from it): a node
+/// half no earlier run used (the dedupe is durable) and one counter.
+fn mint() -> OpId {
+    static NODE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let node = *NODE.get_or_init(node);
+    OpId::from_parts(
+        node,
+        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+    )
+}
+
 /// A fresh op id (the dedupe is durable: an op id from an earlier run would replay).
 fn op(counter: u64) -> OpId {
     OpId::from_parts(node(), counter * 2 + 1)
@@ -183,7 +199,7 @@ fn transcript(load: impl Fn() -> Loaded, url: Option<&str>) -> Vec<String> {
         r#"{"url": "mysql://nobody:none@127.0.0.1:9/nowhere"}"#,
     ] {
         let (plugin, dispatcher) = load();
-        let answer = LoadedStore::open(plugin, dispatcher, cfg.as_bytes(), node()).map(|_| ());
+        let answer = LoadedStore::open(plugin, dispatcher, cfg.as_bytes(), mint).map(|_| ());
         t.push(format!("open {cfg:?} = {answer:?}"));
     }
     let Some(url) = url else {
@@ -192,8 +208,8 @@ fn transcript(load: impl Fn() -> Loaded, url: Option<&str>) -> Vec<String> {
     let (plugin, dispatcher) = load();
     clear(url);
     let settings = serde_json::json!({ "url": url }).to_string();
-    let s = LoadedStore::open(plugin, dispatcher, settings.as_bytes(), node())
-        .expect("the store opens");
+    let s =
+        LoadedStore::open(plugin, dispatcher, settings.as_bytes(), mint).expect("the store opens");
     t.push(format!("facts = {:?}", s.facts()));
 
     // The 1.5.5 op set.
@@ -357,8 +373,8 @@ fn same(linked: &[String], dropped: &[String]) {
     );
 }
 
-/// The MySQL store behaves as ONE store through either door — and the library asked for as another
-/// kind, or under a Statement that is not its own, is refused (the RED arms).
+/// The MySQL store behaves as ONE store through either door (the RED arms below: the library asked
+/// for as another kind, or under a Statement that is not its own, is refused).
 #[test]
 fn the_linked_and_the_dropped_in_mysql_store_are_one_store() {
     let url = mysql_url();
@@ -415,8 +431,14 @@ fn the_linked_and_the_dropped_in_mysql_store_are_one_store() {
         linked[4].starts_with("open") && linked[4].contains("Err("),
         "{linked:#?}"
     );
+}
 
-    // RED ARM 1: the library asked for as another kind is refused before it is opened.
+/// RED ARM 1: the library asked for as another kind is refused before it is opened. No database
+/// needed.
+#[test]
+fn a_store_library_loaded_as_another_kind_is_refused() {
+    let lib = cdylib();
+    let stated = packed_rendering(&lib);
     let d = dispatcher();
     let e = match load_dropped::<Secret>(&lib, &stated, bind(&d)) {
         Ok(_) => panic!("a store library loaded as secret"),
@@ -426,8 +448,13 @@ fn the_linked_and_the_dropped_in_mysql_store_are_one_store() {
         e.contains("the manifest states kind Store, not Secret"),
         "{e}"
     );
+}
 
-    // RED ARM 2: a manifest whose Statement is not the library's own is refused.
+/// RED ARM 2: a manifest whose Statement is not the library's own is refused. No database needed.
+#[test]
+fn a_statement_that_is_not_the_librarys_own_is_refused() {
+    let lib = cdylib();
+    let stated = packed_rendering(&lib);
     let mut other = stated.clone();
     other.push(0);
     let d = dispatcher();
