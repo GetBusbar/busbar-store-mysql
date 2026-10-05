@@ -2,8 +2,15 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 use super::*;
-use busbar_contract::records::ModelTokensDelta;
+use busbar_contract::records::{ModelTokensDelta, RecordStore};
+use mysql::prelude::*;
+use mysql::{params, Opts, Pool, PooledConn};
 use std::collections::BTreeMap;
+
+/// The store under test, opened through the real loader over the host's connection path; raw SQL
+/// on an independent `mysql` driver connection.
+mod harness;
+use harness::MysqlStore;
 
 /// A name-keyed `usage_units` map from literal pairs — the 1.6.0 shape of what used to be the four
 /// `TierTokens`/`TierTokensDelta` fields.
@@ -495,6 +502,50 @@ fn usage_with_no_model_breakdown_still_records_its_request_counters() {
         "a ledger with no model breakdown still carries request counters, and they must persist"
     );
     assert_eq!(back.billable_requests, 2);
+}
+
+/// THE SPLIT FLUSH (busbar ADV-1.6.0-2). The engine charges a request at ADMISSION and its tokens
+/// at COMPLETION, and the write-behind flusher ticks on its own clock, so a request slower than one
+/// tick reaches the store as TWO deltas: `{requests: +1, models: []}`, then
+/// `{requests: 0, models: [<tokens>]}`. The published 1.5.x store kept request counters on its
+/// per-model rows, had nowhere to put the first delta, answered `Ok(())` and dropped it: after a
+/// restart the row read `requests=0 tokens_input=11 tokens_output=7`, spend intact and the
+/// requests cap reset. This drives exactly that sequence through `add_usage`, reconnects (a new
+/// process reading the same database), and requires the whole request back. busbar's
+/// `plugins.store-persist|store-mysql` oracle cell pins the flush tick out of its boots so the
+/// 1.5.5 golden stays deterministic; this test is where the split itself stays proven.
+#[test]
+fn a_request_split_across_two_flushes_keeps_its_count_across_a_reconnect() {
+    let _guard = lock_usage_windows();
+    let Some(s) = fresh_store() else { return };
+    let admission = UsageDelta {
+        requests: 1,
+        billable_requests: 1,
+        models: vec![],
+    };
+    let completion = UsageDelta {
+        requests: 0,
+        billable_requests: 0,
+        models: vec![ModelTokensDelta {
+            model: "m-split".to_string(),
+            usage_units: units(&[(UNIT_INPUT, 11), (UNIT_OUTPUT, 7)]),
+        }],
+    };
+    s.add_usage("vk_split_flush", 1_000_103, &admission)
+        .unwrap();
+    s.add_usage("vk_split_flush", 1_000_103, &completion)
+        .unwrap();
+    drop(s);
+    let reopened = MysqlStore::connect(&test_url().unwrap()).expect("reconnect");
+    let back = reopened.get_usage("vk_split_flush", 1_000_103).unwrap();
+    assert_eq!(
+        (back.requests, back.billable_requests),
+        (1, 1),
+        "the admission flush's request count was dropped; the completion's tokens alone survived: {back:?}"
+    );
+    assert_eq!(back.models.len(), 1, "{back:?}");
+    assert_eq!(back.models[0].tier(UNIT_INPUT), 11, "{back:?}");
+    assert_eq!(back.models[0].tier(UNIT_OUTPUT), 7, "{back:?}");
 }
 
 /// `purge_metering_before` must match the rows `add_metering` actually wrote. The bucket column is
@@ -1559,7 +1610,7 @@ mod conformance {
         let Some((store, ns)) = setup("put", 0) else {
             return;
         };
-        conf::assert_put_key_does_not_resurrect_a_tombstone(store, &ns);
+        conf::assert_put_key_does_not_resurrect_a_tombstone(&**store, &ns);
     }
 
     #[test]
@@ -1567,7 +1618,7 @@ mod conformance {
         let Some((store, ns)) = setup("del", 0) else {
             return;
         };
-        conf::assert_delete_key_unknown_id_is_an_error(store, &ns);
+        conf::assert_delete_key_unknown_id_is_an_error(&**store, &ns);
     }
 
     #[test]
@@ -1575,7 +1626,7 @@ mod conformance {
         let Some((store, ns)) = setup("rev", 0) else {
             return;
         };
-        conf::assert_revoke_credential_unknown_id_is_an_error(store, &ns);
+        conf::assert_revoke_credential_unknown_id_is_an_error(&**store, &ns);
     }
 
     #[test]
@@ -1583,7 +1634,7 @@ mod conformance {
         let Some((store, ns)) = setup("pcl", 0) else {
             return;
         };
-        conf::assert_put_credential_requires_a_live_key(store, &ns);
+        conf::assert_put_credential_requires_a_live_key(&**store, &ns);
     }
 
     #[test]
@@ -1591,7 +1642,7 @@ mod conformance {
         let Some((store, ns)) = setup("pkc", 0) else {
             return;
         };
-        conf::assert_put_key_with_credential_is_atomic(store, &ns);
+        conf::assert_put_key_with_credential_is_atomic(&**store, &ns);
     }
 
     #[test]
@@ -1600,7 +1651,7 @@ mod conformance {
         let Some((store, _ns)) = setup("aud", seq) else {
             return;
         };
-        conf::assert_append_audit_duplicate_seq(store, seq);
+        conf::assert_append_audit_duplicate_seq(&**store, seq);
     }
 
     #[test]
@@ -1608,7 +1659,7 @@ mod conformance {
         let Some((store, ns)) = setup("ptk", 0) else {
             return;
         };
-        conf::assert_plane_task_upsert_get_list(store, &ns);
+        conf::assert_plane_task_upsert_get_list(&**store, &ns);
     }
 
     #[test]
@@ -1616,7 +1667,7 @@ mod conformance {
         let Some((store, ns)) = setup("pev", 0) else {
             return;
         };
-        conf::assert_plane_event_chain_is_ordered_by_seq(store, &ns);
+        conf::assert_plane_event_chain_is_ordered_by_seq(&**store, &ns);
     }
 
     #[test]
@@ -1624,7 +1675,7 @@ mod conformance {
         let Some((store, ns)) = setup("pcp", 0) else {
             return;
         };
-        conf::assert_plane_call_parents_enumerated(store, &ns);
+        conf::assert_plane_call_parents_enumerated(&**store, &ns);
     }
 
     #[test]
@@ -1632,7 +1683,7 @@ mod conformance {
         let Some((store, ns)) = setup("pdm", 0) else {
             return;
         };
-        conf::assert_plane_demotion_upsert_list_delete(store, &ns);
+        conf::assert_plane_demotion_upsert_list_delete(&**store, &ns);
     }
 
     // The two purge checks sweep a KIND-WIDE cutoff. The suite's own `ns_purge_window` keeps two
@@ -1646,7 +1697,7 @@ mod conformance {
         let Some((store, ns)) = setup("ppc", 0) else {
             return;
         };
-        conf::assert_plane_purge_honours_the_cutoff(store, &ns);
+        conf::assert_plane_purge_honours_the_cutoff(&**store, &ns);
     }
 
     #[test]
@@ -1655,7 +1706,7 @@ mod conformance {
         let Some((store, ns)) = setup("ppt", 0) else {
             return;
         };
-        conf::assert_plane_purge_task_keeps_active_rows(store, &ns);
+        conf::assert_plane_purge_task_keeps_active_rows(&**store, &ns);
     }
 
     #[test]
@@ -1663,7 +1714,7 @@ mod conformance {
         let Some((store, ns)) = setup("ptu", 0) else {
             return;
         };
-        conf::assert_plane_token_is_single_use(store, &ns);
+        conf::assert_plane_token_is_single_use(&**store, &ns);
     }
 
     // The suite's kind-wide purge-collision regression, the same one busbar's reference backend runs:
@@ -1679,8 +1730,8 @@ mod conformance {
         let ns_b = ns("ppcB");
         reset(store, &ns_b, 0);
         std::thread::scope(|scope| {
-            let a = scope.spawn(|| conf::assert_plane_purge_honours_the_cutoff(store, &ns_a));
-            let b = scope.spawn(|| conf::assert_plane_purge_honours_the_cutoff(store, &ns_b));
+            let a = scope.spawn(|| conf::assert_plane_purge_honours_the_cutoff(&**store, &ns_a));
+            let b = scope.spawn(|| conf::assert_plane_purge_honours_the_cutoff(&**store, &ns_b));
             a.join().expect("run A must not panic");
             b.join().expect("run B must not panic");
         });
@@ -1695,8 +1746,10 @@ mod conformance {
         let ns_b = ns("pptB");
         reset(store, &ns_b, 0);
         std::thread::scope(|scope| {
-            let a = scope.spawn(|| conf::assert_plane_purge_task_keeps_active_rows(store, &ns_a));
-            let b = scope.spawn(|| conf::assert_plane_purge_task_keeps_active_rows(store, &ns_b));
+            let a =
+                scope.spawn(|| conf::assert_plane_purge_task_keeps_active_rows(&**store, &ns_a));
+            let b =
+                scope.spawn(|| conf::assert_plane_purge_task_keeps_active_rows(&**store, &ns_b));
             a.join().expect("run A must not panic");
             b.join().expect("run B must not panic");
         });

@@ -22,17 +22,17 @@ crate-type = ["cdylib", "rlib"]
 # as a loadable library.
 busbar-store-mysql = { path = "../store-mysql" }
 # `export_door!`. Same pinned rev as the logic crate's, so one busbar source resolves.
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "934a016e20fc1a67c209b671d137c8cc28092767" }
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "0db7ee2ea048217ea3fc10f0d92fbda19ee1f133" }
 
 [dev-dependencies]
 # The conformance and end-to-end tests load the built cdylib over the REAL loader (sign, pack, scan,
 # open) and the linked row through the same registry — dev-only, never in the shipped artifact. Same
 # pinned rev as the logic crate's busbar-contract, so one busbar source resolves.
-busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "934a016e20fc1a67c209b671d137c8cc28092767" }
+busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "0db7ee2ea048217ea3fc10f0d92fbda19ee1f133", features = ["test-support"] }
 serde_json = "1"
 # Drives the store v3 slots (`StoreCalls`, async) to completion on a current-thread runtime.
 tokio = { version = "1", features = ["rt"] }
-mysql = { version = "26", default-features = false, features = ["minimal"] }
+mysql = { version = "28", default-features = false, features = ["minimal-rust"] }
 # For admin_api_e2e.rs: drives the real busbar admin HTTP API (install/mint) against an
 # OUT-OF-PROCESS busbar, fully synchronous (no tokio runtime — matches store-postgres-plugin's own
 # admin_api_e2e.rs rationale for `reqwest::blocking`).

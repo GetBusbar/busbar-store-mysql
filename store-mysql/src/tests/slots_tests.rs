@@ -7,10 +7,9 @@
 //! Every test names its own slots, streams, sessions and keys from a fresh ULID, so the suite runs
 //! in parallel against the one shared database and leaves nothing another test reads.
 
-use super::{fresh_store, sample_key, test_url};
-use crate::MysqlStore;
+use super::{fresh_store, sample_key, test_url, MysqlStore};
 use busbar_contract::abi::sdk::store::{
-    Cap, CapsRefused, Cell, CellKey, Dimension, Grant, OpRefused, ReserveRefused, StoreSlots,
+    Cap, CapsRefused, Cell, CellKey, Dimension, Grant, OpRefused, ReserveRefused,
 };
 use busbar_contract::abi::store::OpId;
 use busbar_contract::kinds::{Head, RecordBytes};
