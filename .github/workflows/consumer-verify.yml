@@ -1,5 +1,5 @@
-# RENDERED by `cargo xtask fleet render busbar-store-mysql` from GetBusbar/busbar's plugins.yaml and
-# .github/fleet/ templates; `cargo xtask fleet check` is red on any edit here. Daily: does the newest
+# RENDERED by `busbar-release plugin sync busbar-store-mysql` from GetBusbar/busbar-release template/; a hand
+# edit is overwritten by the next sync. Daily: does the newest
 # PUBLISHED release still work for a user (busbar's plugin-consumer-verify.yml)? A publish-time check
 # cannot see an artifact that rots afterwards; release.yml verifies each release as it publishes.
 name: consumer-verify

@@ -1,13 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# RENDERED by `cargo xtask fleet render busbar-store-mysql` from GetBusbar/busbar's plugins.yaml and
-# .github/fleet/workspace-Cargo.toml; `cargo xtask fleet check` is red on any edit here.
+# RENDERED by `busbar-release plugin sync busbar-store-mysql` from GetBusbar/busbar-release template/ and
+# GetBusbar/busbar's dependency policy; a hand edit is overwritten by the next sync.
 #
-# One repo per plugin, every repo a twin: this workspace is exactly two crates, the logic
-# (`store-mysql/`, the rlib a busbar build can link) and the thin cdylib that packages it as a
-# droppable `kind: store` plugin (`store-mysql-plugin/`, crate `busbar-store-mysql-plugin`). Its busbar
-# dependencies are git dependencies on GetBusbar/busbar at the fleet pin (`.busbar-ref` field 1);
-# no sibling-checkout path dependency ships in any manifest.
+# One repo per plugin, every repo a twin: this workspace is exactly two crates, the logic (the rlib a
+# busbar build links) and the thin cdylib that packages it as a droppable `kind: store` plugin
+# (crate `busbar-store-mysql-plugin`). Its one busbar dependency is busbar-contract (busbar-plugin-loader is dev-only,
+# for the both-ways conformance test), both git dependencies on GetBusbar/busbar at the pin in
+# `.busbar-ref`; no sibling-checkout path dependency ships in any manifest.
+#
+# THIRD-PARTY VERSIONS ARE THE FLEET'S, NOT THIS REPO'S. The table below is busbar's own root
+# `[workspace.dependencies]` (third-party rows) at busbar 0db7ee2ea048217ea3fc10f0d92fbda19ee1f133, followed by the plugin-only rows
+# of busbar's `.github/fleet/deps.toml` at 0db7ee2ea048217ea3fc10f0d92fbda19ee1f133. A member takes a crate with
+# `{ workspace = true }` (adding features if it needs them); a crate in neither table is a new
+# `deps.toml` row in busbar first. CI holds this repo's Cargo.lock to busbar's lock at the pin.
 [workspace]
 resolver = "2"
 members = [
@@ -25,3 +31,88 @@ repository = "https://github.com/GetBusbar/busbar-store-mysql"
 [workspace.dependencies]
 busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "0db7ee2ea048217ea3fc10f0d92fbda19ee1f133" }
 busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "0db7ee2ea048217ea3fc10f0d92fbda19ee1f133" }
+# busbar's root [workspace.dependencies], third-party rows, at 0db7ee2ea048217ea3fc10f0d92fbda19ee1f133
+a2a-lf = "0.3.0"
+a2a-pb = "0.2.0"
+arc-swap = "1"
+async-trait = "0.1"
+axum = "0.8"
+base64 = "0.22"
+bumpalo = "3"
+bytes = "1"
+core_affinity = "0.8"
+crc32fast = "1"
+criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
+dimpl = { version = "=0.7.4", default-features = false }
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+futures = "0.3"
+getrandom = "0.3"
+h2 = "0.4"
+hex = "0.4.3"
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+httpdate = "1.0"
+hyper = { version = "1", default-features = false, features = ["server", "client", "http1", "http2"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "webpki-tokio"] }
+hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "http2", "server-auto", "server-graceful", "service", "tokio"] }
+idna_adapter = "=1.1.0"
+indexmap = { version = "2", features = ["serde"] }
+jsonschema = { version = "0.49", default-features = false }
+libc = "0.2"
+libloading = "0.9"
+log = "0.4"
+loom = "0.7"
+memchr = "2"
+metrics = "0.24.6"
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
+metrics-util = { version = "0.20.4", default-features = false }
+oauth-as = { version = "1.0.0", features = ["http", "jwt", "consent", "resource-metadata", "par", "dpop", "client-assertion"] }
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "trace"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+proptest = "1"
+prost = { version = "0.14", default-features = false, features = ["std"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+ring = "0.17"
+rmcp = { version = "3.1.2", default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = { version = "1", default-features = false, features = ["std"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_urlencoded = "0.7"
+serde_yaml = { package = "serde_yaml_ng", version = "0.10" }
+sha2 = "0.10"
+smallvec = "1"
+socket2 = { version = "0.6", features = ["all"] }
+sonic-rs = "0.5"
+syn = { version = "2", features = ["full", "visit", "parsing", "printing"] }
+tar = { version = "0.4", default-features = false }
+tikv-jemalloc-ctl = "0.6"
+tikv-jemallocator = "0.6"
+tokio = "1"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
+tokio-util = { version = "0.7", default-features = false, features = ["compat"] }
+tonic = { version = "0.14", default-features = false }
+tonic-types = "0.14"
+tower = "0.5"
+tracing = "0.1.44"
+tracing-core = "0.1"
+tracing-log = { version = "0.2", default-features = false, features = ["log-tracer", "std"] }
+tracing-subscriber = "0.3.23"
+tungstenite = { version = "0.29", default-features = false }
+url = "2"
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["std", "ring"] }
+webpki-roots = "1"
+zeroize = "1"
+# busbar .github/fleet/deps.toml [plugin-deps], at 0db7ee2ea048217ea3fc10f0d92fbda19ee1f133
+ldap3 = { version = "0.12", default-features = false, features = ["sync"] }
+mysql = { version = "26", default-features = false, features = ["minimal"] }
+postgres = "0.19"
+redis = { version = "1", default-features = false, features = ["script"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+ulid = "1"
+
