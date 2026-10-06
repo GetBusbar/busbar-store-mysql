@@ -10,7 +10,7 @@
 //! module doc) and MySQL's `information_schema.tables` for the boot-time schema-existence poll.
 //!
 //!   1. Boot a real `busbar` process (no `--validate`) with its admin listener up and the compiled-in
-//!      `memory` store active (`store:` block absent).
+//!      `memory` store active (`store: {module: memory}`: busbar 1.6.0 requires the block).
 //!   2. `POST /api/v1/admin/plugins` with the REAL built cdylib, base64-encoded, guarded by a real
 //!      `x-admin-token` — the exact wire shape `crates/busbar/src/admin/v1/json/handlers.rs`'s
 //!      `install_plugin` uses.
@@ -485,9 +485,14 @@ fn install_over_admin_api_then_mint_a_key_and_verify_mysql_directly() {
         plugins_dir.display()
     );
 
-    // BOOT #1: compiled-in `memory` store — the mysql plugin is not on disk yet.
+    // BOOT #1: compiled-in `memory` store — the mysql plugin is not on disk yet. busbar 1.6.0
+    // refuses a config with no `store:` block (BUSBAR-9007), so it is named.
     let config1 = work.join("config1.yaml");
-    std::fs::write(&config1, &providers_and_common).unwrap();
+    std::fs::write(
+        &config1,
+        format!("{providers_and_common}store:\n  module: memory\n"),
+    )
+    .unwrap();
 
     let mut guard1 = spawn_busbar(
         Command::new(&busbar_bin)

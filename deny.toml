@@ -1,5 +1,5 @@
 # RENDERED by `busbar-release plugin sync` from GetBusbar/busbar-release template/ and busbar's
-# `.github/fleet/deps.toml` at 0db7ee2ea048217ea3fc10f0d92fbda19ee1f133; a hand edit is overwritten by the next sync. CI runs
+# `.github/fleet/deps.toml` at 7c6d8b4b4d0e352dc57777c04f49571ec5b5be23; a hand edit is overwritten by the next sync. CI runs
 # `cargo deny check` on it (busbar's plugin-ci.yml at the pin). The license allowlist is busbar's own;
 # the one reviewed git source is busbar itself, at the pin.
 [graph]
@@ -98,8 +98,6 @@ deny = [
     { crate = "httpdate:>=2.0.0", reason = "busbar resolves httpdate to 1.0.3; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "hyper:<1.0.0", reason = "busbar resolves hyper to 1.11.1; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "hyper:>=2.0.0", reason = "busbar resolves hyper to 1.11.1; a plugin may not pull a second version (OWNER 2026-10-02)" },
-    { crate = "hyper-rustls:<0.27.0", reason = "busbar resolves hyper-rustls to 0.27.9; a plugin may not pull a second version (OWNER 2026-10-02)" },
-    { crate = "hyper-rustls:>=0.28.0", reason = "busbar resolves hyper-rustls to 0.27.9; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "hyper-util:<0.1.0", reason = "busbar resolves hyper-util to 0.1.20; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "hyper-util:>=0.2.0", reason = "busbar resolves hyper-util to 0.1.20; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "idna_adapter:<1.0.0", reason = "busbar resolves idna_adapter to 1.1.0; a plugin may not pull a second version (OWNER 2026-10-02)" },
@@ -243,4 +241,4 @@ skip = [
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = ["https://github.com/GetBusbar/busbar"]
+allow-git = ["https://github.com/GetBusbar/busbar", "https://www.github.com/GetBusbar/busbar", "https://github.com/GetBusbar/busbar-transport-tcp"]

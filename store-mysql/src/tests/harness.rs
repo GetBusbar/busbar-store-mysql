@@ -27,7 +27,7 @@ use busbar_contract::records::{AuditRecord, PlaneRecordRef, RecordStoreResult, U
 use busbar_contract::store_calls::{StoreCalls, StoreFailure};
 use busbar_plugin_loader::dispatch::kinds::store::Store;
 use busbar_plugin_loader::dispatch::{
-    load_linked, Bind, DispatchConfig, Dispatcher, LinkedRow, NoSink,
+    load_linked, Bind, ConnTable, DispatchConfig, Dispatcher, LinkedRow, NoSink,
 };
 use busbar_plugin_loader::store_v3::LoadedStore;
 use busbar_plugin_loader::tcp_conns::TcpConns;
@@ -101,7 +101,7 @@ pub(crate) fn open_loaded(settings: &str) -> Result<LoadedStore, String> {
             max_inflight_cap: 64,
             sink: Arc::new(NoSink),
             dispatcher: d.adopter(),
-            conns: Some(conns.clone()),
+            conns: ConnTable::Host(conns.clone()),
         },
     )
     .map_err(|e| e.to_string())?;

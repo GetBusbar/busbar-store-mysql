@@ -22,6 +22,77 @@
 //! failure; unset locally: skipped with a line saying so). Everything else needs no database and
 //! always runs. A missing cdylib PANICS: this test IS the dropped-in door's proof.
 
+// THE PUBLISHED SUITE (busbar-plugin-loader's `conformance` feature, at the pin): the linked door and
+// the built cdylib, each through the one loader, driven by the store kind's script over the live
+// MySQL `conformance.json` names; exact crossing counts, the two folds equal, its RED arms.
+//
+// THE HOST: the store's one `tcp` need is served by busbar's own connector, composed as the root
+// composes it (`conformance_host`, rendered by the fleet template). No `tls:`: the store has no TLS
+// option (its URL names none, and one that does is refused, as 1.5.5's was).
+//
+// Each fold opens over a DATABASE of its own: conformance.json's url names `{fold}` as its database,
+// and the hooks below create that database before the fold and drop it after, on an independent
+// connection of the `mysql` driver. The service's store user may not create a database, so the hooks
+// connect as the server's root (a test-only account: `BUSBAR_TEST_MYSQL_ROOT_PASSWORD`, the service
+// container's `busbar` when unset) and grant the settings' user the fold's database. The store never
+// creates a database; nothing in its behaviour changes.
+#[path = "support/conformance_host.rs"]
+mod conformance_host;
+
+busbar_plugin_loader::conformance_suite! {
+    door: busbar_store_mysql::door,
+    cdylib: "busbar_store_mysql_plugin",
+    inputs: include_str!("conformance.json"),
+    host: conformance_host::host,
+    namespace: (create_fold_database, drop_fold_database),
+}
+
+/// The live server a fold's filled settings name, as the server's root on a connection of the
+/// `mysql` driver's own, and the settings' user (the one the store connects as).
+fn fold_root(settings: &[u8]) -> (mysql::Conn, String) {
+    let v: serde_json::Value =
+        serde_json::from_slice(settings).expect("conformance.json's settings are JSON");
+    let url = v["url"]
+        .as_str()
+        .expect("conformance.json's settings name a url");
+    let opts = mysql::Opts::from_url(url).expect("conformance.json's url is a mysql url");
+    let user = opts.get_user().unwrap_or_default().to_owned();
+    let password =
+        std::env::var("BUSBAR_TEST_MYSQL_ROOT_PASSWORD").unwrap_or_else(|_| "busbar".to_owned());
+    let root = mysql::OptsBuilder::from_opts(opts)
+        .user(Some("root"))
+        .pass(Some(password))
+        .db_name(None::<String>);
+    let conn = mysql::Conn::new(root).expect("the live MySQL accepts the test client as root");
+    (conn, user)
+}
+
+/// The suite's namespace hook: the fold's database, made before its open, its whole use granted to
+/// the user the store connects as.
+fn create_fold_database(namespace: &str, settings: &[u8]) {
+    use mysql::prelude::Queryable;
+    let (mut root, user) = fold_root(settings);
+    root.query_drop(format!("CREATE DATABASE IF NOT EXISTS `{namespace}`"))
+        .expect("the fold's database is created");
+    root.query_drop(format!(
+        "GRANT ALL PRIVILEGES ON `{namespace}`.* TO '{user}'@'%'"
+    ))
+    .expect("the fold's database is granted to the store's user");
+}
+
+/// The suite's namespace hook: the fold's database and everything the store made in it, dropped
+/// after the fold, and its grant revoked.
+fn drop_fold_database(namespace: &str, settings: &[u8]) {
+    use mysql::prelude::Queryable;
+    let (mut root, user) = fold_root(settings);
+    root.query_drop(format!("DROP DATABASE IF EXISTS `{namespace}`"))
+        .expect("the fold's database is dropped");
+    root.query_drop(format!(
+        "REVOKE ALL PRIVILEGES ON `{namespace}`.* FROM '{user}'@'%'"
+    ))
+    .expect("the fold's grant is revoked");
+}
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -35,8 +106,8 @@ use busbar_contract::store_calls::StoreCalls;
 use busbar_plugin_loader::dispatch::kinds::secret::Secret;
 use busbar_plugin_loader::dispatch::kinds::store::Store;
 use busbar_plugin_loader::dispatch::{
-    load_dropped, load_linked, rendering_of_library, Bind, DispatchConfig, Dispatcher, LinkedRow,
-    NoSink, Plugin,
+    load_dropped, load_linked, rendering_of_library, Bind, ConnTable, DispatchConfig, Dispatcher,
+    LinkedRow, NoSink, Plugin,
 };
 use busbar_plugin_loader::store_v3::LoadedStore;
 
@@ -82,7 +153,7 @@ fn bind(d: &Dispatcher) -> Bind {
         max_inflight_cap: 64,
         sink: Arc::new(NoSink),
         dispatcher: d.adopter(),
-        conns: Some(conns),
+        conns: ConnTable::Host(conns),
     }
 }
 

@@ -1,6 +1,9 @@
 {
   "contract_abi": {
-    "min": 4,
-    "max": 4
-  }
+    "min": 3,
+    "max": 3
+  },
+  "needs": [
+    "tcp"
+  ]
 }

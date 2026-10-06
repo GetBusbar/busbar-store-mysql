@@ -24,13 +24,13 @@ busbar-contract = { workspace = true }
 # handshake, mysql_native_password / caching_sha2_password, `Value`/`Row`/`FromRow`, `params!`), so
 # every parameter and column converts exactly as it did over the driver. `src/mysqlwire.rs` is the
 # driver's connection logic, every byte over the op's wire.
-mysql_common = { version = "0.35", default-features = false }
+mysql_common = { workspace = true }
 # The compressed protocol's deflate (`compress=` in the URL), pure Rust (busbar's own flate2 row).
 flate2 = { workspace = true }
 bytes = { workspace = true }
 # The 1.5.5 driver's URL reading (`mysql://...`): pure parsing, no socket.
 url = { workspace = true }
-percent-encoding = "2"
+percent-encoding = { workspace = true }
 serde_json = { workspace = true }
 [dev-dependencies]
 # The `Store` contract conformance suite used to arrive here as `busbar-plugin-testkit`; the owner
@@ -45,4 +45,4 @@ ulid = { workspace = true }
 # (`TcpConns`, `test-support`). The 1.5.5 `mysql` driver verifies what landed INDEPENDENTLY of the
 # store (tests only; never in the shipped image).
 busbar-plugin-loader = { workspace = true, features = ["test-support"] }
-mysql = { version = "28", default-features = false, features = ["minimal-rust"] }
+mysql = { workspace = true }
