@@ -29,7 +29,7 @@
 use busbar_contract::records::RecordStore;
 use busbar_plugin_loader::dispatch::kinds::store::Store;
 use busbar_plugin_loader::dispatch::{
-    load_dropped, rendering_of_library, Bind, DispatchConfig, Dispatcher, NoSink,
+    load_dropped, rendering_of_library, Bind, ConnTable, DispatchConfig, Dispatcher, NoSink,
 };
 use busbar_plugin_loader::store_v3::LoadedStore;
 use mysql::params;
@@ -75,7 +75,7 @@ fn host(instance: &str) -> (Arc<Dispatcher>, Bind) {
         max_inflight_cap: 64,
         sink: Arc::new(NoSink),
         dispatcher: dispatcher.adopter(),
-        conns: Some(conns),
+        conns: ConnTable::Host(conns),
     };
     (dispatcher, bind)
 }

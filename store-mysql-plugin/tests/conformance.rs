@@ -35,8 +35,8 @@ use busbar_contract::store_calls::StoreCalls;
 use busbar_plugin_loader::dispatch::kinds::secret::Secret;
 use busbar_plugin_loader::dispatch::kinds::store::Store;
 use busbar_plugin_loader::dispatch::{
-    load_dropped, load_linked, rendering_of_library, Bind, DispatchConfig, Dispatcher, LinkedRow,
-    NoSink, Plugin,
+    load_dropped, load_linked, rendering_of_library, Bind, ConnTable, DispatchConfig, Dispatcher,
+    LinkedRow, NoSink, Plugin,
 };
 use busbar_plugin_loader::store_v3::LoadedStore;
 
@@ -82,7 +82,7 @@ fn bind(d: &Dispatcher) -> Bind {
         max_inflight_cap: 64,
         sink: Arc::new(NoSink),
         dispatcher: d.adopter(),
-        conns: Some(conns),
+        conns: ConnTable::Host(conns),
     }
 }
 
