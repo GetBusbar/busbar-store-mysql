@@ -8,6 +8,6 @@
     "usage": { "bucket": "conf-usage", "window": 1700000000 },
     "stream": "conf-stream",
     "schema": "conf-schema",
-    "keys": { "grouped": "vk_conf_grouped", "group": "conf-group", "plain": "vk_conf_plain", "absent": "vk_conf_absent" }
+    "keys": { "grouped": "a", "group": "conf-group", "plain": "z", "absent": "vk_conf_absent" }
   }
 }

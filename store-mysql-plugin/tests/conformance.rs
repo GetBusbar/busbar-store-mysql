@@ -36,6 +36,11 @@
 // connect as the server's root (a test-only account: `BUSBAR_TEST_MYSQL_ROOT_PASSWORD`, the service
 // container's `busbar` when unset) and grant the settings' user the fold's database. The store never
 // creates a database; nothing in its behaviour changes.
+//
+// THE KEY IDS: this store's `usage_metering.key_id` is a FOREIGN KEY to `api_keys` (a metering row
+// names a key that exists), and the store kind's script meters keys `a` and `z` without putting
+// them; so conformance.json's `keys.grouped` and `keys.plain` ARE `a` and `z`, put (and tombstoned,
+// never removed) before the script meters them.
 #[path = "support/conformance_host.rs"]
 mod conformance_host;
 
