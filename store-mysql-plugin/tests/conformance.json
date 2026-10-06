@@ -1,0 +1,13 @@
+{
+  "settings": { "url": "mysql://busbar:busbar@127.0.0.1:3306/{fold}" },
+  "store": {
+    "credential_kind": "sigv4",
+    "node": 7,
+    "caps": { "bucket": "conf-cap", "window_start": 1700000000000, "requests": 3, "input": 100 },
+    "draw": { "requests": 2, "input": 60 },
+    "usage": { "bucket": "conf-usage", "window": 1700000000 },
+    "stream": "conf-stream",
+    "schema": "conf-schema",
+    "keys": { "grouped": "vk_conf_grouped", "group": "conf-group", "plain": "vk_conf_plain", "absent": "vk_conf_absent" }
+  }
+}
