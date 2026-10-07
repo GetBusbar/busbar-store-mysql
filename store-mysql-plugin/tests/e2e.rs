@@ -329,6 +329,7 @@ fn build_real_binaries() -> (PathBuf, PathBuf) {
             "--bin",
             "busbar-plugin-pack",
         ])
+        .env("BUSBAR_RELEASE_PUBKEY", E2E_RELEASE_PUBKEY)
         .current_dir(&root)
         .status()
         .expect("run cargo build for busbar + busbar-plugin-pack");
@@ -345,6 +346,33 @@ fn build_real_binaries() -> (PathBuf, PathBuf) {
         target.join("release/busbar"),
         target.join("release/busbar-plugin-pack"),
     )
+}
+
+/// THE TEST-ONLY FIRST-PARTY KEYPAIR (ed25519, `busbar-plugin-pack keygen`), never the release key.
+/// busbar grants the `operator-infrastructure` egress class this store's `tcp` need declares to a
+/// FIRST-PARTY plugin only (`busbar_plugin_loader::sign::egress_grant`): the busbar built here
+/// embeds the public half (`BUSBAR_RELEASE_PUBKEY`, compile time, as busbar's signing gate builds
+/// it) and the tarball is signed with the private half, so the plugin under test is first-party.
+/// Fixed, so the cached busbar build is reused across runs.
+const E2E_RELEASE_PUBKEY: &str = "9209607c315f66473c8cca8bf9a7b8031115d01bb47341613cebf57f0e4f271c";
+const E2E_RELEASE_PRIVKEY: &str =
+    "290f2453f236650ab21b85a95d49b9dab088518e829e4d524b01e441636ab327";
+
+/// The built busbar's version (`busbar --version`): a first-party plugin below it is refused by
+/// the first-party anti-downgrade floor, so the tarball is packed at exactly this version.
+fn busbar_version(busbar_bin: &std::path::Path) -> String {
+    let out = Command::new(busbar_bin)
+        .arg("--version")
+        .output()
+        .expect("run busbar --version");
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.split_whitespace()
+        .find_map(|w| {
+            let v = w.trim_start_matches('v');
+            (v.split('.').count() == 3 && v.split('.').all(|p| p.parse::<u64>().is_ok()))
+                .then(|| v.to_owned())
+        })
+        .unwrap_or_else(|| panic!("busbar --version names no version: {text}"))
 }
 
 /// THE REAL END-TO-END INSTALL PROOF: pack the plugin, drop it in a real `plugins.dir`, run the real
@@ -370,8 +398,8 @@ fn load_and_exercise_mysql_plugin_via_file_drop() {
     let plugins_dir = work.join("plugins");
     std::fs::create_dir_all(&plugins_dir).unwrap();
 
-    // Pack the real cdylib into a real signed-shape tarball via the same tool CI's SIGNOFF step
-    // uses, --allow-unsigned locally exactly like CI's own unsigned-key fallback.
+    // Pack the real cdylib into a real signed tarball via the same tool CI's SIGNOFF step uses,
+    // signed first-party with the test keypair (`E2E_RELEASE_PRIVKEY`) the busbar above embeds.
     let tarball = work.join("store-mysql.tar.gz");
     let status = Command::new(&pack_bin)
         .args([
@@ -385,7 +413,7 @@ fn load_and_exercise_mysql_plugin_via_file_drop() {
             "--kind",
             "store",
             "--version",
-            "0.0.0-e2e",
+            busbar_version(&busbar_bin).as_str(),
             "--publisher",
             "busbar",
             "--description",
@@ -394,8 +422,8 @@ fn load_and_exercise_mysql_plugin_via_file_drop() {
             "Apache-2.0",
             "--out",
             tarball.to_str().unwrap(),
-            "--allow-unsigned",
         ])
+        .env("BUSBAR_SIGN_KEY", E2E_RELEASE_PRIVKEY)
         .status()
         .expect("run busbar-plugin-pack");
     assert!(status.success(), "packing the plugin must succeed");

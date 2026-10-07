@@ -226,6 +226,7 @@ impl Opened {
             name: plugin.name().to_owned(),
             claims: stated.claims,
             composes_over: stated.composes_over,
+            status_rows: stated.status_rows,
         };
         Self { plugin, facts }
     }
