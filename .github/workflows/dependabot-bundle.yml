@@ -1,4 +1,4 @@
-# RENDERED by `busbar-release plugin sync busbar-store-mysql` from GetBusbar/busbar-release template/; a hand
+# RENDERED by `busbar-release plugin heal busbar-store-mysql` from GetBusbar/busbar-release template/; a hand
 # edit is overwritten by the next sync (DEPENDABOT-ONE).
 # dependabot-bundle: every open dependabot PR (whatever its base today) is merged into ONE branch (deps/bundle),
 # which carries ONE PR with auto-merge on. Merged PRs are closed with a link; a PR that conflicts

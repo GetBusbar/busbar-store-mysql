@@ -1,4 +1,4 @@
-# RENDERED by `busbar-release plugin sync busbar-store-mysql` from GetBusbar/busbar-release template/; a hand
+# RENDERED by `busbar-release plugin heal busbar-store-mysql` from GetBusbar/busbar-release template/; a hand
 # edit is overwritten by the next sync. THIS REPO TESTS ITSELF AGAINST BUSBAR with the fleet's ONE
 # harness: busbar's reusable plugin-ci.yml, taken at the busbar commit this repo pins (.busbar-ref), so
 # the CI logic, the gates (busbar scripts/fleet/plugin-gates.py), the dependency policy

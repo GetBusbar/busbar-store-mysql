@@ -1,4 +1,4 @@
-# RENDERED by `busbar-release plugin sync` from GetBusbar/busbar-release template/; a hand edit is
+# RENDERED by `busbar-release plugin heal` from GetBusbar/busbar-release template/; a hand edit is
 # overwritten by the next sync. CI (busbar's plugin-ci.yml at the pin) runs clippy with -D warnings on
 # the 1.98.0 toolchain; the MSRV clippy judges against is each crate's own `rust-version`.
 too-many-arguments-threshold = 7

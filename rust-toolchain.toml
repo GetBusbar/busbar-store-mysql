@@ -1,4 +1,4 @@
-# RENDERED by `busbar-release plugin sync` from GetBusbar/busbar-release template/. The toolchain is
+# RENDERED by `busbar-release plugin heal` from GetBusbar/busbar-release template/. The toolchain is
 # busbar's own pin (its rust-toolchain.toml at the pin), so a plugin and the core that links it compile
 # with one compiler.
 [toolchain]

@@ -1,4 +1,4 @@
-# RENDERED by `busbar-release plugin sync busbar-store-mysql` from GetBusbar/busbar-release template/; a hand
+# RENDERED by `busbar-release plugin heal busbar-store-mysql` from GetBusbar/busbar-release template/; a hand
 # edit is overwritten by the next sync. Moves this repo's
 # busbar pin (busbar's plugin-repin.yml) when busbar dispatches `busbar-repin` or on demand; the
 # cut/skip decision is by commit, and the commit goes to dev only.

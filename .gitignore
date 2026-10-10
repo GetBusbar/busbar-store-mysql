@@ -1,4 +1,4 @@
-# RENDERED by `busbar-release plugin sync` from GetBusbar/busbar-release template/ (the plugins.yaml
+# RENDERED by `busbar-release plugin heal` from GetBusbar/busbar-release template/ (the plugins.yaml
 # entry's `gitignore:` lines follow the fleet's own).
 /target
 /mutants.out*
