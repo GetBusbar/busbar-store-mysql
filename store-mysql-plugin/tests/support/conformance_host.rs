@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 //
-// RENDERED by `busbar-release plugin sync busbar-store-mysql` from GetBusbar/busbar-release
+// RENDERED by `busbar-release plugin heal busbar-store-mysql` from GetBusbar/busbar-release
 // template/conformance-host/, because this repo's declares file states network needs (`needs`:
 // `tcp`); a hand edit is overwritten by the next sync.
 

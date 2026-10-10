@@ -14,7 +14,7 @@ Thanks for your interest in improving `busbar-store-mysql`.
 
 Every busbar plugin repo has the same skeleton. This one is a two-crate Cargo workspace: `store-mysql/` holds the plugin's logic and `store-mysql-plugin/` is the thin `cdylib` that packages it as a droppable `kind: store` plugin. busbar itself is a git dependency
 pinned to the commit in `.busbar-ref`. The CI, release, dependency and lint configuration
-are rendered by `busbar-release plugin sync` from the fleet template (GetBusbar/busbar-release
+are rendered by `busbar-release plugin heal` from the fleet template (GetBusbar/busbar-release
 `template/`), [busbar's plugin registry](https://github.com/GetBusbar/busbar/blob/main/plugins.yaml)
 and busbar's dependency policy (`.github/fleet/deps.toml` and the root `[workspace.dependencies]`
 at the pin); change them there, not here.

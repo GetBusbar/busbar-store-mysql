@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# RENDERED by `busbar-release plugin sync busbar-store-mysql` from GetBusbar/busbar-release template/ and
+# RENDERED by `busbar-release plugin heal busbar-store-mysql` from GetBusbar/busbar-release template/ and
 # GetBusbar/busbar's dependency policy; a hand edit is overwritten by the next sync.
 #
 # One repo per plugin, every repo a twin: this workspace is exactly two crates, the logic (the rlib a

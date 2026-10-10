@@ -1,4 +1,4 @@
-# RENDERED by `busbar-release plugin sync busbar-store-mysql` from GetBusbar/busbar-release template/; a hand
+# RENDERED by `busbar-release plugin heal busbar-store-mysql` from GetBusbar/busbar-release template/; a hand
 # edit is overwritten by the next sync. On a v* tag: this repo's own ci.yml (the fleet harness) on the
 # tagged commit, then busbar's plugin-release.yml (build, sign, pack, publish), then the consumer
 # verification of what was published, each at the busbar commit this repo pins.

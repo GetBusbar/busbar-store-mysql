@@ -1,4 +1,4 @@
-# RENDERED by `busbar-release plugin sync` from GetBusbar/busbar-release template/.
+# RENDERED by `busbar-release plugin heal` from GetBusbar/busbar-release template/.
 # Codecov is INFORMATIONAL, never a gate: the correctness gate is the `ci` workflow (busbar's
 # plugin-ci.yml at the pin). Every status is informational, there are no PR comments, and test-only paths
 # plus the busbar checkout the end-to-end tests build are excluded from the percentage.
