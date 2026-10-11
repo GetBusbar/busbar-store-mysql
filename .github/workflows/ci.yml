@@ -6,13 +6,23 @@
 name: ci
 
 on:
+  # A tree is tested once: on its pull request into dev and on the push that lands it on dev. qa and
+  # main take dev's commits by pull request whose head is that tested commit: the checks it carries
+  # from dev's run satisfy the ruleset, and nothing re-tests it. Any other head: run this by hand
+  # (workflow_dispatch) on its branch.
   push:
-    branches: [dev, qa, main]
+    branches: [dev]
   pull_request:
-    branches: [dev, qa, main]
+    branches: [dev]
   workflow_dispatch: {}
   # release.yml runs this file on the tagged commit before it publishes.
   workflow_call: {}
+
+# A newer push to a pull request cancels its older run (only the newest commit can merge); a push to
+# dev, a dispatch and release.yml's call run to the end.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
