@@ -358,23 +358,6 @@ const E2E_RELEASE_PUBKEY: &str = "9209607c315f66473c8cca8bf9a7b8031115d01bb47341
 const E2E_RELEASE_PRIVKEY: &str =
     "290f2453f236650ab21b85a95d49b9dab088518e829e4d524b01e441636ab327";
 
-/// The built busbar's version (`busbar --version`): a first-party plugin below it is refused by
-/// the first-party anti-downgrade floor, so the tarball is packed at exactly this version.
-fn busbar_version(busbar_bin: &std::path::Path) -> String {
-    let out = Command::new(busbar_bin)
-        .arg("--version")
-        .output()
-        .expect("run busbar --version");
-    let text = String::from_utf8_lossy(&out.stdout);
-    text.split_whitespace()
-        .find_map(|w| {
-            let v = w.trim_start_matches('v');
-            (v.split('.').count() == 3 && v.split('.').all(|p| p.parse::<u64>().is_ok()))
-                .then(|| v.to_owned())
-        })
-        .unwrap_or_else(|| panic!("busbar --version names no version: {text}"))
-}
-
 /// THE REAL END-TO-END INSTALL PROOF: pack the plugin, drop it in a real `plugins.dir`, run the real
 /// `busbar --validate` against a config naming `store: { module: mysql }`, and confirm real MySQL was
 /// actually touched — via the documented file-drop mechanism, never a direct `load()` call.
@@ -413,7 +396,9 @@ fn load_and_exercise_mysql_plugin_via_file_drop() {
             "--kind",
             "store",
             "--version",
-            busbar_version(&busbar_bin).as_str(),
+            // The plugin's own version, the one its Statement states: the pack tool refuses any
+            // other, and first-party plugins version on their own line (no binary-version floor).
+            env!("CARGO_PKG_VERSION"),
             "--publisher",
             "busbar",
             "--description",
