@@ -7,6 +7,15 @@ all-features = false
 
 [advisories]
 version = 2
+ignore = [
+    # RUSTSEC-2024-0449: `unsafe-libyaml` 0.2.11 is unmaintained. It reaches this plugin only through
+    # busbar-contract at the pin (busbar-contract -> serde_yaml_ng 0.10 -> unsafe-libyaml), the same
+    # line busbar's own Cargo.lock carries, and busbar's own deny.toml accepts it with this reason:
+    # "unmaintained", not a security hole, and no safe swap exists now (a different YAML parser
+    # risks 1.5.5 config-parse parity). Re-evaluate with busbar's row when serde_yaml_ng moves off
+    # unsafe-libyaml. Tracking: https://rustsec.org/advisories/RUSTSEC-2024-0449.html
+    "RUSTSEC-2024-0449",
+]
 
 [licenses]
 version = 2
