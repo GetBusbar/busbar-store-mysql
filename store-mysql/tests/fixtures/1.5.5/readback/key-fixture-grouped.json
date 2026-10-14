@@ -1,0 +1,10 @@
+{
+  "budget_period": "total",
+  "group": "fixture",
+  "id": "vk_55cb1808aabb09e6e14e517d91ce0c13",
+  "rate_headroom": null,
+  "requests": 8,
+  "spend_cents": 732,
+  "tokens": 54,
+  "window_start": 0
+}
