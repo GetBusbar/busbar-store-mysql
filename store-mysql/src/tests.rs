@@ -3773,3 +3773,268 @@ fn a_v6_development_database_carries_its_plane_state_across_once() {
         "the one-time copy must not re-run and resurrect a cleared quarantine"
     );
 }
+
+// ── Migration conformance: rows the published 1.5.5 binary wrote ────────────────────────────────
+
+// MIGRATION CONFORMANCE (busbar 1.6.0 #33 / M5): rows the PUBLISHED 1.5.5 binary wrote through the
+// published store-mysql v1.0.6 plugin read back through this build's `migrate`. The fixture in
+// `tests/fixtures/1.5.5/` was RECORDED by busbar's `scripts/store-migration-fixture.sh` driving the
+// v1.5.5 binary and the v1.0.6 plugin against mysql:8@sha256:b3b90af2... (the image plugin-ci
+// uses); the binary, plugin and image digests and every file's sha256 are in its `MANIFEST.tsv`.
+// `dump.sql` is the whole database as 1.5.5 left it (mysqldump, `--skip-comments`), `rows.json`
+// every table's rows as written.
+const FIXTURE_DUMP_1_5_5: &str = include_str!("../tests/fixtures/1.5.5/dump.sql");
+const FIXTURE_ROWS_1_5_5: &str = include_str!("../tests/fixtures/1.5.5/rows.json");
+
+fn fixture_rows(table: &str) -> Vec<serde_json::Value> {
+    let all: serde_json::Value = serde_json::from_str(FIXTURE_ROWS_1_5_5).unwrap();
+    all[table]
+        .as_array()
+        .unwrap_or_else(|| panic!("rows.json has no table {table}"))
+        .clone()
+}
+
+fn fx_u64(row: &serde_json::Value, col: &str) -> u64 {
+    row[col]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{col} is not an unsigned integer in {row}"))
+}
+
+fn fx_str<'a>(row: &'a serde_json::Value, col: &str) -> &'a str {
+    row[col]
+        .as_str()
+        .unwrap_or_else(|| panic!("{col} is not a string in {row}"))
+}
+
+/// A fresh database holding exactly what the 1.5.5 binary left. `dump.sql` is executed statement
+/// by statement on one connection (a statement ends at a line ending in `;`; mysqldump's
+/// `/*!40101 ... */;` lines are statements of their own), nothing skipped.
+fn restore_1_5_5(db: &ScratchDb) {
+    let mut c = db.conn();
+    let mut stmt = String::new();
+    for line in FIXTURE_DUMP_1_5_5.lines() {
+        if stmt.is_empty() && line.trim().is_empty() {
+            continue;
+        }
+        stmt.push_str(line);
+        stmt.push('\n');
+        if line.ends_with(';') {
+            c.query_drop(stmt.as_str())
+                .unwrap_or_else(|e| panic!("the 1.5.5 dump restores: {e}\n{stmt}"));
+            stmt.clear();
+        }
+    }
+    assert!(stmt.trim().is_empty(), "the dump ends on a statement");
+}
+
+fn schema_version_of(db: &ScratchDb) -> String {
+    let mut c = db.conn();
+    c.query_first("SELECT v FROM store_meta WHERE k = 'schema_version'")
+        .unwrap()
+        .expect("a schema_version row")
+}
+
+/// Every row of `rows.json` read back through the 1.6.0 surface, and no extra rows.
+fn assert_1_5_5_rows_read_back(store: &MysqlStore) {
+    // METERING: every row, per bucket, and nothing else.
+    let metering = fixture_rows("usage_metering");
+    assert!(!metering.is_empty(), "the fixture carries metering rows");
+    let bucket_of = |r: &serde_json::Value| -> u64 { fx_str(r, "bucket").parse().unwrap() };
+    let buckets: std::collections::BTreeSet<u64> = metering.iter().map(bucket_of).collect();
+    let mut seen = 0;
+    for bucket in &buckets {
+        let got = store.list_metering(*bucket).unwrap();
+        let want: Vec<&serde_json::Value> = metering
+            .iter()
+            .filter(|r| bucket_of(r) == *bucket)
+            .collect();
+        assert_eq!(got.len(), want.len(), "metering rows in bucket {bucket}");
+        for w in want {
+            let row = got
+                .iter()
+                .find(|g| {
+                    g.key_id == fx_str(w, "key_id")
+                        && g.model == fx_str(w, "model")
+                        && g.provider == fx_str(w, "provider")
+                })
+                .unwrap_or_else(|| panic!("metering row missing after migrate: {w}"));
+            assert_eq!(row.requests, fx_u64(w, "requests"), "{w}");
+            assert_eq!(row.billable_requests, fx_u64(w, "billable_requests"), "{w}");
+            assert_eq!(row.key_group_at_use, fx_str(w, "key_group_at_use"), "{w}");
+            assert_eq!(row.pricing_version, fx_str(w, "pricing_version"), "{w}");
+            assert_eq!(row.tokens_input, fx_u64(w, "tokens_input"), "{w}");
+            assert_eq!(row.tokens_output, fx_u64(w, "tokens_output"), "{w}");
+            assert_eq!(row.tokens_cache_read, fx_u64(w, "tokens_cache_read"), "{w}");
+            assert_eq!(
+                row.tokens_cache_write,
+                fx_u64(w, "tokens_cache_write"),
+                "{w}"
+            );
+            assert_eq!(row.priced_from_ms, 0, "a 1.5.5 row is undated: {w}");
+            assert!(row.usage_units.is_empty(), "{w}");
+            seen += 1;
+        }
+    }
+    assert_eq!(seen, metering.len());
+
+    // USAGE WINDOWS: per (bucket, window) the counts summed over its model rows, and each model's
+    // token columns under their unit names.
+    let windows = fixture_rows("usage_windows");
+    assert!(!windows.is_empty(), "the fixture carries usage windows");
+    let cells: std::collections::BTreeSet<(String, u64)> = windows
+        .iter()
+        .map(|w| {
+            (
+                fx_str(w, "bucket_id").to_string(),
+                fx_u64(w, "window_start"),
+            )
+        })
+        .collect();
+    for (bucket, start) in cells {
+        let rows: Vec<&serde_json::Value> = windows
+            .iter()
+            .filter(|w| fx_str(w, "bucket_id") == bucket && fx_u64(w, "window_start") == start)
+            .collect();
+        let got = store.get_usage(&bucket, start).unwrap();
+        assert_eq!(
+            got.requests,
+            rows.iter().map(|w| fx_u64(w, "requests")).sum::<u64>(),
+            "requests of {bucket}@{start}"
+        );
+        assert_eq!(
+            got.billable_requests,
+            rows.iter()
+                .map(|w| fx_u64(w, "billable_requests"))
+                .sum::<u64>(),
+            "billable requests of {bucket}@{start}"
+        );
+        let mut want: Vec<(String, BTreeMap<String, u64>)> = rows
+            .iter()
+            .filter(|w| !fx_str(w, "model").is_empty())
+            .map(|w| {
+                let mut m = BTreeMap::new();
+                for (unit, col) in [
+                    (UNIT_INPUT, "tokens_input"),
+                    (UNIT_OUTPUT, "tokens_output"),
+                    (UNIT_CACHE_READ, "tokens_cache_read"),
+                    (UNIT_CACHE_WRITE, "tokens_cache_write"),
+                ] {
+                    let v = fx_u64(w, col);
+                    if v != 0 {
+                        m.insert(unit.to_string(), v);
+                    }
+                }
+                (fx_str(w, "model").to_string(), m)
+            })
+            .collect();
+        let mut have: Vec<(String, BTreeMap<String, u64>)> = got
+            .models
+            .iter()
+            .map(|m| (m.model.clone(), m.usage_units.clone()))
+            .collect();
+        want.sort();
+        have.sort();
+        assert_eq!(have, want, "models of {bucket}@{start}");
+    }
+
+    // KEYS.
+    let keys = fixture_rows("api_keys");
+    assert!(!keys.is_empty(), "the fixture carries keys");
+    assert_eq!(store.list_keys().unwrap().len(), keys.len());
+    for k in &keys {
+        let got = store
+            .get_key(fx_str(k, "id"))
+            .unwrap()
+            .unwrap_or_else(|| panic!("key missing after migrate: {k}"));
+        assert_eq!(got.name, fx_str(k, "name"), "{k}");
+        assert_eq!(got.generation_hash, fx_str(k, "generation_hash"), "{k}");
+        assert_eq!(got.enabled, fx_u64(k, "enabled") != 0, "{k}");
+        let group = fx_str(k, "key_group");
+        assert_eq!(
+            got.group.as_deref(),
+            (!group.is_empty()).then_some(group),
+            "{k}"
+        );
+        assert_eq!(got.created_at, fx_u64(k, "created_at"), "{k}");
+        assert_eq!(got.revision, fx_u64(k, "revision"), "{k}");
+        assert_eq!(got.expires_at, k["expires_at"].as_u64(), "{k}");
+        assert_eq!(got.deleted_at, k["deleted_at"].as_u64(), "{k}");
+        assert!(k["allowed_pools"].is_null() && got.allowed_scopes.is_none());
+        assert!(got.labels.is_empty(), "{k}");
+        assert_eq!(
+            (got.idp_subject, got.binding_mode, got.minted_by),
+            (None, None, None),
+            "{k}"
+        );
+    }
+
+    // AUDIT: the hash chain, verbatim and in order.
+    let audit = fixture_rows("audit_log");
+    assert!(!audit.is_empty(), "the fixture carries audit rows");
+    let got = store.list_audit().unwrap();
+    assert_eq!(got.len(), audit.len());
+    for (g, w) in got.iter().zip(&audit) {
+        assert_eq!(g.seq, fx_u64(w, "seq"), "{w}");
+        assert_eq!(g.ts, fx_u64(w, "ts"), "{w}");
+        assert_eq!(g.action, fx_str(w, "action"), "{w}");
+        assert_eq!(g.resource, fx_str(w, "resource"), "{w}");
+        assert_eq!(g.outcome, fx_str(w, "outcome"), "{w}");
+        assert_eq!(g.principal, fx_str(w, "principal"), "{w}");
+        assert_eq!(g.prev_hash, fx_str(w, "prev_hash"), "{w}");
+        assert_eq!(g.hash, fx_str(w, "hash"), "{w}");
+    }
+}
+
+/// Every read the assertions above make, as text, so two opens compare whole.
+fn read_everything_1_5_5(store: &MysqlStore) -> Vec<String> {
+    let mut out = vec![
+        format!("{:?}", store.list_keys().unwrap()),
+        format!("{:?}", store.list_audit().unwrap()),
+    ];
+    for r in fixture_rows("usage_metering") {
+        let bucket: u64 = fx_str(&r, "bucket").parse().unwrap();
+        out.push(format!("{:?}", store.list_metering(bucket).unwrap()));
+    }
+    for w in fixture_rows("usage_windows") {
+        out.push(format!(
+            "{:?}",
+            store
+                .get_usage(fx_str(&w, "bucket_id"), fx_u64(&w, "window_start"))
+                .unwrap()
+        ));
+    }
+    out
+}
+
+/// Rows written by the 1.5.5 binary read back through this build's migrate, field for field.
+#[test]
+fn the_1_5_5_binarys_rows_read_back_through_migrate() {
+    let _ddl_guard = lock_fresh_database_ddl();
+    let Some(db) = ScratchDb::new("fx155") else {
+        return;
+    };
+    restore_1_5_5(&db);
+    let store = MysqlStore::connect(&db.url).expect("this build opens the 1.5.5 database");
+    assert_eq!(schema_version_of(&db), SCHEMA_VERSION.to_string());
+    assert_1_5_5_rows_read_back(&store);
+}
+
+/// A second open over the migrated 1.5.5 database changes nothing.
+#[test]
+fn migrate_over_the_1_5_5_rows_is_idempotent() {
+    let _ddl_guard = lock_fresh_database_ddl();
+    let Some(db) = ScratchDb::new("fx155i") else {
+        return;
+    };
+    restore_1_5_5(&db);
+    let first = {
+        let store = MysqlStore::connect(&db.url).expect("first open");
+        assert_eq!(schema_version_of(&db), SCHEMA_VERSION.to_string());
+        assert_1_5_5_rows_read_back(&store);
+        read_everything_1_5_5(&store)
+    };
+    let store = MysqlStore::connect(&db.url).expect("second open");
+    assert_eq!(schema_version_of(&db), SCHEMA_VERSION.to_string());
+    assert_1_5_5_rows_read_back(&store);
+    assert_eq!(read_everything_1_5_5(&store), first);
+}
