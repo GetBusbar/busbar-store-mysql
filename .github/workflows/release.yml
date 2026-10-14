@@ -25,7 +25,7 @@ jobs:
     secrets: inherit
   release:
     needs: ci
-    uses: GetBusbar/busbar/.github/workflows/plugin-release.yml@7356bbfb6baeb0e9245a59dc74f8b4bfadb2c5a4
+    uses: GetBusbar/busbar/.github/workflows/plugin-release.yml@1d111f29049842e66f4ce3419e1219302a249b4f
     with:
       plugin_crate: busbar-store-mysql-plugin
       manifest_name: busbar-store-mysql
@@ -42,7 +42,7 @@ jobs:
   consumer-verify:
     needs: release
     if: ${{ !cancelled() }}
-    uses: GetBusbar/busbar/.github/workflows/plugin-consumer-verify.yml@7356bbfb6baeb0e9245a59dc74f8b4bfadb2c5a4
+    uses: GetBusbar/busbar/.github/workflows/plugin-consumer-verify.yml@1d111f29049842e66f4ce3419e1219302a249b4f
     with:
       version: ${{ github.ref_name }}
       asset_prefix: busbar-store-mysql
