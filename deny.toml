@@ -1,5 +1,5 @@
 # RENDERED by `busbar-release plugin heal` from GetBusbar/busbar-release template/ and busbar's
-# `.github/fleet/deps.toml` at 7356bbfb6baeb0e9245a59dc74f8b4bfadb2c5a4; a hand edit is overwritten by the next sync. CI runs
+# `.github/fleet/deps.toml` at 565f24f25e42370f3f8b5d8b2d91d56950eb4866; a hand edit is overwritten by the next sync. CI runs
 # `cargo deny check` on it (busbar's plugin-ci.yml at the pin). The license allowlist is busbar's own;
 # the one reviewed git source is busbar itself, at the pin.
 [graph]
@@ -61,10 +61,6 @@ deny = [
     { crate = "rustls:<0.23", reason = "one rustls major (0.23) fleet-wide" },
     { crate = "ring:<0.17", reason = "one ring major (0.17) fleet-wide" },
     { crate = "serde_yaml", reason = "unmaintained; busbar uses serde_yaml_ng" },
-    { crate = "a2a-lf:<0.3.0", reason = "busbar resolves a2a-lf to 0.3.0; a plugin may not pull a second version (OWNER 2026-10-02)" },
-    { crate = "a2a-lf:>=0.4.0", reason = "busbar resolves a2a-lf to 0.3.0; a plugin may not pull a second version (OWNER 2026-10-02)" },
-    { crate = "a2a-pb:<0.2.0", reason = "busbar resolves a2a-pb to 0.2.0; a plugin may not pull a second version (OWNER 2026-10-02)" },
-    { crate = "a2a-pb:>=0.3.0", reason = "busbar resolves a2a-pb to 0.2.0; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "arc-swap:<1.0.0", reason = "busbar resolves arc-swap to 1.9.2; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "arc-swap:>=2.0.0", reason = "busbar resolves arc-swap to 1.9.2; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "async-trait:<0.1.0", reason = "busbar resolves async-trait to 0.1.92; a plugin may not pull a second version (OWNER 2026-10-02)" },
@@ -147,10 +143,8 @@ deny = [
     { crate = "reqwest:>=0.13.0", reason = "busbar resolves reqwest to 0.12.28; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "ring:<0.17.0", reason = "busbar resolves ring to 0.17.14; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "ring:>=0.18.0", reason = "busbar resolves ring to 0.17.14; a plugin may not pull a second version (OWNER 2026-10-02)" },
-    { crate = "rmcp:<3.0.0", reason = "busbar resolves rmcp to 3.1.2; a plugin may not pull a second version (OWNER 2026-10-02)" },
-    { crate = "rmcp:>=4.0.0", reason = "busbar resolves rmcp to 3.1.2; a plugin may not pull a second version (OWNER 2026-10-02)" },
-    { crate = "rustls:<0.23.0", reason = "busbar resolves rustls to 0.23.45; a plugin may not pull a second version (OWNER 2026-10-02)" },
-    { crate = "rustls:>=0.24.0", reason = "busbar resolves rustls to 0.23.45; a plugin may not pull a second version (OWNER 2026-10-02)" },
+    { crate = "rustls:<0.23.0", reason = "busbar resolves rustls to 0.23.46; a plugin may not pull a second version (OWNER 2026-10-02)" },
+    { crate = "rustls:>=0.24.0", reason = "busbar resolves rustls to 0.23.46; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "rustls-pki-types:<1.0.0", reason = "busbar resolves rustls-pki-types to 1.15.1; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "rustls-pki-types:>=2.0.0", reason = "busbar resolves rustls-pki-types to 1.15.1; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "schemars:<1.0.0", reason = "busbar resolves schemars to 1.2.2; a plugin may not pull a second version (OWNER 2026-10-02)" },
@@ -187,10 +181,6 @@ deny = [
     { crate = "tokio-tungstenite:>=0.30.0", reason = "busbar resolves tokio-tungstenite to 0.29.0; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "tokio-util:<0.7.0", reason = "busbar resolves tokio-util to 0.7.18; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "tokio-util:>=0.8.0", reason = "busbar resolves tokio-util to 0.7.18; a plugin may not pull a second version (OWNER 2026-10-02)" },
-    { crate = "tonic:<0.14.0", reason = "busbar resolves tonic to 0.14.6; a plugin may not pull a second version (OWNER 2026-10-02)" },
-    { crate = "tonic:>=0.15.0", reason = "busbar resolves tonic to 0.14.6; a plugin may not pull a second version (OWNER 2026-10-02)" },
-    { crate = "tonic-types:<0.14.0", reason = "busbar resolves tonic-types to 0.14.6; a plugin may not pull a second version (OWNER 2026-10-02)" },
-    { crate = "tonic-types:>=0.15.0", reason = "busbar resolves tonic-types to 0.14.6; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "tower:<0.5.0", reason = "busbar resolves tower to 0.5.3; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "tower:>=0.6.0", reason = "busbar resolves tower to 0.5.3; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "tracing:<0.1.0", reason = "busbar resolves tracing to 0.1.44; a plugin may not pull a second version (OWNER 2026-10-02)" },
