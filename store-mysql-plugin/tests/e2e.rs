@@ -358,23 +358,6 @@ const E2E_RELEASE_PUBKEY: &str = "9209607c315f66473c8cca8bf9a7b8031115d01bb47341
 const E2E_RELEASE_PRIVKEY: &str =
     "290f2453f236650ab21b85a95d49b9dab088518e829e4d524b01e441636ab327";
 
-/// The built busbar's version (`busbar --version`): a first-party plugin below it is refused by
-/// the first-party anti-downgrade floor, so the tarball is packed at exactly this version.
-fn busbar_version(busbar_bin: &std::path::Path) -> String {
-    let out = Command::new(busbar_bin)
-        .arg("--version")
-        .output()
-        .expect("run busbar --version");
-    let text = String::from_utf8_lossy(&out.stdout);
-    text.split_whitespace()
-        .find_map(|w| {
-            let v = w.trim_start_matches('v');
-            (v.split('.').count() == 3 && v.split('.').all(|p| p.parse::<u64>().is_ok()))
-                .then(|| v.to_owned())
-        })
-        .unwrap_or_else(|| panic!("busbar --version names no version: {text}"))
-}
-
 /// THE REAL END-TO-END INSTALL PROOF: pack the plugin, drop it in a real `plugins.dir`, run the real
 /// `busbar --validate` against a config naming `store: { module: mysql }`, and confirm real MySQL was
 /// actually touched — via the documented file-drop mechanism, never a direct `load()` call.
@@ -413,7 +396,9 @@ fn load_and_exercise_mysql_plugin_via_file_drop() {
             "--kind",
             "store",
             "--version",
-            busbar_version(&busbar_bin).as_str(),
+            // The release version is the plugin's own, the one its Statement states (the pack tool
+            // refuses any other).
+            env!("CARGO_PKG_VERSION"),
             "--publisher",
             "busbar",
             "--description",
@@ -992,10 +977,8 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
 }
 
 /// A key granting a NON-`pool` scope kind round-trips ACROSS THE PLUGIN ABI. The store response is
-/// serialized INSIDE the cdylib, whose scope-kind wire registry the engine's boot registration never
-/// reaches; before the store registered the kinds it reads, `get_key`/`list_keys` on such a key
-/// failed with "scope kind 'mcp_server' has no registered wire field" — and the engine's governance
-/// boot, which lists every key, refused to start against this backend.
+/// serialized INSIDE the cdylib, and the wire carries every scope kind as data: `get_key` and
+/// `list_keys` on such a key answer it back unchanged, with no registry on either side.
 #[test]
 fn a_non_pool_scope_grant_crosses_the_plugin_abi() {
     use busbar_contract::records::{ScopeRef, VirtualKey};
@@ -1023,7 +1006,6 @@ fn a_non_pool_scope_grant_crosses_the_plugin_abi() {
         created_at: 1_000,
         ..Default::default()
     };
-    busbar_contract::records::register_scope_kind("mcp_server"); // the engine side registers it at boot
     store
         .put_key(&key)
         .expect("put a key with an mcp_server grant");
