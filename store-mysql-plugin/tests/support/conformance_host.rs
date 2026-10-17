@@ -103,7 +103,10 @@ pub fn anchors() -> &'static str {
 /// # Panics
 /// The anchors do not parse, a transport door does not load or open, or the view does not compose.
 #[must_use]
-pub fn host(wake: Arc<dyn Fn(u64) + Send + Sync>, anchors: Option<&str>) -> Arc<dyn DeclaredConns> {
+pub fn host(
+    wake: busbar_contract::conn::ConnWake,
+    anchors: Option<&str>,
+) -> Arc<dyn DeclaredConns> {
     // The reactor a socket a plugin opens from a dispatcher worker registers on, as the root
     // installs it (`root::connector::io_reactor`): the connector's own I/O thread.
     busbar_core_connector::io::install_process_reactor(io_reactor());
@@ -236,6 +239,7 @@ impl Opened {
             composes_over: stated.composes_over,
             ported: stated.ported,
             status_rows: stated.status_rows,
+            datagram: stated.datagram,
             duplex: stated
                 .upgrades
                 .iter()
@@ -585,7 +589,7 @@ fn tls_echo() -> String {
 /// to the test CA is upgraded and round-trips (the anchors went to the host, never to the plugin).
 #[test]
 fn the_hosts_tls_upgrade_verifies_against_the_suites_test_anchors() {
-    let c = host(Arc::new(|_| {}), Some(anchors()));
+    let c = host(Arc::new(|_, _| {}), Some(anchors()));
     assert_eq!(
         upgraded_echo(c.as_ref(), &tls_echo()),
         Ok(b"hello".to_vec())
@@ -596,7 +600,7 @@ fn the_hosts_tls_upgrade_verifies_against_the_suites_test_anchors() {
 /// trust the test CA.
 #[test]
 fn red_with_the_anchors_withheld_the_hosts_tls_upgrade_is_refused() {
-    let c = host(Arc::new(|_| {}), None);
+    let c = host(Arc::new(|_, _| {}), None);
     let answer = upgraded_echo(c.as_ref(), &tls_echo());
     assert!(answer.is_err(), "upgraded over an untrusted CA: {answer:?}");
 }

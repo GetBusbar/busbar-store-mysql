@@ -1209,18 +1209,8 @@ fn assemble_scopes(
     }
     if let Some(o) = other_json {
         let other: Vec<(String, String)> = serde_json::from_str(&o).map_err(store_err)?;
-        // REGISTER every non-`pool` kind this row carries with the scope-kind wire registry of the
-        // image this code runs in. When this store runs as a PLUGIN, that is the cdylib's OWN copy
-        // of the registry, which the engine's boot-time registration (`PlaneDecl.scope_kinds`) never
-        // reaches -- so a key granting an `mcp_server` or `agent` scope could not be serialized back
-        // across the store ABI at all ("scope kind 'mcp_server' has no registered wire field"), and
-        // the engine's governance boot, which lists every key, refused to start. Registering here is
-        // sound: the grant was serialized ENGINE-side under this exact kind when it was written,
-        // which the registry only permits for a registered kind, and registration only names the
-        // kind's wire field (`allowed_{kind}s`); it never remaps or widens a grant.
-        for (kind, _) in &other {
-            busbar_contract::records::register_scope_kind(kind);
-        }
+        // Every non-`pool` kind crosses the wire as data (`ScopeRef { kind, value }`): no
+        // registry is consulted on either side of the store ABI.
         list.extend(
             other
                 .into_iter()

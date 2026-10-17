@@ -992,10 +992,8 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
 }
 
 /// A key granting a NON-`pool` scope kind round-trips ACROSS THE PLUGIN ABI. The store response is
-/// serialized INSIDE the cdylib, whose scope-kind wire registry the engine's boot registration never
-/// reaches; before the store registered the kinds it reads, `get_key`/`list_keys` on such a key
-/// failed with "scope kind 'mcp_server' has no registered wire field" — and the engine's governance
-/// boot, which lists every key, refused to start against this backend.
+/// serialized INSIDE the cdylib, and the wire carries every scope kind as data: `get_key` and
+/// `list_keys` on such a key answer it back unchanged, with no registry on either side.
 #[test]
 fn a_non_pool_scope_grant_crosses_the_plugin_abi() {
     use busbar_contract::records::{ScopeRef, VirtualKey};
@@ -1023,7 +1021,6 @@ fn a_non_pool_scope_grant_crosses_the_plugin_abi() {
         created_at: 1_000,
         ..Default::default()
     };
-    busbar_contract::records::register_scope_kind("mcp_server"); // the engine side registers it at boot
     store
         .put_key(&key)
         .expect("put a key with an mcp_server grant");
