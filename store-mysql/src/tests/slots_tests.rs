@@ -58,7 +58,7 @@ fn release(s: &MysqlStore, op: OpId, items: &[(u64, u64)]) -> Result<Vec<u64>, O
 #[test]
 fn the_statement_tail_is_a_durable_store_that_refuses_forks() {
     const {
-        assert!(!MysqlStore::TAIL.ephemeral);
+        assert!(MysqlStore::TAIL.durable == busbar_contract::abi::sdk::store::DURABLE_CLAIMED);
         assert!(MysqlStore::TAIL.durable_plane);
         assert!(MysqlStore::TAIL.fork_refusal);
     }

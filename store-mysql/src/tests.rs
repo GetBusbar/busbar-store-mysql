@@ -1854,7 +1854,7 @@ fn concurrent_appends_of_distinct_seqs_never_deadlock() {
 // durability. The only honest proof is to READ IT BACK, and the only honest proof that it survives
 // a deploy is to read it back on a NEW CONNECTION after the writing store is gone.
 
-/// Every plane-record purge in this binary takes this ONE lock. `purge_plane_records_before` is
+/// Every plane-record purge in this binary takes this ONE lock. `purge_plane_records` is
 /// KIND-WIDE by contract (no namespace), so a purge test's cutoff sweeps every other test's rows of
 /// that kind below it — including the conformance battery's. Only the purge tests and the two
 /// conformance purge checks hold it; everything else writes above every cutoff used here and stays
@@ -2040,7 +2040,11 @@ fn purge_calls_before_deletes_and_returns_a_real_count() {
         .unwrap();
 
     let purged = store
-        .purge_plane_records_before("call", 1_000_000_200)
+        .purge_plane_records(
+            "call",
+            1_000_000_200,
+            busbar_contract::records::Retention::Age,
+        )
         .unwrap();
     assert!(
         purged >= 1,
@@ -2056,7 +2060,11 @@ fn purge_calls_before_deletes_and_returns_a_real_count() {
          exactly at the cutoff is kept"
     );
     let rest = store
-        .purge_plane_records_before("call", 1_000_001_000)
+        .purge_plane_records(
+            "call",
+            1_000_001_000,
+            busbar_contract::records::Retention::Age,
+        )
         .unwrap();
     assert!(
         rest >= 2,
@@ -2082,7 +2090,11 @@ fn a_purge_is_confined_to_its_own_kind() {
         .append_plane_record(call_rec(p, 1, 5, "", "h1").view())
         .unwrap();
     store
-        .purge_plane_records_before("call", 1_000_000_000)
+        .purge_plane_records(
+            "call",
+            1_000_000_000,
+            busbar_contract::records::Retention::Age,
+        )
         .unwrap();
     assert!(calls_of(&store, p).is_empty(), "the old call row is swept");
     assert!(
@@ -2554,7 +2566,11 @@ fn purge_tasks_before_drops_only_terminal_rows_and_returns_a_real_count() {
         .unwrap();
 
     let purged = store
-        .purge_plane_records_before("task", 1_000_000_200)
+        .purge_plane_records(
+            "task",
+            1_000_000_200,
+            busbar_contract::records::Retention::TerminalOnly,
+        )
         .unwrap();
     assert_eq!(
         purged, 4,
@@ -2583,7 +2599,11 @@ fn purge_tasks_before_drops_only_terminal_rows_and_returns_a_real_count() {
     );
     assert_eq!(
         store
-            .purge_plane_records_before("task", 1_000_000_200)
+            .purge_plane_records(
+                "task",
+                1_000_000_200,
+                busbar_contract::records::Retention::TerminalOnly
+            )
             .unwrap(),
         0,
         "re-running the same purge removes nothing"
@@ -2622,7 +2642,11 @@ fn purging_a_task_takes_its_provenance_chain_with_it_and_no_other() {
 
     assert_eq!(
         store
-            .purge_plane_records_before("task", 1_000_000_200)
+            .purge_plane_records(
+                "task",
+                1_000_000_200,
+                busbar_contract::records::Retention::TerminalOnly
+            )
             .unwrap(),
         1,
         "exactly the one terminal task in this band is swept, and the count must be one actually \
@@ -3728,7 +3752,16 @@ fn a_v6_development_database_carries_its_plane_state_across_once() {
     // Terminality came across on the typed column: a purge takes the terminal task only — and
     // `Completed` (not a recognised terminal token) is kept, the closed-set rule the v5 sweep had.
     let _guard = lock_plane_purge();
-    assert_eq!(store.purge_plane_records_before("task", 1_000).unwrap(), 1);
+    assert_eq!(
+        store
+            .purge_plane_records(
+                "task",
+                1_000,
+                busbar_contract::records::Retention::TerminalOnly
+            )
+            .unwrap(),
+        1
+    );
     let ids = all_task_ids(&store);
     assert!(ids.contains(&"t_v6_live".to_string()));
     assert!(ids.contains(&"t_v6_Done".to_string()));

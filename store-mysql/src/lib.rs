@@ -57,8 +57,8 @@ use mysqlwire::{Conn, Error, Opts, Params, Row, Transaction};
 use busbar_contract::records::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, ModelTokens,
     ModelTokensDelta, PlaneDisposition, PlaneRecord, PlaneSelector, RecordStoreError,
-    RecordStoreResult, ScopeRef, SecretForm, UsageDelta, UsageLedger, VirtualKey, UNIT_CACHE_READ,
-    UNIT_CACHE_WRITE, UNIT_INPUT, UNIT_OUTPUT,
+    RecordStoreResult, Retention, ScopeRef, SecretForm, UsageDelta, UsageLedger, VirtualKey,
+    UNIT_CACHE_READ, UNIT_CACHE_WRITE, UNIT_INPUT, UNIT_OUTPUT,
 };
 use std::collections::BTreeMap;
 
@@ -92,7 +92,7 @@ type PlaneRowTuple = (String, Option<String>, u64, bool, Vec<u8>);
 /// as the envelope's typed `disposition`; this list is consulted by nothing else.
 const TERMINAL_TASK_STATES: [&str; 4] = ["completed", "failed", "canceled", "rejected"];
 
-/// The plane-record kind whose retention is TERMINAL-ONLY (see `purge_plane_records_before`), and
+/// The plane-record kind whose purge cascades to its child chain (see `purge_plane_records`), and
 /// the child kind that is swept together with it. The same two strings the reference `impl Store`s
 /// in busbar branch on; every other kind is opaque to this store.
 const KIND_TASK: &str = "task";
@@ -277,7 +277,7 @@ const SCHEMA: &[&str] = &[
     // write-throughs state no ORDER between a task's first upsert and its first event, and a DELETE
     // trigger needs SUPER on a binlog-enabled server, which the app-level user does not hold. The
     // one cascade this store owes (a purged task takes its event chain with it) lives in
-    // `purge_plane_records_before`, in the same transaction as the parent delete.
+    // `purge_plane_records`, in the same transaction as the parent delete.
     "CREATE TABLE IF NOT EXISTS plane_records (
         kind VARCHAR(64) COLLATE utf8mb4_bin NOT NULL,
         ident VARCHAR(191) COLLATE utf8mb4_bin NOT NULL,
@@ -289,7 +289,7 @@ const SCHEMA: &[&str] = &[
         body LONGBLOB NOT NULL,
         PRIMARY KEY (kind, ident, seq)
     ) ENGINE=InnoDB",
-    // The retention sweep's access path: `purge_plane_records_before` deletes by (kind, ts < cutoff).
+    // The retention sweep's access path: `purge_plane_records` deletes by (kind, ts < cutoff).
     // No IF NOT EXISTS -- MySQL has no such form for CREATE INDEX; a re-run's duplicate error is
     // swallowed by try_init_schema, exactly as it is for every other index here.
     "CREATE INDEX idx_plane_records_kind_ts ON plane_records (kind, ts)",
@@ -2522,15 +2522,16 @@ impl MysqlStore {
         .map_err(store_err)
     }
 
-    pub(crate) async fn purge_plane_records_before(
+    pub(crate) async fn purge_plane_records(
         conn: &mut Conn,
         kind: &str,
         before: u64,
+        retention: Retention,
     ) -> RecordStoreResult<u64> {
         // STRICTLY older than the cutoff: a row exactly at `before` is kept. The count returned is
         // one the DELETE actually performed (`affected_rows`), never an estimate.
-        if kind == KIND_TASK {
-            // TERMINAL ONLY. An interrupted task waiting on a human is exactly the row that sits
+        if retention == Retention::TerminalOnly {
+            // TERMINAL ONLY, the rule the host passes (the `task` kind's). An interrupted task waiting on a human is exactly the row that sits
             // still for a long time; compacting it is losing the work, not reclaiming space.
             // Terminality is the envelope's typed `terminal` column -- never decoded from the body.
             //
@@ -2557,7 +2558,7 @@ impl MysqlStore {
                 .exec(
                     "SELECT ident FROM plane_records \
                      WHERE kind = :kind AND seq = 0 AND ts < :before AND terminal ORDER BY ident",
-                    params! { "kind" => KIND_TASK, "before" => before },
+                    params! { "kind" => kind, "before" => before },
                 )
                 .await
                 .map_err(store_err)?;
@@ -2567,7 +2568,7 @@ impl MysqlStore {
                 tx.exec_drop(
                     "DELETE FROM plane_records WHERE kind = :kind AND ident = :ident AND seq = 0 \
                      AND ts < :before AND terminal",
-                    params! { "kind" => KIND_TASK, "ident" => &ident, "before" => before },
+                    params! { "kind" => kind, "ident" => &ident, "before" => before },
                 )
                 .await
                 .map_err(store_err)?;
@@ -2575,19 +2576,21 @@ impl MysqlStore {
                 // this connection. 0 = a concurrent sweep took it first, or it is no longer
                 // eligible; either way its chain is not this sweep's to touch.
                 if tx.affected_rows() == 1 {
-                    tx.exec_drop(
-                        "DELETE FROM plane_records WHERE kind = :event_kind AND ident = :ident",
-                        params! { "event_kind" => KIND_TASK_EVENT, "ident" => &ident },
-                    )
-                    .await
-                    .map_err(store_err)?;
+                    if kind == KIND_TASK {
+                        tx.exec_drop(
+                            "DELETE FROM plane_records WHERE kind = :event_kind AND ident = :ident",
+                            params! { "event_kind" => KIND_TASK_EVENT, "ident" => &ident },
+                        )
+                        .await
+                        .map_err(store_err)?;
+                    }
                     removed += 1;
                 }
                 tx.commit().await.map_err(store_err)?;
             }
             return Ok(removed);
         }
-        // Every other kind drops ALL of its rows older than the cutoff. Batched and looped, like
+        // `Age` drops ALL of the kind's rows older than the cutoff. Batched and looped, like
         // `purge_windows_before`: the batch bound keeps any one DELETE's lock footprint small, and
         // the loop makes the contract -- every row below the cutoff -- actually hold for a backlog
         // larger than one batch.

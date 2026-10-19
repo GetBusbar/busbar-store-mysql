@@ -563,7 +563,7 @@ fn decode(b: &[u8]) -> serde_json::Value {
 ///
 /// busbar 1.6.0 carries the A2A task store and the MCP call log through the neutral kind-tagged
 /// verbs (`upsert_plane_record`, `append_plane_record`, `list_plane_records`,
-/// `list_plane_record_parents`, `purge_plane_records_before`, …) — kinds `task`, `task_event` and
+/// `list_plane_record_parents`, `purge_plane_records`, …) — kinds `task`, `task_event` and
 /// `call`. Every in-crate test of them calls `MysqlStore` DIRECTLY, in-process, and NONE of them can
 /// see the failure that actually matters in production, because in production this backend is ONLY
 /// ever reached as a plugin.
@@ -751,14 +751,14 @@ fn tasks_and_call_log_survive_an_unload_and_reload_over_the_real_plugin_abi() {
     // read as 0.
     assert_eq!(
         store
-            .purge_plane_records_before("call", 2_002)
+            .purge_plane_records("call", 2_002, busbar_contract::records::Retention::Age)
             .expect("purge calls"),
         2,
         "both records at ts 2001 go (one per principal); the one exactly at the cutoff stays"
     );
     assert_eq!(
         store
-            .purge_plane_records_before("task", 25)
+            .purge_plane_records("task", 25, busbar_contract::records::Retention::TerminalOnly)
             .expect("purge tasks"),
         0,
         "no TERMINAL task is older than the cutoff: t_alpha and t_beta are active and must never be \
@@ -766,7 +766,11 @@ fn tasks_and_call_log_survive_an_unload_and_reload_over_the_real_plugin_abi() {
     );
     assert_eq!(
         store
-            .purge_plane_records_before("task", 31)
+            .purge_plane_records(
+                "task",
+                31,
+                busbar_contract::records::Retention::TerminalOnly
+            )
             .expect("purge tasks"),
         1,
         "the one terminal task at ts 30 is the only row retention may drop"

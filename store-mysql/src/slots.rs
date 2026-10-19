@@ -44,13 +44,13 @@ use busbar_contract::abi::sdk::door::abi_str;
 use busbar_contract::abi::sdk::store::wire::{drive_kept, Body};
 use busbar_contract::abi::sdk::store::{
     Cap, CapsRefused, Cell, CellKey, Dimension, Grant, Op, OpRefused, OpResult, ReserveRefused,
-    Scanned, Step, StoreSlots, Tail,
+    Scanned, Step, StoreSlots, Tail, DURABLE_CLAIMED,
 };
 use busbar_contract::abi::store::{OpId, OP_ID_RETENTION_SECS};
 use busbar_contract::kinds::{Head, RecordBytes};
 use busbar_contract::records::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, PlaneRecordRef,
-    PlaneSelector, RecordStoreResult, UsageDelta, UsageLedger, VirtualKey,
+    PlaneSelector, RecordStoreResult, Retention, UsageDelta, UsageLedger, VirtualKey,
 };
 
 use crate::mysqlwire::{Conn, Error, Params, Transaction, Value as SqlValue};
@@ -670,7 +670,7 @@ async fn v3_record_scan(
 
 impl StoreSlots for MysqlStore {
     const TAIL: Tail = Tail {
-        ephemeral: false,
+        durable: DURABLE_CLAIMED,
         durable_plane: true,
         fork_refusal: true,
     };
@@ -1229,15 +1229,16 @@ impl StoreSlots for MysqlStore {
         })
     }
 
-    fn purge_plane_records_before(
+    fn purge_plane_records(
         &self,
         cx: &mut Op<'_>,
         kind: &str,
         before: u64,
+        retention: Retention,
     ) -> Step<RecordStoreResult<u64>> {
         let kind = kind.to_owned();
         on_conn!(self, cx, store_err, |c| {
-            MysqlStore::purge_plane_records_before(&mut c, &kind, before).await
+            MysqlStore::purge_plane_records(&mut c, &kind, before, retention).await
         })
     }
 
