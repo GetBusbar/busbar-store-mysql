@@ -492,7 +492,7 @@ fn install_over_admin_api_then_mint_a_key_and_verify_mysql_directly() {
          admin_listen: \"127.0.0.1:{admin_port}\"\n\
          plugins:\n  enabled: true\n  dir: {}\n  trust:\n    allow_unsigned: true\n\
          identity-providers:\n  admin-tokens: {{ module: admin-tokens, token: {{ env: BUSBAR_ADMIN_TOKEN }} }}\n\
-         auth:\n  chain: []\n  signing_key: {{ env: BUSBAR_SIGNING_KEY }}\n  admin_auth: [admin-tokens]\n\
+         auth:\n  chain: [keys]\n  signing_key: {{ env: BUSBAR_SIGNING_KEY }}\n  admin_auth: [admin-tokens]\n\
          providers:\n  mock:\n    api_key: {{ env: MOCK_KEY }}\n\
          models:\n  test-model:\n    provider: mock\n",
         plugins_dir.display()
