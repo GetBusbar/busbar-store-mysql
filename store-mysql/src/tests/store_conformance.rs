@@ -70,10 +70,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-/// A per-`ns` `(old_ts, new_ts)` pair for the two `purge_plane_records_before` checks below, straddling
+/// A per-`ns` `(old_ts, new_ts)` pair for the two `purge_plane_records` checks below, straddling
 /// a FIXED, SHARED `cutoff`.
 ///
-/// `purge_plane_records_before(kind, before)` takes a `kind` and a cutoff — no namespace — so it is
+/// `purge_plane_records(kind, before)` takes a `kind` and a cutoff — no namespace — so it is
 /// the one verb in this battery the `ns` discipline (module doc above) cannot reach directly: two
 /// concurrent runs sharing a live database both write rows and sweep the same kind-wide cutoff, so
 /// each run's sweep can catch the other's OLD rows too, and `assert_eq!(purged, 1)` then fails for a
@@ -709,7 +709,7 @@ pub fn assert_plane_demotion_upsert_list_delete(store: &dyn RecordStore, ns: &st
         .expect("deleting an absent demotion is an idempotent no-op, not an error");
 }
 
-/// **`purge_plane_records_before` (kind `call`) HONOURS THE CUTOFF.** The retention sweep drops rows
+/// **`purge_plane_records` (kind `call`) HONOURS THE CUTOFF.** The retention sweep drops rows
 /// STRICTLY OLDER than `before` and leaves everything at or after it alone, and it reports how many
 /// it actually dropped.
 ///
@@ -750,7 +750,7 @@ pub fn assert_plane_purge_honours_the_cutoff(store: &dyn RecordStore, ns: &str) 
     // The count itself is not asserted here — see the module doc above this function for why a
     // per-call bound on a kind-wide count cannot hold under a genuinely concurrent sibling run.
     let _purged = store
-        .purge_plane_records_before("call", cutoff)
+        .purge_plane_records("call", cutoff, busbar_contract::records::Retention::Age)
         .expect("purge the call plane records older than the cutoff");
 
     // Namespace-scoped evidence: this run's OWN older row must be gone and its OWN newer row must
@@ -768,7 +768,7 @@ pub fn assert_plane_purge_honours_the_cutoff(store: &dyn RecordStore, ns: &str) 
     assert_eq!(
         survivors,
         vec![2],
-        "purge_plane_records_before must drop ONLY the rows older than `before`: seq 1 (ts {old_ts}) \
+        "purge_plane_records must drop ONLY the rows older than `before`: seq 1 (ts {old_ts}) \
          had to go and seq 2 (ts {new_ts}) had to stay, got {survivors:?}"
     );
 
@@ -776,7 +776,7 @@ pub fn assert_plane_purge_honours_the_cutoff(store: &dyn RecordStore, ns: &str) 
     // only thing left to check is that it STAYS gone and the survivor stays put. The count is, again,
     // not asserted (a concurrent sibling run may still contribute rows to the same kind-wide sweep).
     let _reswept = store
-        .purge_plane_records_before("call", cutoff)
+        .purge_plane_records("call", cutoff, busbar_contract::records::Retention::Age)
         .expect("re-purge at the same cutoff");
     let resurvivors: Vec<u64> = store
         .list_plane_records("call", &PlaneSelector::Parent(parent.into()))
@@ -796,7 +796,7 @@ pub fn assert_plane_purge_honours_the_cutoff(store: &dyn RecordStore, ns: &str) 
     );
 }
 
-/// **`purge_plane_records_before` (kind `task`) drops only TERMINAL rows.** Age alone is not the
+/// **`purge_plane_records` (kind `task`) drops only TERMINAL rows.** Age alone is not the
 /// task table's retention rule: an interrupted task waiting on a human is exactly the row that sits
 /// still longest, and dropping it loses the work. Terminality is the envelope's
 /// [`PlaneDisposition`] sidecar — a backend never has to decode the opaque body to honour this.
@@ -830,7 +830,11 @@ pub fn assert_plane_purge_task_keeps_active_rows(store: &dyn RecordStore, ns: &s
     // executes second can correctly see `0` for its own call, without either backend being
     // non-conforming. What holds under any interleaving is the namespace-scoped evidence below.
     let _purged = store
-        .purge_plane_records_before("task", cutoff)
+        .purge_plane_records(
+            "task",
+            cutoff,
+            busbar_contract::records::Retention::TerminalOnly,
+        )
         .expect("purge the task plane records older than the cutoff");
 
     let ids: Vec<String> = store
