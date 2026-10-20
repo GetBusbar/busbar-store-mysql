@@ -28,6 +28,12 @@ license = "Apache-2.0"
 publish = false
 repository = "https://github.com/GetBusbar/busbar-store-mysql"
 
+# The ONE fleet clippy allowance (coordinator ruling (a), 2026-10-19): every plugin-built ABI literal
+# spreads `..Type::ZERO` (the zero-spread guard, busbar #1207), which a literal naming every field
+# today trips as needless_update. Members take it with `[lints] workspace = true`.
+[workspace.lints.clippy]
+needless_update = "allow"
+
 [workspace.dependencies]
 busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "565f24f25e42370f3f8b5d8b2d91d56950eb4866" }
 busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "565f24f25e42370f3f8b5d8b2d91d56950eb4866" }
