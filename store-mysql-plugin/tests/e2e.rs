@@ -10,15 +10,15 @@
 //! `load_and_exercise_mysql_plugin_via_file_drop` packs the built cdylib into a real tarball (the
 //! same `busbar-plugin-pack` tool CI's own SIGNOFF step uses), drops it into a real `plugins.dir`,
 //! and runs the REAL `busbar --validate` binary against a config naming `store: { module: mysql }` —
-//! the documented file-drop install path. `--validate` genuinely exercises the trust gate + ABI
-//! dlopen + `RecordStore::connect` (real schema migration against real MySQL), so a successful validate is
-//! real proof the plugin loads and initializes through busbar's own boot path, not a proxy for it.
+//! the documented file-drop install path. `--validate` is manifest-only (no server, no network, no
+//! state, no dlopen, no store open, no migration): a clean validate proves the file-dropped plugin
+//! passes the trust/manifest gate, and nothing more. The real boot in `admin_api_e2e.rs` is what
+//! dlopens the plugin and opens the store.
 //!
-//! Persistence is then proven the same two independent ways the prior direct-call test used:
-//!   1. `--validate` itself (via the plugin's `open()` and its connect step) runs the real schema
-//!      migration — confirmed by checking the schema now exists.
-//!   2. A second, independent store through the COMPILED-IN door (never the cdylib) confirms real
-//!      MySQL was actually touched, not an in-process fake.
+//! The schema check in that test is made on a RAW `mysql::Conn` (never the plugin, the ABI or the
+//! loader). The store it opens first through the COMPILED-IN door (`MysqlStore` below) is the SAME
+//! code as the plugin under test, so it proves only that real MySQL is reachable and migrated, not
+//! that the code is right: only a raw-client read-back is independent of it.
 //!
 //! The ABI-contract tests below load the cdylib DIRECTLY through the loader's dropped-in door
 //! ([`load`]: the Statement rendered as `busbar-plugin-pack` renders it, `load_dropped`, then
@@ -469,13 +469,12 @@ fn load_and_exercise_mysql_plugin_via_file_drop() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // PROOF real MySQL was touched by the REAL busbar process, through the REAL file-drop path: an
-    // independent connection (bypassing the plugin/ABI/loader entirely) confirms the schema now
-    // exists -- --validate's own plugin-open call ran RecordStore::connect, which runs init_schema(). Also
-    // exercises MysqlStore::connect itself as the second independent-verification leg the prior
-    // direct-call test used.
+    // `--validate` is manifest-only: it never opens the store, so it did not create the schema. The
+    // compiled-in door (the same code as the plugin, so NOT an independent check of it) is opened
+    // first and migrates the database; the RAW `mysql::Conn` after it is the independent read of
+    // what that left in real MySQL (bypassing the plugin/ABI/loader entirely).
     let _direct = MysqlStore::connect(&url)
-        .expect("connect directly, bypassing the plugin entirely, to confirm real schema init");
+        .expect("connect through the compiled-in door to migrate real MySQL");
     let mut raw = mysql::Conn::new(mysql::Opts::from_url(&url).unwrap()).unwrap();
     use mysql::prelude::*;
     let exists: bool = raw
@@ -487,8 +486,8 @@ fn load_and_exercise_mysql_plugin_via_file_drop() {
         .unwrap();
     assert!(
         exists,
-        "the api_keys table must exist after busbar --validate loaded the plugin via file-drop -- \
-         proof the real boot path actually called RecordStore::connect/init_schema, not a no-op"
+        "the api_keys table must exist in real MySQL after the compiled-in door migrated it, as a \
+         raw connection reads it"
     );
 
     let _ = std::fs::remove_dir_all(&work);
@@ -586,8 +585,10 @@ fn decode(b: &[u8]) -> serde_json::Value {
 /// three events on one task and one on another, three call records for one principal and one for a
 /// second), DROPS the handle — which runs `close` and UNLOADS the library — then `dlopen`s
 /// AGAIN over the same file and reads everything back. A third leg reads the same rows through the
-/// plain `MysqlStore`, never touching the cdylib, the C ABI or the loader — so a plugin that
-/// answered from its own in-process cache still fails here.
+/// plain `MysqlStore` (the compiled-in door: the same code as the plugin, so it shows the rows are
+/// in MySQL, not that the code is right), and a fourth leg reads them with a RAW `mysql::Conn`,
+/// independent of all of it — so a plugin that answered from its own in-process cache still fails
+/// here.
 #[test]
 fn tasks_and_call_log_survive_an_unload_and_reload_over_the_real_plugin_abi() {
     use busbar_contract::records::{PlaneDisposition, PlaneRecord, PlaneSelector};
@@ -781,6 +782,8 @@ fn tasks_and_call_log_survive_an_unload_and_reload_over_the_real_plugin_abi() {
     drop(store);
 
     // LEG 3 — the surviving rows through the plain `MysqlStore`, never the cdylib / ABI / loader.
+    // It is the compiled-in door, the same code as the plugin: it shows the rows are physically in
+    // MySQL, and leg 4 is the read independent of that code.
     assert_eq!(
         ids_of(
             RecordStore::list_plane_records(&direct, "task", &PlaneSelector::All)
@@ -807,6 +810,42 @@ fn tasks_and_call_log_survive_an_unload_and_reload_over_the_real_plugin_abi() {
     )
     .expect("list calls")
     .is_empty());
+
+    // LEG 4 — a RAW `mysql::Conn`: plain SQL on the table, no store code, no plugin, no ABI.
+    {
+        use mysql::prelude::*;
+        let mut raw = mysql::Conn::new(mysql::Opts::from_url(&url).expect("test url must parse"))
+            .expect("a raw connection for the independent read-back");
+        let tasks: Vec<(String, i64)> = raw
+            .query("SELECT id, terminal FROM plane_records WHERE kind = 'task' ORDER BY id")
+            .expect("raw read of the task rows");
+        assert_eq!(
+            tasks,
+            vec![("t_alpha".to_string(), 0), ("t_beta".to_string(), 0)],
+            "a raw read must find exactly the two surviving ACTIVE tasks (the terminal one was purged)"
+        );
+        let beta: Option<Vec<u8>> = raw
+            .exec_first(
+                "SELECT body FROM plane_records WHERE kind = 'task' AND id = :id",
+                params! { "id" => "t_beta" },
+            )
+            .expect("raw read of one task body");
+        assert_eq!(
+            beta,
+            Some(task("t_beta", "input-required", 20, PlaneDisposition::Active).body),
+            "the stored body bytes must be the ones written, byte for byte"
+        );
+        let call_seqs: Vec<u64> = raw
+            .query(
+                "SELECT seq FROM plane_records WHERE kind = 'call' AND id = 'vk_abi' ORDER BY seq",
+            )
+            .expect("raw read of the call rows");
+        assert_eq!(
+            call_seqs,
+            vec![2, 3],
+            "a raw read must find the two call records the purge kept"
+        );
+    }
 
     wipe_task_and_call_rows(&url);
 }
