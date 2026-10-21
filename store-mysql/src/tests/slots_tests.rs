@@ -191,12 +191,73 @@ fn reserve_needs_a_cap_grants_whole_cells_and_refuses_past_the_cap() {
     );
     assert_eq!(
         release(&s, op(8), &[(g[1].slice_id, 1)]),
+        Ok(vec![0]),
+        "a closed slice answers 0"
+    );
+    assert_eq!(
+        release(&s, op(12), &[(u64::MAX, 1)]),
         Err(OpRefused::Failed(format!(
             "slice_release: slice {} is not held",
-            g[1].slice_id
-        )))
+            u64::MAX
+        ))),
+        "a slice never granted fails the release"
     );
     reserve(&s, op(9), EPOCH, &[cell(3)]).expect("the released 3 can be drawn again");
+}
+
+/// A RELEASE ON WINDOW 0 IS FINAL (`abi::store::money` slice life (e)): the release takes back
+/// the unspent it names, the slice closes (another release answers 0), and the spent rest stays
+/// counted against the cap. A rolling window keeps the partial-release rule.
+#[test]
+fn a_release_on_window_zero_is_final() {
+    let Some(s) = fresh_store() else { return };
+    let bucket = fresh("window-0");
+    let zero = CellKey {
+        bucket: &bucket,
+        pool: None,
+        dimension: Dimension::NanoUnits,
+        window_start: 0,
+    };
+    s.window_caps(
+        op(30),
+        &[Cap {
+            key: zero,
+            cap: 10,
+            config_gen: 1,
+        }],
+    )
+    .expect("cap");
+    let draw = |amount| [Cell { key: zero, amount }];
+    let g = reserve(&s, op(31), EPOCH, &draw(6)).expect("6 of 10");
+    let id = g[0].slice_id;
+    assert_eq!(release(&s, op(32), &[(id, 2)]), Ok(vec![2]));
+    assert_eq!(
+        release(&s, op(33), &[(id, 4)]),
+        Ok(vec![0]),
+        "a window-0 slice stayed open after its release"
+    );
+    reserve(&s, op(34), EPOCH, &draw(6)).expect("the returned 2 are drawable");
+    assert_eq!(
+        reserve(&s, op(35), EPOCH, &draw(1)),
+        Err(ReserveRefused::Exhausted { cell: 0 }),
+        "the spent 4 stay counted"
+    );
+
+    // The control: on a rolling window a partial release leaves the rest open.
+    let rolling = fresh("rolling");
+    let k = key(&rolling, 60);
+    s.window_caps(
+        op(36),
+        &[Cap {
+            key: k,
+            cap: 10,
+            config_gen: 1,
+        }],
+    )
+    .expect("cap");
+    let g = reserve(&s, op(37), EPOCH, &[Cell { key: k, amount: 6 }]).expect("draw");
+    assert_eq!(release(&s, op(38), &[(g[0].slice_id, 2)]), Ok(vec![2]));
+    assert_eq!(release(&s, op(39), &[(g[0].slice_id, 4)]), Ok(vec![4]));
 }
 
 /// Epoch 0 until WIRE-STORE adds the advance: no epoch a caller states is refused, and a grant,
