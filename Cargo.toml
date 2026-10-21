@@ -10,8 +10,8 @@
 # `.busbar-ref`; no sibling-checkout path dependency ships in any manifest.
 #
 # THIRD-PARTY VERSIONS ARE THE FLEET'S, NOT THIS REPO'S. The table below is busbar's own root
-# `[workspace.dependencies]` (third-party rows) at busbar 7263f4e61b7af7fdadb9079394d139547e61d1c0, followed by the plugin-only rows
-# of busbar's `.github/fleet/deps.toml` at 7263f4e61b7af7fdadb9079394d139547e61d1c0. A member takes a crate with
+# `[workspace.dependencies]` (third-party rows) at busbar a3748f7932a3292aed3c9ef1e75e9f999a732140, followed by the plugin-only rows
+# of busbar's `.github/fleet/deps.toml` at a3748f7932a3292aed3c9ef1e75e9f999a732140. A member takes a crate with
 # `{ workspace = true }` (adding features if it needs them); a crate in neither table is a new
 # `deps.toml` row in busbar first. CI holds this repo's Cargo.lock to busbar's lock at the pin.
 [workspace]
@@ -35,14 +35,14 @@ repository = "https://github.com/GetBusbar/busbar-store-mysql"
 needless_update = "allow"
 
 [workspace.dependencies]
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "7263f4e61b7af7fdadb9079394d139547e61d1c0" }
-busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "7263f4e61b7af7fdadb9079394d139547e61d1c0" }
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "a3748f7932a3292aed3c9ef1e75e9f999a732140" }
+busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "a3748f7932a3292aed3c9ef1e75e9f999a732140" }
 # THE SUITE'S HOST CONNECTOR (dev-only; store-mysql-plugin/tests/support/conformance_host.rs,
 # rendered because the declares file states network needs): busbar's connector and its TLS
 # test kit at the pin, and the transport framers those needs name, at the revs busbar links.
-busbar-core-connector = { git = "https://github.com/GetBusbar/busbar", rev = "7263f4e61b7af7fdadb9079394d139547e61d1c0", features = ["test-support"] }
+busbar-core-connector = { git = "https://github.com/GetBusbar/busbar", rev = "a3748f7932a3292aed3c9ef1e75e9f999a732140", features = ["test-support"] }
 busbar-transport-tcp = { git = "https://github.com/GetBusbar/busbar-transport-tcp", rev = "223ec3f02000de94089a1752635b9e206f7492e5" }
-# busbar's root [workspace.dependencies], third-party rows, at 7263f4e61b7af7fdadb9079394d139547e61d1c0
+# busbar's root [workspace.dependencies], third-party rows, at a3748f7932a3292aed3c9ef1e75e9f999a732140
 arc-swap = "1"
 async-trait = "0.1"
 axum = "0.8"
@@ -79,7 +79,6 @@ metrics-util = { version = "0.20.4", default-features = false }
 oauth-as = { version = "1.0.0", features = ["http", "jwt", "consent", "resource-metadata", "par", "dpop", "client-assertion"] }
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "trace"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
-proptest = "1"
 prost = { version = "0.14", default-features = false, features = ["std"] }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
@@ -113,7 +112,7 @@ url = "2"
 webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["std", "ring"] }
 webpki-roots = "1"
 zeroize = "1"
-# busbar .github/fleet/deps.toml [plugin-deps], at 7263f4e61b7af7fdadb9079394d139547e61d1c0
+# busbar .github/fleet/deps.toml [plugin-deps], at a3748f7932a3292aed3c9ef1e75e9f999a732140
 fallible-iterator = "0.2"
 ldap3 = { version = "0.12", default-features = false, features = ["sync"] }
 mysql = { version = "28", default-features = false, features = ["minimal-rust"] }
@@ -135,4 +134,4 @@ ulid = "1"
 # patches them to its own tree. The source is busbar spelled through www.github.com: Cargo
 # refuses a patch that names the source it patches.
 [patch."https://github.com/GetBusbar/busbar"]
-busbar-contract = { git = "https://www.github.com/GetBusbar/busbar", rev = "7263f4e61b7af7fdadb9079394d139547e61d1c0" }
+busbar-contract = { git = "https://www.github.com/GetBusbar/busbar", rev = "a3748f7932a3292aed3c9ef1e75e9f999a732140" }
