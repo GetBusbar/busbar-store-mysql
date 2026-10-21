@@ -129,6 +129,7 @@ fn sample_key(id: &str, generation: &str) -> VirtualKey {
         idp_subject: None,
         binding_mode: None,
         minted_by: None,
+        idp_provider: None,
     }
 }
 
@@ -3278,6 +3279,51 @@ fn the_1_6_0_key_fields_round_trip() {
         Some("vk_app_admin"),
         "provenance survives the tombstone, like every other attribution field"
     );
+}
+
+/// THE MINTING PROVIDER (Q128 u31, busbar `VirtualKey::idp_provider`): a kernel-only provenance
+/// field persisted with the row through both write paths. RED before the column existed: the write
+/// dropped it and the key read back `None`.
+#[test]
+fn the_minting_provider_persists_through_both_write_paths() {
+    let Some(s) = fresh_store() else { return };
+    let mut k = sample_key("vk_prov", "g");
+    k.idp_provider = Some("okta-prod".into());
+    s.put_key(&k).unwrap();
+    assert_eq!(
+        s.get_key("vk_prov")
+            .unwrap()
+            .unwrap()
+            .idp_provider
+            .as_deref(),
+        Some("okta-prod")
+    );
+    let mut minted = sample_key("vk_prov_minted", "g");
+    minted.idp_provider = Some("okta-prod".into());
+    s.put_key_with_credential(
+        &minted,
+        &sample_credential("vk_prov_minted", "AKIA_PROV", 0),
+    )
+    .unwrap();
+    assert_eq!(
+        s.get_key("vk_prov_minted")
+            .unwrap()
+            .unwrap()
+            .idp_provider
+            .as_deref(),
+        Some("okta-prod")
+    );
+    k.idp_provider = None;
+    s.put_key(&k).unwrap();
+    assert_eq!(s.get_key("vk_prov").unwrap().unwrap().idp_provider, None);
+}
+
+/// GREEN twin: a key minted without a provider reads back `None`.
+#[test]
+fn a_key_minted_without_a_provider_reads_none() {
+    let Some(s) = fresh_store() else { return };
+    s.put_key(&sample_key("vk_noprov", "g")).unwrap();
+    assert_eq!(s.get_key("vk_noprov").unwrap().unwrap().idp_provider, None);
 }
 
 /// OPEN usage units (everything but the reserved four) round-trip through `put_usage`, accumulate
