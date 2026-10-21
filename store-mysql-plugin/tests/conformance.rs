@@ -5,7 +5,7 @@
 //! store kind's memory ABI (store v3), run against the busbar rev this repo pins (`.busbar-ref`).
 //!
 //! The store is held two ways at once: LINKED (the logic crate's `door`, as a busbar build that
-//! compiles it in registers it: `LinkedRow::of(door)` through the loader's `load_linked`) and
+//! compiles it in registers it: `LinkedRow::of_loaded(LoadedDoor::from_raw(door))` through the loader's `load_linked`) and
 //! DROPPED IN (this crate's built cdylib, its Statement rendered the way `busbar-plugin-pack`
 //! renders it into the signed manifest, then `dlopen`ed by the loader's `load_dropped`). Each is
 //! bound to its own dispatcher and opened the way the host opens a store (`LoadedStore`), and gives
@@ -40,7 +40,7 @@
 mod conformance_host;
 
 busbar_plugin_loader::conformance_suite! {
-    door: busbar_store_mysql::door,
+    loaded: loaded(),
     cdylib: "busbar_store_mysql_plugin",
     inputs: include_str!("conformance.json"),
     host: conformance_host::host,
@@ -107,9 +107,16 @@ use busbar_plugin_loader::dispatch::kinds::secret::Secret;
 use busbar_plugin_loader::dispatch::kinds::store::Store;
 use busbar_plugin_loader::dispatch::{
     load_dropped, load_linked, rendering_of_library, Bind, ConnTable, DispatchConfig, Dispatcher,
-    LinkedRow, NoSink, Plugin,
+    LinkedRow, LoadedDoor, NoSink, Plugin,
 };
 use busbar_plugin_loader::store_v3::LoadedStore;
+
+/// This crate's own door, as the loader names a compiled-in one.
+#[allow(unused_unsafe)]
+fn loaded() -> LoadedDoor {
+    // SAFETY: `door` is this crate's own `store_door!` entry.
+    unsafe { LoadedDoor::from_raw(busbar_store_mysql::door) }
+}
 
 /// The live MySQL, under this repo's gate.
 fn mysql_url() -> Option<String> {
@@ -174,7 +181,7 @@ type Loaded = (Plugin<Store>, Arc<Dispatcher>);
 /// THE LINKED DOOR: the row a busbar build that compiles this store in registers.
 fn linked() -> Loaded {
     let d = dispatcher();
-    let row = LinkedRow::of(busbar_store_mysql::door).expect("the door states its Statement");
+    let row = LinkedRow::of_loaded(loaded()).expect("the door states its Statement");
     let p = load_linked::<Store>(&row, bind(&d)).expect("the linked door loads");
     (p, d)
 }
@@ -454,7 +461,7 @@ fn the_linked_and_the_dropped_in_mysql_store_are_one_store() {
     let stated = packed_rendering(&lib);
     assert_eq!(
         stated,
-        LinkedRow::of(busbar_store_mysql::door)
+        LinkedRow::of_loaded(loaded())
             .expect("the linked row")
             .statement,
         "the dropped-in library states the linked door's Statement byte for byte"
@@ -463,7 +470,7 @@ fn the_linked_and_the_dropped_in_mysql_store_are_one_store() {
     let linked = transcript(linked, url);
     let dropped_in = transcript(|| dropped(&lib, &stated), url);
     same(&linked, &dropped_in);
-    assert_eq!(linked[0], format!("name = {}", busbar_store_mysql::NAME));
+    assert_eq!(linked[0], "name = busbar-store-mysql");
 
     if url.is_some() {
         // The comparison is not vacuous: the scenario read back what it wrote.
@@ -534,4 +541,14 @@ fn a_statement_that_is_not_the_librarys_own_is_refused() {
         Err(e) => e.to_string(),
     };
     assert!(e.contains("repack the plugin"), "{e}");
+}
+
+#[test]
+fn the_statement_carries_the_declares_document() {
+    let row = LinkedRow::of_loaded(loaded()).expect("the door states itself");
+    let read = busbar_contract::abi::mechanism::rendering::read(&row.statement).unwrap();
+    assert_eq!(
+        busbar_contract::abi::mechanism::extensions::declares(&read.extensions.bytes),
+        Some(&include_bytes!("../../store-mysql/declares.json")[..]),
+    );
 }
