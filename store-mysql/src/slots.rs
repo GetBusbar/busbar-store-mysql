@@ -813,6 +813,9 @@ impl StoreSlots for MysqlStore {
             .map_err(|e| e.to_string()))
     }
 
+    /// `record_put` (slot 40): an upsert on `(schema, key)`. An EMPTY value removes the row
+    /// (ARCHITECT 2026-10-21): it is the host's strike, so `record_get` then answers `None` and
+    /// `record_scan` never returns it. Removing a row that is not there is `Ok`.
     fn record_put(
         &self,
         cx: &mut Op<'_>,
@@ -821,6 +824,17 @@ impl StoreSlots for MysqlStore {
         value: &[u8],
     ) -> Step<Result<(), String>> {
         let (schema, key, value) = (schema.to_owned(), key.to_vec(), value.to_vec());
+        if value.is_empty() {
+            return on_conn!(self, cx, text, |c| {
+                c
+                .exec_drop(
+                    "DELETE FROM store_records WHERE schema_id = :schema AND rkey = :rkey",
+                    params! { "schema" => &schema, "rkey" => &key },
+                )
+                .await
+                .map_err(|e| e.to_string())
+            });
+        }
         on_conn!(self, cx, text, |c| {
             c
             .exec_drop(
