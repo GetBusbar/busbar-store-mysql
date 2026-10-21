@@ -101,8 +101,9 @@ struct MysqlStore;
 impl MysqlStore {
     fn connect(url: &str) -> Result<LoadedStore, String> {
         let (dispatcher, bind) = host("store-mysql-e2e-direct");
-        let row = busbar_plugin_loader::dispatch::LinkedRow::of(busbar_store_mysql::door)
-            .map_err(|e| e.to_string())?;
+        let row =
+            busbar_plugin_loader::dispatch::LinkedRow::of_macro(busbar_store_mysql::MACRO_DOOR)
+                .map_err(|e| e.to_string())?;
         let plugin = busbar_plugin_loader::dispatch::load_linked::<Store>(&row, bind)
             .map_err(|e| e.to_string())?;
         let cfg = serde_json::json!({ "url": url }).to_string();

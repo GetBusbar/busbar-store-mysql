@@ -2775,7 +2775,7 @@ mod slots;
 
 /// THE STORE DOOR (store v3, `busbar_contract::abi::store`): every slot of the store v3 table over
 /// [`MysqlStore`], through the contract's store SDK.
-pub use slots::door;
+pub use slots::{door, MACRO_DOOR};
 
 #[cfg(test)]
 mod tests;

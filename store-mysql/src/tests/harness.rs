@@ -93,7 +93,7 @@ fn mint() -> OpId {
 /// The store's linked door opened on `settings`, as the host opens it.
 pub(crate) fn open_loaded(settings: &str) -> Result<LoadedStore, String> {
     let (d, conns) = host();
-    let row = LinkedRow::of(crate::door).map_err(|e| e.to_string())?;
+    let row = LinkedRow::of_macro(crate::MACRO_DOOR).map_err(|e| e.to_string())?;
     let p = load_linked::<Store>(
         &row,
         Bind {
