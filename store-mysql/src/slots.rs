@@ -863,8 +863,7 @@ impl StoreSlots for MysqlStore {
         let (schema, key, value) = (schema.to_owned(), key.to_vec(), value.to_vec());
         if value.is_empty() {
             return on_conn!(self, cx, text, |c| {
-                c
-                .exec_drop(
+                c.exec_drop(
                     "DELETE FROM store_records WHERE schema_id = :schema AND rkey = :rkey",
                     params! { "schema" => &schema, "rkey" => &key },
                 )

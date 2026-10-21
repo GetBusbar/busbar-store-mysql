@@ -422,7 +422,8 @@ fn an_empty_put_removes_the_row() {
         "a scan never returns a struck row"
     );
 
-    s.record_put(&schema, b"a/9", b"").expect("a strike of nothing is Ok");
+    s.record_put(&schema, b"a/9", b"")
+        .expect("a strike of nothing is Ok");
     assert_eq!(held(), 1);
     s.record_put(&schema, b"a/1", b"again").expect("put again");
     assert_eq!(
