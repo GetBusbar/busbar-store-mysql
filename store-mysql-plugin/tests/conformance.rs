@@ -5,7 +5,7 @@
 //! store kind's memory ABI (store v3), run against the busbar rev this repo pins (`.busbar-ref`).
 //!
 //! The store is held two ways at once: LINKED (the logic crate's `door`, as a busbar build that
-//! compiles it in registers it: `LinkedRow::of(door)` through the loader's `load_linked`) and
+//! compiles it in registers it: `LinkedRow::of_loaded(LoadedDoor::from_raw(door))` through the loader's `load_linked`) and
 //! DROPPED IN (this crate's built cdylib, its Statement rendered the way `busbar-plugin-pack`
 //! renders it into the signed manifest, then `dlopen`ed by the loader's `load_dropped`). Each is
 //! bound to its own dispatcher and opened the way the host opens a store (`LoadedStore`), and gives

@@ -2728,7 +2728,7 @@ fn crate_now() -> u64 {
 //
 // The store's door lives HERE, in the logic crate (`slots`: `store_door!` over this store's
 // `StoreSlots`): a busbar build that links this crate registers `door` as its compiled-in row
-// (`LinkedRow::of(door)`), and the sibling `busbar-store-mysql-plugin` cdylib exports the same
+// (`LinkedRow::of_loaded(LoadedDoor::from_raw(door))`), and the sibling `busbar-store-mysql-plugin` cdylib exports the same
 // `door` as the image's one symbol (`export_door!`). One source, both doors.
 
 /// The store's package name: the name its Statement states and its signed tarball carries.

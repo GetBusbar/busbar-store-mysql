@@ -77,7 +77,7 @@ busbar_contract::statement_extensions!(
     /// The Statement's extensions: this plugin's whole `declares` document (BUSBAR-1.6.0.md l.246).
     EXTENSIONS: [(
         busbar_contract::abi::mechanism::extensions::EXT_DECLARES,
-        include_bytes!("../declares.json"),
+        include_bytes!("../declares.json")
     )]
 );
 
