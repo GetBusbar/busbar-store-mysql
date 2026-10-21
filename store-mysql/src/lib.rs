@@ -119,7 +119,9 @@ fn store_err<E: std::fmt::Display>(e: E) -> RecordStoreError {
 /// v8: the store v3 door (busbar 1.6.0's plugin ABI). Six NEW tables (`store_ops`, `store_caps`,
 /// `store_slices`, `store_journal`, `store_sessions`, `store_records`); purely additive, no
 /// existing table or row is touched.
-const SCHEMA_VERSION: u32 = 8;
+/// v9: `store_slices_closed`, the closed slices' ids (`abi::store::money` slice life (e)); purely
+/// additive.
+const SCHEMA_VERSION: u32 = 9;
 
 /// The version each one-time migration step targets crossing INTO — named so a gate reads as "did
 /// this database predate step N" rather than a bare magic number, and so a future step can't be
@@ -387,6 +389,14 @@ const SCHEMA: &[&str] = &[
         class_key VARCHAR(191) COLLATE utf8mb4_bin NOT NULL,
         window_start BIGINT UNSIGNED NOT NULL,
         remaining BIGINT UNSIGNED NOT NULL
+    ) ENGINE=InnoDB",
+    // THE CLOSED SLICES (`abi::store::money` slice life (e)): a slice's row is deleted when it
+    // closes, and its id is kept here (until `OP_ID_RETENTION_SECS` past its close) so another
+    // release of it answers 0 rather than failing as a slice never granted.
+    "CREATE TABLE IF NOT EXISTS store_slices_closed (
+        slice_id BIGINT UNSIGNED PRIMARY KEY,
+        closed_at BIGINT UNSIGNED NOT NULL,
+        INDEX store_slices_closed_at (closed_at)
     ) ENGINE=InnoDB",
     // THE JOURNAL (`append_batch`/`heads`): fixed-size records per stream, at seq 1.. in order.
     "CREATE TABLE IF NOT EXISTS store_journal (

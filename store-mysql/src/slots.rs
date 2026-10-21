@@ -520,6 +520,7 @@ async fn v3_slice_release(
         ids.sort_unstable();
         ids.dedup();
         let mut held: BTreeMap<u64, (Slot, u64)> = BTreeMap::new();
+        let mut closed: Vec<u64> = Vec::new();
         for id in ids {
             type Row = (String, bool, String, u32, String, u64, u64);
             let row: Option<Row> = tx
@@ -531,6 +532,18 @@ async fn v3_slice_release(
                 .await
                 .map_err(backend::<OpRefused, _>)?;
             let Some((b, pd, p, d, c, w, remaining)) = row else {
+                // A slice a release already CLOSED answers 0; one never granted fails the call.
+                let was: Option<u64> = tx
+                    .exec_first(
+                        "SELECT slice_id FROM store_slices_closed WHERE slice_id = :id",
+                        params! { "id" => id },
+                    )
+                    .await
+                    .map_err(backend::<OpRefused, _>)?;
+                if was.is_some() {
+                    closed.push(id);
+                    continue;
+                }
                 return Err(OpRefused::Failed(format!(
                     "slice_release: slice {id} is not held"
                 )));
@@ -542,17 +555,33 @@ async fn v3_slice_release(
         let mut back_all = Vec::with_capacity(items.len());
         let mut by_slot: BTreeMap<Slot, u64> = BTreeMap::new();
         for (id, unspent) in &items {
+            if closed.contains(id) {
+                back_all.push(0);
+                continue;
+            }
             let (slot, left) = held.get_mut(id).expect("every item's slice is held");
             let back = (*unspent).min(*left);
             *left -= back;
             *by_slot.entry(slot.clone()).or_default() += back;
             back_all.push(back);
         }
-        for (id, (_, left)) in &held {
-            if *left == 0 {
+        let now = crate_now();
+        for (id, (slot, left)) in &held {
+            // A slice closes when nothing is left, and a RELEASE ON WINDOW 0 IS FINAL
+            // (`abi::store::money` slice life (e)): window 0 never rolls, so its slice closes now
+            // and the spent rest stays counted against the cap. On a rolling window a partial
+            // release leaves the rest open.
+            if *left == 0 || slot.5 == 0 {
                 tx.exec_drop(
                     "DELETE FROM store_slices WHERE slice_id = :id",
                     params! { "id" => *id },
+                )
+                .await
+                .map_err(backend::<OpRefused, _>)?;
+                tx.exec_drop(
+                    "INSERT IGNORE INTO store_slices_closed (slice_id, closed_at) \
+                     VALUES (:id, :now)",
+                    params! { "id" => *id, "now" => now },
                 )
                 .await
             } else {
@@ -574,6 +603,14 @@ async fn v3_slice_release(
             .await
             .map_err(backend::<OpRefused, _>)?;
         }
+        // Forget closed slices past the op-id retention (best effort, bounded): past it a release
+        // of one is a replay the dedupe log has forgotten too.
+        tx.exec_drop(
+            "DELETE FROM store_slices_closed WHERE closed_at < :cut LIMIT 1000",
+            params! { "cut" => now.saturating_sub(OP_ID_RETENTION_SECS) },
+        )
+        .await
+        .map_err(backend::<OpRefused, _>)?;
         Ok(json!(back_all))
     });
     serde_json::from_value(answer.clone()).map_err(|_| undecodable(&answer))
@@ -813,6 +850,9 @@ impl StoreSlots for MysqlStore {
             .map_err(|e| e.to_string()))
     }
 
+    /// `record_put` (slot 40): an upsert on `(schema, key)`. An EMPTY value removes the row
+    /// (ARCHITECT 2026-10-21): it is the host's strike, so `record_get` then answers `None` and
+    /// `record_scan` never returns it. Removing a row that is not there is `Ok`.
     fn record_put(
         &self,
         cx: &mut Op<'_>,
@@ -821,6 +861,16 @@ impl StoreSlots for MysqlStore {
         value: &[u8],
     ) -> Step<Result<(), String>> {
         let (schema, key, value) = (schema.to_owned(), key.to_vec(), value.to_vec());
+        if value.is_empty() {
+            return on_conn!(self, cx, text, |c| {
+                c.exec_drop(
+                    "DELETE FROM store_records WHERE schema_id = :schema AND rkey = :rkey",
+                    params! { "schema" => &schema, "rkey" => &key },
+                )
+                .await
+                .map_err(|e| e.to_string())
+            });
+        }
         on_conn!(self, cx, text, |c| {
             c
             .exec_drop(

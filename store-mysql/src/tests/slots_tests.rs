@@ -191,12 +191,73 @@ fn reserve_needs_a_cap_grants_whole_cells_and_refuses_past_the_cap() {
     );
     assert_eq!(
         release(&s, op(8), &[(g[1].slice_id, 1)]),
+        Ok(vec![0]),
+        "a closed slice answers 0"
+    );
+    assert_eq!(
+        release(&s, op(12), &[(u64::MAX, 1)]),
         Err(OpRefused::Failed(format!(
             "slice_release: slice {} is not held",
-            g[1].slice_id
-        )))
+            u64::MAX
+        ))),
+        "a slice never granted fails the release"
     );
     reserve(&s, op(9), EPOCH, &[cell(3)]).expect("the released 3 can be drawn again");
+}
+
+/// A RELEASE ON WINDOW 0 IS FINAL (`abi::store::money` slice life (e)): the release takes back
+/// the unspent it names, the slice closes (another release answers 0), and the spent rest stays
+/// counted against the cap. A rolling window keeps the partial-release rule.
+#[test]
+fn a_release_on_window_zero_is_final() {
+    let Some(s) = fresh_store() else { return };
+    let bucket = fresh("window-0");
+    let zero = CellKey {
+        bucket: &bucket,
+        pool: None,
+        dimension: Dimension::NanoUnits,
+        window_start: 0,
+    };
+    s.window_caps(
+        op(30),
+        &[Cap {
+            key: zero,
+            cap: 10,
+            config_gen: 1,
+        }],
+    )
+    .expect("cap");
+    let draw = |amount| [Cell { key: zero, amount }];
+    let g = reserve(&s, op(31), EPOCH, &draw(6)).expect("6 of 10");
+    let id = g[0].slice_id;
+    assert_eq!(release(&s, op(32), &[(id, 2)]), Ok(vec![2]));
+    assert_eq!(
+        release(&s, op(33), &[(id, 4)]),
+        Ok(vec![0]),
+        "a window-0 slice stayed open after its release"
+    );
+    reserve(&s, op(34), EPOCH, &draw(6)).expect("the returned 2 are drawable");
+    assert_eq!(
+        reserve(&s, op(35), EPOCH, &draw(1)),
+        Err(ReserveRefused::Exhausted { cell: 0 }),
+        "the spent 4 stay counted"
+    );
+
+    // The control: on a rolling window a partial release leaves the rest open.
+    let rolling = fresh("rolling");
+    let k = key(&rolling, 60);
+    s.window_caps(
+        op(36),
+        &[Cap {
+            key: k,
+            cap: 10,
+            config_gen: 1,
+        }],
+    )
+    .expect("cap");
+    let g = reserve(&s, op(37), EPOCH, &[Cell { key: k, amount: 6 }]).expect("draw");
+    assert_eq!(release(&s, op(38), &[(g[0].slice_id, 2)]), Ok(vec![2]));
+    assert_eq!(release(&s, op(39), &[(g[0].slice_id, 4)]), Ok(vec![4]));
 }
 
 /// Epoch 0 until WIRE-STORE adds the advance: no epoch a caller states is refused, and a grant,
@@ -321,6 +382,56 @@ fn records_upsert_read_back_and_scan_a_prefix_in_key_order() {
     assert_eq!(keys(b"b", 10), vec![b"b\x00".to_vec(), b"b\xff".to_vec()]);
     assert_eq!(keys(b"", 2), vec![b"a".to_vec(), b"b\x00".to_vec()]);
     assert!(keys(b"", 0).is_empty());
+}
+
+/// AN EMPTY PUT REMOVES THE ROW (slot 40's rule, ARCHITECT 2026-10-21): the host writes every
+/// strike as an empty `record_put` and reads empty as absent, so the row LEAVES the table:
+/// `record_get` answers `None`, `record_scan` never returns it, and the table shrinks. Removing a
+/// row that is not there is `Ok`.
+#[test]
+fn an_empty_put_removes_the_row() {
+    use mysql::prelude::Queryable;
+    let Some(s) = fresh_store() else { return };
+    let schema = fresh("schema");
+    let held = || -> i64 {
+        s.conn()
+            .expect("a raw connection")
+            .exec_first(
+                "SELECT COUNT(*) FROM store_records WHERE schema_id = ?",
+                (schema.as_str(),),
+            )
+            .expect("count")
+            .unwrap_or_default()
+    };
+    s.record_put(&schema, b"a/1", b"one").expect("put");
+    s.record_put(&schema, b"a/2", b"two").expect("put");
+    assert_eq!(held(), 2);
+
+    s.record_put(&schema, b"a/1", b"").expect("strike");
+    assert_eq!(held(), 1, "the struck row left the table");
+    assert_eq!(s.record_get(&schema, b"a/1").expect("get"), None);
+    let scan: Vec<(Vec<u8>, Vec<u8>)> = s
+        .record_scan(&schema, b"a/", 10)
+        .expect("scan")
+        .into_iter()
+        .map(|(k, v)| (k, v.as_slice().to_vec()))
+        .collect();
+    assert_eq!(
+        scan,
+        vec![(b"a/2".to_vec(), b"two".to_vec())],
+        "a scan never returns a struck row"
+    );
+
+    s.record_put(&schema, b"a/9", b"")
+        .expect("a strike of nothing is Ok");
+    assert_eq!(held(), 1);
+    s.record_put(&schema, b"a/1", b"again").expect("put again");
+    assert_eq!(
+        s.record_get(&schema, b"a/1")
+            .expect("get")
+            .map(|r| r.as_slice().to_vec()),
+        Some(b"again".to_vec())
+    );
 }
 
 /// The plane-record `op_id` write and the key path still share the store's one schema.
