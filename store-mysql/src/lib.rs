@@ -416,7 +416,7 @@ const SCHEMA: &[&str] = &[
 /// this store is control-plane-frequency (key/credential CRUD) plus write-behind usage flush, not a
 /// high-fan-out OLTP workload, and an unbounded set across many instances (a multi-process fleet
 /// booting simultaneously) is what exhausts MySQL's default `max_connections`.
-pub const KEPT_CONNECTIONS: usize = 8;
+const KEPT_CONNECTIONS: usize = 8;
 
 /// ESTABLISHED on every connection the store ever opens -- including a reconnect after a dropped
 /// connection, or the set growing past the one connection `probe_invariants` checks at boot -- and
@@ -430,7 +430,7 @@ pub(crate) const INIT: &[&str] =
 
 /// MySQL/MariaDB-backed store: the connection URL and the kept connections every op runs on (one
 /// connection per op at a time, as 1.5.5's pool checked one out per call).
-pub struct MysqlStore {
+struct MysqlStore {
     shared: Arc<Shared>,
 }
 
@@ -2732,7 +2732,7 @@ fn crate_now() -> u64 {
 // `door` as the image's one symbol (`export_door!`). One source, both doors.
 
 /// The store's package name: the name its Statement states and its signed tarball carries.
-pub const NAME: &str = "busbar-store-mysql";
+const NAME: &str = "busbar-store-mysql";
 
 impl MysqlStore {
     /// The `url` of the settings JSON the host hands `open`:
@@ -2775,7 +2775,7 @@ mod slots;
 
 /// THE STORE DOOR (store v3, `busbar_contract::abi::store`): every slot of the store v3 table over
 /// [`MysqlStore`], through the contract's store SDK.
-pub use slots::{door, MACRO_DOOR};
+pub use slots::door;
 
 #[cfg(test)]
 mod tests;

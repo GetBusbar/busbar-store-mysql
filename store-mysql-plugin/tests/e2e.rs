@@ -94,6 +94,13 @@ fn load(path: &Path, cfg: &str) -> Result<Box<dyn RecordStore>, String> {
     Ok(Box::new(store))
 }
 
+/// This crate's own door, as the loader names a compiled-in one.
+#[allow(unused_unsafe)]
+fn loaded() -> busbar_plugin_loader::dispatch::LoadedDoor {
+    // SAFETY: `door` is this crate's own `store_door!` entry.
+    unsafe { busbar_plugin_loader::dispatch::LoadedDoor::from_raw(busbar_store_mysql::door) }
+}
+
 /// The store through its COMPILED-IN door (`busbar_store_mysql::door`, never the cdylib): the
 /// independent leg the dropped-in store's writes are migrated, read back and cleaned up through.
 struct MysqlStore;
@@ -101,9 +108,8 @@ struct MysqlStore;
 impl MysqlStore {
     fn connect(url: &str) -> Result<LoadedStore, String> {
         let (dispatcher, bind) = host("store-mysql-e2e-direct");
-        let row =
-            busbar_plugin_loader::dispatch::LinkedRow::of_macro(busbar_store_mysql::MACRO_DOOR)
-                .map_err(|e| e.to_string())?;
+        let row = busbar_plugin_loader::dispatch::LinkedRow::of_loaded(loaded())
+            .map_err(|e| e.to_string())?;
         let plugin = busbar_plugin_loader::dispatch::load_linked::<Store>(&row, bind)
             .map_err(|e| e.to_string())?;
         let cfg = serde_json::json!({ "url": url }).to_string();

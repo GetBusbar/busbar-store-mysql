@@ -73,12 +73,21 @@ pub const NEEDS: &[Need] = &[{
 /// The need index of [`NEEDS`]' one entry.
 const NEED: u32 = 0;
 
+busbar_contract::statement_extensions!(
+    /// The Statement's extensions: this plugin's whole `declares` document (BUSBAR-1.6.0.md l.246).
+    EXTENSIONS: [(
+        busbar_contract::abi::mechanism::extensions::EXT_DECLARES,
+        include_bytes!("../declares.json"),
+    )]
+);
+
 busbar_contract::store_door!(
     MysqlStore,
     NAME,
     env!("CARGO_PKG_VERSION"),
     64,
-    needs: NEEDS
+    needs: NEEDS,
+    extensions: EXTENSIONS
 );
 
 /// RUN ONE OP on one of the instance's kept connections (a fresh one when none is idle): open the
