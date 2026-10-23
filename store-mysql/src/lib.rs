@@ -157,6 +157,7 @@ const SCHEMA: &[&str] = &[
         idp_subject TEXT NULL,
         binding_mode TEXT NULL,
         minted_by TEXT NULL,
+        idp_provider TEXT NULL,
         CONSTRAINT ck_api_keys_tombstone CHECK (deleted_at IS NULL OR enabled = FALSE),
         CONSTRAINT ck_api_keys_expiry CHECK (expires_at IS NULL OR expires_at > created_at),
         CONSTRAINT ck_api_keys_labels_json CHECK (JSON_VALID(labels)),
@@ -705,6 +706,7 @@ impl MysqlStore {
         Self::ensure_column(conn, keys_table, "idp_subject", "TEXT NULL").await?;
         Self::ensure_column(conn, keys_table, "binding_mode", "TEXT NULL").await?;
         Self::ensure_column(conn, keys_table, "minted_by", "TEXT NULL").await?;
+        Self::ensure_column(conn, keys_table, "idp_provider", "TEXT NULL").await?;
         Self::ensure_column(
             conn,
             metering_table,
@@ -1042,6 +1044,7 @@ impl MysqlStore {
         let idp_subject: Option<String> = row.take("idp_subject").unwrap_or(None);
         let binding_mode: Option<String> = row.take("binding_mode").unwrap_or(None);
         let minted_by: Option<String> = row.take("minted_by").unwrap_or(None);
+        let idp_provider: Option<String> = row.take("idp_provider").unwrap_or(None);
 
         let allowed_scopes = assemble_scopes(allowed_pools_json, allowed_scopes_ext)?;
         let labels = serde_json::from_str(&labels_json).map_err(store_err)?;
@@ -1065,6 +1068,7 @@ impl MysqlStore {
             idp_subject,
             binding_mode,
             minted_by,
+            idp_provider,
         })
     }
 
@@ -1153,7 +1157,7 @@ fn secret_form_str(f: &SecretForm) -> &'static str {
 /// The columns every key read selects, in one place so the three key reads cannot drift apart.
 const KEY_COLUMNS: &str = "id, generation_hash, name, allowed_pools, allowed_scopes_ext, labels, \
      enabled, created_at, key_group, expires_at, deleted_at, revision, idp_subject, binding_mode, \
-     minted_by";
+     minted_by, idp_provider";
 
 /// PARTITION `allowed_scopes` into its two columns: `allowed_pools` (the `pool` kind, a JSON array
 /// of bare names -- byte-for-byte the v3 shape, so a 1.5.x node reading a row mid-rolling-upgrade
@@ -1605,9 +1609,9 @@ impl MysqlStore {
             "INSERT INTO api_keys
                 (id, name, key_group, allowed_pools, allowed_scopes_ext, labels, enabled,
                  generation_hash, created_at, updated_at, expires_at, deleted_at, revision,
-                 idp_subject, binding_mode, minted_by)
+                 idp_subject, binding_mode, minted_by, idp_provider)
              VALUES (:id, :name, :key_group, :pools, :ext, :labels, :enabled, :gen, :created,
-                     :updated, :expires, :deleted, :rev, :idp, :binding, :minted_by)
+                     :updated, :expires, :deleted, :rev, :idp, :binding, :minted_by, :idp_provider)
              ON DUPLICATE KEY UPDATE
                 name = VALUES(name), key_group = VALUES(key_group), allowed_pools = VALUES(allowed_pools),
                 allowed_scopes_ext = VALUES(allowed_scopes_ext),
@@ -1615,7 +1619,7 @@ impl MysqlStore {
                 updated_at = VALUES(updated_at), expires_at = VALUES(expires_at),
                 deleted_at = VALUES(deleted_at), revision = VALUES(revision),
                 idp_subject = VALUES(idp_subject), binding_mode = VALUES(binding_mode),
-                minted_by = VALUES(minted_by)",
+                minted_by = VALUES(minted_by), idp_provider = VALUES(idp_provider)",
             params! {
                 "id" => &key.id,
                 "name" => &key.name,
@@ -1633,6 +1637,7 @@ impl MysqlStore {
                 "idp" => &key.idp_subject,
                 "binding" => &key.binding_mode,
                 "minted_by" => &key.minted_by,
+                "idp_provider" => &key.idp_provider,
             },
         ).await
         .map_err(store_err)?;
@@ -2206,9 +2211,9 @@ impl MysqlStore {
             "INSERT INTO api_keys
                 (id, name, key_group, allowed_pools, allowed_scopes_ext, labels, enabled,
                  generation_hash, created_at, updated_at, expires_at, deleted_at, revision,
-                 idp_subject, binding_mode, minted_by)
+                 idp_subject, binding_mode, minted_by, idp_provider)
              VALUES (:id, :name, :key_group, :pools, :ext, :labels, :enabled, :gen, :created,
-                     :updated, :expires, NULL, :rev, :idp, :binding, :minted_by)",
+                     :updated, :expires, NULL, :rev, :idp, :binding, :minted_by, :idp_provider)",
             params! {
                 "id" => &key.id, "name" => &key.name, "key_group" => &group, "pools" => &pools_json,
                 "ext" => &ext_json,
@@ -2216,6 +2221,7 @@ impl MysqlStore {
                 "created" => key.created_at, "updated" => key.created_at, "expires" => key.expires_at,
                 "rev" => rev, "idp" => &key.idp_subject, "binding" => &key.binding_mode,
                 "minted_by" => &key.minted_by,
+                "idp_provider" => &key.idp_provider,
             },
         ).await
         .map_err(store_err)?;
