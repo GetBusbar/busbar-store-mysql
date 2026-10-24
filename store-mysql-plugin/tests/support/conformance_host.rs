@@ -51,11 +51,10 @@ use std::time::{Duration, Instant};
 use busbar_contract::abi::host::conn::connector::{
     DIRECTION_OUTBOUND, EGRESS_OPERATOR_INFRASTRUCTURE,
 };
-use busbar_contract::abi::mechanism::call::{Blob, Outcome, BLOB_ABSENT};
-use busbar_contract::abi::mechanism::door::DoorFn;
+use busbar_contract::abi::mechanism::call::{Blob, Outcome};
 use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut};
 use busbar_contract::abi::mechanism::rendering::{ReadBlob, ReadNeed};
-use busbar_contract::abi::sdk::door::{blank_in, blank_out};
+use busbar_contract::abi::sdk::door::{blank_in, blank_out, MacroDoor};
 use busbar_contract::abi::transport::slot;
 use busbar_contract::conn::{
     ConnError, ConnId, DeclaredConns, InstanceId, NeedId, OpenDesc, PieceKind, NO_TICKET,
@@ -77,11 +76,11 @@ pub const FAR_END: &str = "localhost:41517";
 /// The framer doors the host serves, as the root links them: (claim, door). One row a line,
 /// whatever the claims' lengths (a `vec!` would be reflowed by rustfmt).
 #[allow(clippy::vec_init_then_push)]
-fn doors() -> Vec<(&'static str, DoorFn)> {
-    use busbar_transport_tcp::linked::door as tcp_door;
+fn doors() -> Vec<(&'static str, MacroDoor)> {
+    use busbar_transport_tcp::door::MACRO_DOOR as tcp_door;
     // Each row is compiled against this repo's own pin of busbar-contract (the rendered `[patch]`),
     // as busbar compiles the rows it links.
-    let mut doors: Vec<(&'static str, DoorFn)> = Vec::new();
+    let mut doors: Vec<(&'static str, MacroDoor)> = Vec::new();
     doors.push(("tcp", tcp_door));
     doors
 }
@@ -192,7 +191,7 @@ fn entries() -> Vec<Entry> {
                 // A transport door is a framer the connector drives: it declares no need.
                 conns: ConnTable::NoNeeds,
             };
-            let plugin = LinkedRow::of(door)
+            let plugin = LinkedRow::of_macro(door)
                 .and_then(|row| load_linked::<Transport>(&row, bind))
                 .unwrap_or_else(|e| panic!("the host's transport `{claim}` does not load: {e}"));
             Entry {
@@ -216,12 +215,7 @@ impl Opened {
             .cloned()
             .unwrap_or_else(|| panic!("the host's transport `{claim}` states no transport tail"));
         let mut i: OpenIn = blank_in();
-        i.settings = Blob {
-            ptr: std::ptr::null(),
-            len: 0,
-            fmt: BLOB_ABSENT,
-            flags: 0,
-        };
+        i.settings = Blob::ABSENT;
         let mut f = Frame::new(i, blank_out::<OpenOut>());
         let opened = plugin.call(life::OPEN, &mut f);
         assert_eq!(
