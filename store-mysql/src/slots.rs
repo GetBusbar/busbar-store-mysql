@@ -545,11 +545,19 @@ async fn v3_slice_release(
             let (slot, left) = held.get_mut(id).expect("every item's slice is held");
             let back = (*unspent).min(*left);
             *left -= back;
+            // A release on window 0 is final (`abi::store` slice life (e)): window 0 never rolls,
+            // so a slice left open would outlive its holder. It closes now; the spent rest stays
+            // counted against the cap, and a later item naming it takes back 0.
+            if slot.5 == 0 {
+                *left = 0;
+            }
             *by_slot.entry(slot.clone()).or_default() += back;
             back_all.push(back);
         }
-        for (id, (_, left)) in &held {
-            if *left == 0 {
+        for (id, (slot, left)) in &held {
+            // A closed window-0 slice stays as a row with nothing left (no schema change): a
+            // second release of it answers 0 where a deleted row would answer "not held".
+            if *left == 0 && slot.5 != 0 {
                 tx.exec_drop(
                     "DELETE FROM store_slices WHERE slice_id = :id",
                     params! { "id" => *id },
