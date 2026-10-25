@@ -12,19 +12,22 @@ on:
   # the tag ref (`gh workflow run release.yml --ref <tag>`).
   workflow_dispatch: {}
 
-permissions:
-  contents: write
-  id-token: write
-  attestations: write
-  issues: write
-  actions: read
+# Nothing by default: each job below is granted exactly what the workflow it calls needs, and is
+# passed only the secrets that workflow declares (never every secret wholesale).
+permissions: {}
 
 jobs:
   ci:
     uses: ./.github/workflows/ci.yml
-    secrets: inherit
+    permissions:
+      contents: read
+    # No secrets: the tagged commit's CI needs none (coverage upload skips without CODECOV_TOKEN).
   release:
     needs: ci
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     uses: GetBusbar/busbar/.github/workflows/plugin-release.yml@71b70e487bebe5ae2feb1fabf32d8906edf4ccad
     with:
       plugin_crate: busbar-store-mysql-plugin
@@ -38,10 +41,15 @@ jobs:
       needs_user: ""
       declares_file: "store-mysql/declares.json"
       former_names: "busbar-store-mysql-plugin"
-    secrets: inherit
+    secrets:
+      BUSBAR_SIGN_KEY: ${{ secrets.BUSBAR_SIGN_KEY }}
+      RELEASE_DISPATCH_TOKEN: ${{ secrets.RELEASE_DISPATCH_TOKEN }}
   consumer-verify:
     needs: release
     if: ${{ !cancelled() }}
+    permissions:
+      contents: read
+      actions: read
     uses: GetBusbar/busbar/.github/workflows/plugin-consumer-verify.yml@71b70e487bebe5ae2feb1fabf32d8906edf4ccad
     with:
       version: ${{ github.ref_name }}
@@ -51,4 +59,3 @@ jobs:
       plugin_kind: store
       bundle_image: ""
       bundle_env: ""
-    secrets: inherit

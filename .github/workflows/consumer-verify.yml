@@ -16,7 +16,6 @@ on:
 
 permissions:
   contents: read
-  issues: write
   actions: read
 
 jobs:
@@ -30,4 +29,3 @@ jobs:
       plugin_kind: store
       bundle_image: ""
       bundle_env: ""
-    secrets: inherit
