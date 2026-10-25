@@ -13,7 +13,7 @@
 //! every parameter and column converts exactly as it did over the driver.
 //!
 //! The surface mirrors the driver's (`Opts::from_url`, `query*`/`exec*`, `Transaction`,
-//! `affected_rows`, `last_insert_id`, `Error` with its `Display`) with every call `async`, so the
+//! `affected_rows`, `Error` with its `Display`) with every call `async`, so the
 //! store's SQL bodies are the 1.5.5 bodies with `.await`. What the driver's pool did around each
 //! checkout is kept too (`MysqlStore`'s kept set): a kept connection is pinged before it is used
 //! (`check_health`) and reset when it comes back (`COM_RESET_CONNECTION` and the store's `init`
@@ -1475,19 +1475,6 @@ impl Conn {
         Ok(Affected(self.affected_rows()))
     }
 
-    /// One prepared statement, run once per parameter set.
-    pub async fn exec_batch<P: Into<Params>>(
-        &mut self,
-        query: impl AsRef<str>,
-        params: impl IntoIterator<Item = P>,
-    ) -> Result<()> {
-        let all: Vec<Params> = params.into_iter().map(Into::into).collect();
-        for p in all {
-            self.exec_drop(query.as_ref(), p).await?;
-        }
-        Ok(())
-    }
-
     /// `COM_PING`.
     pub async fn ping(&mut self) -> Result<()> {
         self.write_command(Command::COM_PING, &[]).await?;
@@ -1563,12 +1550,6 @@ impl Transaction<'_> {
         self.conn.query_drop("ROLLBACK").await?;
         self.done = true;
         Ok(())
-    }
-
-    /// The last statement's insert id (`None` for none).
-    #[must_use]
-    pub fn last_insert_id(&self) -> Option<u64> {
-        self.conn.st.ok.as_ref().and_then(OkPacket::last_insert_id)
     }
 }
 

@@ -33,9 +33,9 @@
 //!   *looks* validated can silently accept garbage. A live functional probe (attempt a CHECK
 //!   violation, confirm it's rejected) is the only way to catch this; a version-string check alone
 //!   is not sufficient since parsing-without-enforcing doesn't show up as a version mismatch.
-//! - The store v3 additions (`slots`: `op_id` dedupe, the journal, sessions, kernel records, the
-//!   money slots and window caps) live in their own tables (schema v8), each written in ONE
-//!   transaction with the `op_id` it is deduped on, so the dedupe is as durable as the effect.
+//! - The store v3 additions (`slots`: `op_id` dedupe and the kernel's records) live in their own
+//!   tables (schema v8), each written in ONE transaction with the `op_id` it is deduped on, so the
+//!   dedupe is as durable as the effect. The store keeps ledger counts and records, not money.
 //! - CONNECTIONS: no socket of the store's own (busbar THE DESIGN, the connections section). The
 //!   door declares one outbound `tcp` need (`slots::NEEDS`, `operator-infrastructure`); every op
 //!   runs on a connection the host's connector dials, kept across ops in a set of at most
@@ -134,18 +134,15 @@ fn store_err<E: std::fmt::Display>(e: E) -> RecordStoreError {
 /// v8: the store v3 door (busbar 1.6.0's plugin ABI). Six NEW tables (`store_ops`, `store_caps`,
 /// `store_slices`, `store_journal`, `store_sessions`, `store_records`); purely additive, no
 /// existing table or row is touched.
-/// v9 (the store kind's epoch and slice life, `abi::store::money` rules (a)-(c)), ADDITIVE:
-/// `store_epoch` (the ONE fleet epoch `reserve` fences with, `0` before any reserve),
-/// `store_slices.valid_until_ms` (the instant a slice expires and its unreturned part goes back to
-/// its window's headroom) and `idx_store_slices_expiry` (a reserve's reclaim of its slots' expired
-/// slices). Slices a v8 build left open (granted `u64::MAX`, never expiring) are stamped to expire
-/// one `SLICE_TTL_MS` after the upgrade on the database's clock, so money a crashed node stranded
-/// under the old never-expires grant is returned rather than held forever -- see
-/// `run_v9_slice_life_upgrade`. Do not run v8 nodes against a v9 database: a v8 node's slice insert
-/// takes the column default `0`, which is already expired, so the next v9 `reserve` returns that
-/// slice to the window at once (the window can be over-granted for up to one TTL), and a v8 node
-/// neither fences on the epoch nor expires anything.
-const SCHEMA_VERSION: u32 = 9;
+/// v9 (the store kind's epoch and slice life), ADDITIVE: `store_epoch`, `store_slices.valid_until_ms`
+/// and `idx_store_slices_expiry`. Neither v8 nor v9 shipped in a release.
+/// v10 (money is a view on ledger x rate card), SUBTRACTIVE: the store keeps only ledger counts
+/// (`usage_windows`, `usage_metering` and their unit tables) and the records the kernel puts. The
+/// tables of the deleted slots go: `store_caps`, `store_slices`, `store_epoch` (caps, slices and the
+/// fence epoch), `store_journal` (`append_batch`) and `store_sessions`. The dedupe rows of the
+/// deleted slots go with them; a row of a kept slot is untouched, so a retry across the upgrade
+/// still answers its original -- see `run_v10_drop_dead_slot_tables`.
+const SCHEMA_VERSION: u32 = 10;
 
 /// The version each one-time migration step targets crossing INTO — named so a gate reads as "did
 /// this database predate step N" rather than a bare magic number, and so a future step can't be
@@ -155,13 +152,7 @@ const SCHEMA_VERSION: u32 = 9;
 const V2_BILLABLE_REQUESTS_BACKFILL: u32 = 2;
 const V3_KEY_GROUP_AT_USE_ASCII_BIN: u32 = 3;
 const V7_PLANE_RECORDS: u32 = 7;
-const V9_SLICE_LIFE: u32 = 9;
-
-/// THE STORE'S ONE CLOCK: the database server's, in ms since the Unix epoch, as a SQL expression.
-/// Computed in UTC (`UTC_TIMESTAMP`), so no session time zone or DST shift enters it. Every node of a
-/// fleet reads the same clock, so a slice's expiry means the same instant on all of them.
-pub(crate) const DB_NOW_MS: &str =
-    "TIMESTAMPDIFF(MICROSECOND, '1970-01-01 00:00:00', UTC_TIMESTAMP(6)) DIV 1000";
+const V10_DEAD_SLOTS: u32 = 10;
 
 const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS store_meta (
@@ -367,7 +358,7 @@ const SCHEMA: &[&str] = &[
     // THE OPEN USAGE UNITS of a metering cell -- every ledgered class the token columns do not hold
     // (`MeteringRow::usage_units`), additive like them. Keyed by the metering cell's own key plus the
     // unit. No foreign key: the parent cell is written first in the same transaction, and
-    // `purge_metering_before` removes both.
+    // a delete of the cell removes both.
     "CREATE TABLE IF NOT EXISTS usage_metering_units (
         bucket CHAR(10) NOT NULL,
         key_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
@@ -394,60 +385,6 @@ const SCHEMA: &[&str] = &[
         answer LONGBLOB NOT NULL
     ) ENGINE=InnoDB",
     "CREATE INDEX idx_store_ops_recorded ON store_ops (recorded_at)",
-    // THE WINDOW CAPS AND WHAT IS DRAWN AGAINST THEM: one row per slot `(bucket, pool, dimension,
-    // class_key, window_start)`. `pooled` tells an absent pool (every pool) from a named one, so
-    // `pool` can sit in the key as ''. `used` is the slot's drawn-and-not-released total; a cap
-    // push never touches it. utf8mb4_bin for the reason the v7 tables give.
-    "CREATE TABLE IF NOT EXISTS store_caps (
-        bucket VARCHAR(191) COLLATE utf8mb4_bin NOT NULL,
-        pooled BOOLEAN NOT NULL,
-        pool VARCHAR(191) COLLATE utf8mb4_bin NOT NULL,
-        dimension INT UNSIGNED NOT NULL,
-        class_key VARCHAR(191) COLLATE utf8mb4_bin NOT NULL,
-        window_start BIGINT UNSIGNED NOT NULL,
-        cap BIGINT UNSIGNED NOT NULL,
-        config_gen BIGINT UNSIGNED NOT NULL,
-        used BIGINT UNSIGNED NOT NULL DEFAULT 0,
-        PRIMARY KEY (bucket, pooled, pool, dimension, class_key, window_start)
-    ) ENGINE=InnoDB",
-    // THE OPEN SLICES: what each grant still holds against its slot, until `slice_release` takes
-    // it back or it expires (`valid_until_ms`, v9, the database's clock). A rolling-window slice
-    // released to zero or expired is deleted; the AUTO_INCREMENT high-water says it was granted.
-    // `idx_store_slices_expiry` (v9) is created by `run_v9_slice_life_upgrade`, after the column.
-    "CREATE TABLE IF NOT EXISTS store_slices (
-        slice_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-        bucket VARCHAR(191) COLLATE utf8mb4_bin NOT NULL,
-        pooled BOOLEAN NOT NULL,
-        pool VARCHAR(191) COLLATE utf8mb4_bin NOT NULL,
-        dimension INT UNSIGNED NOT NULL,
-        class_key VARCHAR(191) COLLATE utf8mb4_bin NOT NULL,
-        window_start BIGINT UNSIGNED NOT NULL,
-        remaining BIGINT UNSIGNED NOT NULL,
-        valid_until_ms BIGINT UNSIGNED NOT NULL DEFAULT 0
-    ) ENGINE=InnoDB",
-    // ── v9 (the store kind's epoch and slice life) ────────────────────────────────────────────
-    //
-    // THE FLEET'S ONE EPOCH (`abi::store::money` (a)): a u64, 0 before any reserve, raised only by a
-    // reserve presenting a higher one, never lowered. The single row is the CHECK-pinned `one = 1`.
-    "CREATE TABLE IF NOT EXISTS store_epoch (
-        one TINYINT UNSIGNED PRIMARY KEY,
-        epoch BIGINT UNSIGNED NOT NULL,
-        CONSTRAINT ck_store_epoch_one CHECK (one = 1)
-    ) ENGINE=InnoDB",
-    // THE JOURNAL (`append_batch`/`heads`): fixed-size records per stream, at seq 1.. in order.
-    "CREATE TABLE IF NOT EXISTS store_journal (
-        stream VARCHAR(191) COLLATE utf8mb4_bin NOT NULL,
-        seq BIGINT UNSIGNED NOT NULL,
-        record VARBINARY(512) NOT NULL,
-        PRIMARY KEY (stream, seq)
-    ) ENGINE=InnoDB",
-    // THE SESSION TABLE (`session_put`/`session_remove`/`sessions_for`).
-    "CREATE TABLE IF NOT EXISTS store_sessions (
-        session BIGINT UNSIGNED PRIMARY KEY,
-        node TEXT NOT NULL,
-        principal VARCHAR(191) COLLATE utf8mb4_bin NOT NULL
-    ) ENGINE=InnoDB",
-    "CREATE INDEX idx_store_sessions_principal ON store_sessions (principal)",
     // THE KERNEL'S DURABLE RECORDS (`record_put`/`record_get`/`record_scan`): `(schema, key) ->
     // value`, read back in KEY ORDER under a prefix. VARBINARY keys compare byte for byte.
     "CREATE TABLE IF NOT EXISTS store_records (
@@ -608,7 +545,7 @@ impl MysqlStore {
     ) -> RecordStoreResult<()> {
         if prior_version > 0 && prior_version < V2_BILLABLE_REQUESTS_BACKFILL {
             // Batched (LIMIT 5000 per statement, looped until exhausted), matching the same
-            // bounded-batch convention purge_windows_before/purge_metering_before already use
+            // bounded-batch convention the plane-record retention already uses
             // elsewhere in this file -- an unbounded single UPDATE across the whole table risks
             // holding its lock/scan for a long time on a large production table, worse than
             // necessary even for a one-time migration.
@@ -875,94 +812,37 @@ impl MysqlStore {
         Ok(())
     }
 
-    /// v9 SCHEMA upgrade (see `SCHEMA_VERSION`), IN PLACE, IDEMPOTENT and safe on a concurrent first
-    /// boot. MySQL DDL commits on its own, so there is no one transaction to hide the steps in; each
-    /// step is instead gated on what the database HAS (like `run_v7_schema_upgrade`) and a lost race
-    /// is "already there" (1060 / 1061), so a crash or a concurrent booter at any point converges.
-    ///
-    /// * the epoch row is seeded at 0 if absent (never overwritten: nothing lowers the epoch);
-    /// * `store_slices.valid_until_ms` is ADDED with a default of the upgrade's own stamp (the
-    ///   database's clock + `SLICE_TTL_MS`), so every slice a v8 build left open expires one TTL
-    ///   after the upgrade the instant the column exists: no window where another node already on v9
-    ///   reads it as `0` (expired) and returns a still-held slice early. The default is then set to
-    ///   `0` (a v9 insert always names its expiry), which leaves the rows already stamped as they are;
-    /// * crossing INTO v9 only, any open slice still at `0` (a v8 node's insert during a rolling
-    ///   upgrade) is stamped the same way;
-    /// * `idx_store_slices_expiry` serves a reserve's reclaim of its slots' expired slices.
-    pub(crate) async fn run_v9_slice_life_upgrade(
+    /// v10 SCHEMA upgrade (see `SCHEMA_VERSION`): the deleted slots' tables and dedupe rows go.
+    /// MySQL DDL commits on its own, so there is no one transaction to hide the steps in; each step
+    /// is idempotent (`DROP TABLE IF EXISTS`, a `DELETE` that matches nothing the second time), and
+    /// the version is stamped only after the last one, so a crash part-way re-runs the whole step.
+    /// The `store_ops` rows kept are those of the three deduped ops that remain (`add_usage_batch`,
+    /// `add_metering_batch`, `append_plane_record`, whose bodies begin `add_usage_batch:`,
+    /// `add_metering_batch:`, `append_plane_record:`); every other row belongs to a deleted slot.
+    pub(crate) async fn run_v10_drop_dead_slot_tables(
         conn: &mut Conn,
         prior_version: u32,
     ) -> RecordStoreResult<()> {
+        if prior_version == 0 || prior_version >= V10_DEAD_SLOTS {
+            return Ok(());
+        }
+        for table in [
+            "store_slices",
+            "store_caps",
+            "store_epoch",
+            "store_journal",
+            "store_sessions",
+        ] {
+            conn.query_drop(format!("DROP TABLE IF EXISTS {table}"))
+                .await
+                .map_err(|e| store_err(format!("schema upgrade failed dropping {table}: {e}")))?;
+        }
         conn.query_drop(
-            "INSERT INTO store_epoch (one, epoch) VALUES (1, 0) ON DUPLICATE KEY UPDATE one = one",
+            "DELETE FROM store_ops WHERE BINARY SUBSTRING_INDEX(body, ':', 1) NOT IN \
+             (BINARY 'add_usage_batch', BINARY 'add_metering_batch', BINARY 'append_plane_record')",
         )
         .await
-        .map_err(store_err)?;
-        let ttl = busbar_contract::abi::store::SLICE_TTL_MS;
-        let stamp = |now: Option<u64>| -> RecordStoreResult<u64> {
-            now.map(|n| n.saturating_add(ttl))
-                .ok_or_else(|| store_err("the database clock read returned no row"))
-        };
-        if !Self::column_exists(conn, "store_slices", "valid_until_ms").await? {
-            let until = stamp(
-                conn.query_first::<u64>(format!("SELECT {DB_NOW_MS}"))
-                    .await
-                    .map_err(store_err)?,
-            )?;
-            Self::ensure_column(
-                conn,
-                "store_slices",
-                "valid_until_ms",
-                &format!("BIGINT UNSIGNED NOT NULL DEFAULT {until}"),
-            )
-            .await?;
-        }
-        let default: Option<Option<String>> = conn
-            .query_first(
-                "SELECT column_default FROM information_schema.columns \
-                 WHERE table_schema = DATABASE() AND table_name = 'store_slices' \
-                 AND column_name = 'valid_until_ms'",
-            )
-            .await
-            .map_err(store_err)?;
-        if default.flatten().as_deref() != Some("0") {
-            conn.query_drop("ALTER TABLE store_slices ALTER COLUMN valid_until_ms SET DEFAULT 0")
-                .await
-                .map_err(|e| {
-                    store_err(format!(
-                        "schema upgrade failed defaulting store_slices.valid_until_ms: {e}"
-                    ))
-                })?;
-        }
-        if prior_version > 0 && prior_version < V9_SLICE_LIFE {
-            let until = stamp(
-                conn.query_first::<u64>(format!("SELECT {DB_NOW_MS}"))
-                    .await
-                    .map_err(store_err)?,
-            )?;
-            conn.exec_drop(
-                "UPDATE store_slices SET valid_until_ms = :until \
-                 WHERE valid_until_ms = 0 AND remaining <> 0",
-                params! { "until" => until },
-            )
-            .await
-            .map_err(store_err)?;
-        }
-        if !Self::index_exists(conn, "store_slices", "idx_store_slices_expiry").await? {
-            if let Err(e) = conn
-                .query_drop(
-                    "CREATE INDEX idx_store_slices_expiry ON store_slices \
-                     (bucket, pooled, pool, dimension, class_key, window_start, valid_until_ms)",
-                )
-                .await
-            {
-                if !Self::is_ddl_race(&e) {
-                    return Err(store_err(format!(
-                        "schema upgrade failed indexing store_slices expiry: {e}"
-                    )));
-                }
-            }
-        }
+        .map_err(|e| store_err(format!("schema upgrade failed pruning store_ops: {e}")))?;
         Ok(())
     }
 
@@ -1061,7 +941,7 @@ impl MysqlStore {
         Self::run_v3_ascii_bin_fix_if_needed(conn, prior_version, "usage_metering").await?;
         Self::run_v7_schema_upgrade(conn, "api_keys", "usage_metering").await?;
         Self::run_v7_plane_record_copy_if_needed(conn, prior_version).await?;
-        Self::run_v9_slice_life_upgrade(conn, prior_version).await?;
+        Self::run_v10_drop_dead_slot_tables(conn, prior_version).await?;
 
         Self::stamp_schema_version(conn, "store_meta").await?;
         conn.query_drop(
@@ -1113,21 +993,6 @@ impl MysqlStore {
                  (got '{sql_mode}') — a truncated write would silently corrupt data instead of \
                  erroring. Set `SET GLOBAL sql_mode='STRICT_ALL_TABLES';` on this server."
             )));
-        }
-
-        // The money slots' transactions run READ COMMITTED (slots.rs, ISOLATION), which InnoDB
-        // refuses to log under STATEMENT-format binary logging (ERROR 1665) - every `reserve`
-        // would fail at runtime. Refuse at open instead.
-        let (binlog_format, log_bin): (String, u64) = conn
-            .query_first("SELECT @@binlog_format, @@log_bin")
-            .await
-            .map_err(store_err)?
-            .unwrap_or_default();
-        if log_bin != 0 && binlog_format.eq_ignore_ascii_case("STATEMENT") {
-            return Err(store_err(
-                "mysql store: binlog_format=STATEMENT cannot log the money slots' READ COMMITTED \
-                 transactions; set binlog_format=ROW",
-            ));
         }
 
         // Session-private TEMPORARY table -- zero contention with real traffic or another node's
@@ -1588,84 +1453,6 @@ impl MysqlStore {
         Ok(())
     }
 
-    /// [`busbar_contract::records::RecordStore::append_audit`] on `q` (see [`Self::add_usage_on`]).
-    pub(crate) async fn append_audit_on(
-        q: &mut Conn,
-        entry: &AuditRecord,
-    ) -> RecordStoreResult<()> {
-        // `ON DUPLICATE KEY UPDATE seq = seq` kept the stored record and said nothing, which is
-        // right for ONE of the two ways a seq collides and wrong for the other. Compare them and
-        // let the difference decide (see the trait contract):
-        //   identical -> the write-through retrying after a lost commit ACK. Common, benign, Ok.
-        //   different -> two records claiming one chain position: a forked or tampered log, and the
-        //                single most important thing an audit store can report.
-        //
-        // INSERT FIRST, and deliberately with NO preceding `SELECT ... FOR UPDATE`.
-        //
-        // The obvious shape — take a row lock, look, then insert — DEADLOCKS here, and measurably:
-        // `SELECT ... FOR UPDATE` on a MISSING row takes a next-key/gap lock under REPEATABLE READ
-        // (which is what `TxOpts::default()` leaves the server on). Two appends of DIFFERENT, both
-        // new seqs land in the same gap; the gap locks are mutually compatible, but each side's
-        // following INSERT needs an insert-intention lock that conflicts with the other's gap lock.
-        // Four threads appending 200 distinct seqs each produced 39 deadlocks that way against 0
-        // for the plain autocommit insert. `append_audit` is also the one control-plane path that
-        // does not call `bump_revision`, so it sits OUTSIDE the `store_sequence` serialization that
-        // makes every other admin-plane transaction deadlock-free — it has no other protection.
-        //
-        // A bare INSERT takes only an insert-intention lock and no gap lock, so the ordinary path
-        // keeps the baseline's concurrency exactly, and the read only happens on the rare collision.
-        //
-        // The loop covers the row being deleted between the insert and the read-back: the seq is
-        // free again, so inserting is the right move. Bounded, and exhausting the bound is an error
-        // rather than a success, so no path here returns Ok without the record being stored.
-        const MAX_ATTEMPTS: u32 = 3;
-        for _ in 0..MAX_ATTEMPTS {
-            let inserted = q
-                .exec_iter(
-                "INSERT INTO audit_log (seq, ts, action, resource, outcome, principal, prev_hash, hash) \
-                 VALUES (:seq, :ts, :action, :resource, :outcome, :principal, :prev, :hash) \
-                 ON DUPLICATE KEY UPDATE seq = seq",
-                params! {
-                    "seq" => entry.seq, "ts" => entry.ts, "action" => &entry.action,
-                    "resource" => &entry.resource, "outcome" => &entry.outcome,
-                    "principal" => &entry.principal, "prev" => &entry.prev_hash, "hash" => &entry.hash,
-                },
-            ).await
-            .map_err(store_err)?
-            .affected_rows();
-            // 1 = inserted. 0 = the seq was already occupied and `seq = seq` changed nothing.
-            if inserted == 1 {
-                return Ok(());
-            }
-            let existing: Option<AuditRowTuple> = q
-                .exec_first(
-                    "SELECT seq, ts, action, resource, outcome, principal, prev_hash, hash \
-                     FROM audit_log WHERE seq = :seq",
-                    params! { "seq" => entry.seq },
-                )
-                .await
-                .map_err(store_err)?;
-            let Some(row) = existing else {
-                continue; // gone between the insert and the read: the seq is free, try again
-            };
-            let stored = audit_from_row(row);
-            if stored == *entry {
-                return Ok(());
-            }
-            return Err(store_err(format!(
-                "append_audit: seq {} already holds a DIFFERENT record; the audit chain has forked \
-                 (stored action '{}', incoming '{}')",
-                entry.seq, stored.action, entry.action
-            )));
-        }
-        Err(store_err(format!(
-            "append_audit: seq {} kept being freed between the insert and the read-back after \
-             {MAX_ATTEMPTS} attempts; something is deleting audit rows concurrently and the record \
-             was NOT stored",
-            entry.seq
-        )))
-    }
-
     /// [`busbar_contract::records::RecordStore::append_plane_record`] on `q` (see [`Self::add_usage_on`]).
     pub(crate) async fn append_plane_record_on(
         q: &mut Conn,
@@ -1906,43 +1693,6 @@ impl MysqlStore {
         .map_err(store_err)?;
 
         tx.commit().await.map_err(store_err)
-    }
-
-    pub(crate) async fn scrub_key(conn: &mut Conn, id: &str) -> RecordStoreResult<()> {
-        let mut tx = conn.start_transaction().await.map_err(store_err)?;
-
-        // bump_revision FIRST — see delete_key's comment on the fixed lock order.
-        let rev = Self::bump_revision(&mut tx).await?;
-
-        let existing: Option<(Option<u64>,)> = tx
-            .exec_first(
-                "SELECT deleted_at FROM api_keys WHERE id = :id FOR UPDATE",
-                params! { "id" => id },
-            )
-            .await
-            .map_err(store_err)?;
-        match existing {
-            None => {
-                tx.rollback().await.map_err(store_err)?;
-                Err(store_err(format!("scrub_key: unknown id '{id}'")))
-            }
-            Some((None,)) => {
-                tx.rollback().await.map_err(store_err)?;
-                Err(store_err(format!(
-                    "scrub_key: key '{id}' is not tombstoned — delete_key first"
-                )))
-            }
-            Some((Some(_),)) => {
-                let now = crate_now();
-                tx.exec_drop(
-                    "UPDATE api_keys SET name = '', labels = '{}', updated_at = :now, revision = :rev \
-                     WHERE id = :id",
-                    params! { "now" => now, "rev" => rev, "id" => id },
-                ).await
-                .map_err(store_err)?;
-                tx.commit().await.map_err(store_err)
-            }
-        }
     }
 
     pub(crate) async fn get_usage(
@@ -2195,82 +1945,6 @@ impl MysqlStore {
             .collect())
     }
 
-    pub(crate) async fn purge_windows_before(
-        conn: &mut Conn,
-        before: u64,
-    ) -> RecordStoreResult<u64> {
-        // Batched AND LOOPED. The batch bound keeps any single DELETE's lock footprint and undo log
-        // small, which is why it is here; without the loop it also silently capped the purge at one
-        // batch, so a retention backlog larger than the cap was never swept and each tick returned a
-        // nonzero count that looked like progress. The contract is "purge every window below the
-        // cutoff", and the returned figure is the total actually deleted.
-        const BATCH: u64 = 5000;
-        let mut total = 0u64;
-        loop {
-            conn.exec_drop(
-                "DELETE FROM usage_windows WHERE window_start < :b LIMIT 5000",
-                params! { "b" => before },
-            )
-            .await
-            .map_err(store_err)?;
-            let n = conn.affected_rows();
-            total += n;
-            if n < BATCH {
-                break;
-            }
-        }
-        // The same windows' OPEN units, swept by the same rule. Not added to the returned figure:
-        // that counts the ledger rows the contract names, and a unit row is part of one of them.
-        loop {
-            conn.exec_drop(
-                "DELETE FROM usage_window_units WHERE window_start < :b LIMIT 5000",
-                params! { "b" => before },
-            )
-            .await
-            .map_err(store_err)?;
-            if conn.affected_rows() < BATCH {
-                break;
-            }
-        }
-        Ok(total)
-    }
-
-    pub(crate) async fn purge_metering_before(
-        conn: &mut Conn,
-        bucket: &str,
-    ) -> RecordStoreResult<u64> {
-        // The `bucket` column is CHAR(10) and BOTH the write path (`add_metering`) and the read path
-        // (`list_metering`) zero-pad into it. Only this method compared the caller's string as given,
-        // so the obvious caller (a u64 bucket rendered the obvious way) matched zero of its own rows
-        // and got a successful purge of nothing. Pad the same way; a bucket that is not an
-        // integer is refused (it would match nothing and report a successful purge).
-        let n: u64 = bucket.trim().parse().map_err(|_| {
-            store_err(format!(
-                "purge_metering_before: invalid bucket {bucket:?}, expected an integer"
-            ))
-        })?;
-        let padded = format!("{n:010}");
-        let mut tx = conn.start_transaction().await.map_err(store_err)?;
-        // The cells' open units go with them, in the same transaction.
-        tx.exec_drop(
-            "DELETE FROM usage_metering_units WHERE bucket = :b",
-            params! { "b" => &padded },
-        )
-        .await
-        .map_err(store_err)?;
-        tx.exec_drop(
-            "DELETE FROM usage_metering WHERE bucket = :b",
-            params! { "b" => &padded },
-        )
-        .await
-        .map_err(store_err)?;
-        // Read BEFORE the commit: `affected_rows` reports the LAST statement on this connection,
-        // and the COMMIT is one. This is the number of metering CELLS removed.
-        let removed = tx.affected_rows();
-        tx.commit().await.map_err(store_err)?;
-        Ok(removed)
-    }
-
     pub(crate) async fn put_credential(
         conn: &mut Conn,
         secret: &CredentialSecret,
@@ -2439,40 +2113,6 @@ impl MysqlStore {
             ).await
             .map_err(store_err)?;
         rows.into_iter().map(Self::row_to_cred_meta).collect()
-    }
-
-    pub(crate) async fn lookup_credential_secret(
-        conn: &mut Conn,
-        kind: &str,
-        public_id: &str,
-    ) -> RecordStoreResult<Option<CredentialSecret>> {
-        let row: Option<(Row, Option<String>)> = conn
-            .exec_first(
-                "SELECT id, key_id, kind, slot, public_id, secret_form, created_at, updated_at, \
-                 expires_at, revoked_at, revoke_reason, revision, secret FROM credentials \
-                 WHERE kind = :kind AND public_id = :pub",
-                params! { "kind" => kind, "pub" => public_id },
-            )
-            .await
-            .map_err(store_err)
-            .and_then(|r: Option<Row>| {
-                r.map(|mut row| {
-                    let secret: Option<String> = row.take("secret");
-                    Ok((row, secret))
-                })
-                .transpose()
-            })?;
-
-        match row {
-            None => Ok(None),
-            Some((row, secret)) => {
-                let meta = Self::row_to_cred_meta(row)?;
-                Ok(Some(CredentialSecret {
-                    meta,
-                    secret: secret.unwrap_or_default(),
-                }))
-            }
-        }
     }
 
     pub(crate) async fn revoke_credential(
@@ -2746,7 +2386,7 @@ impl MysqlStore {
             return Ok(removed);
         }
         // Every other kind drops ALL of its rows older than the cutoff. Batched and looped, like
-        // `purge_windows_before`: the batch bound keeps any one DELETE's lock footprint small, and
+        // the other retention sweeps: the batch bound keeps any one DELETE's lock footprint small, and
         // the loop makes the contract -- every row below the cutoff -- actually hold for a backlog
         // larger than one batch.
         const BATCH: u64 = 5000;

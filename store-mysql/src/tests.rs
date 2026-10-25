@@ -12,6 +12,29 @@ use std::collections::BTreeMap;
 mod harness;
 use harness::MysqlStore;
 
+/// The verify path's read, which is no longer a store op: a credential's secret by `(kind,
+/// public_id)`, read back through the revision delta (which carries every row, revoked or not).
+trait Lookup {
+    fn lookup_credential_secret(
+        &self,
+        kind: &str,
+        public_id: &str,
+    ) -> RecordStoreResult<Option<CredentialSecret>>;
+}
+
+impl Lookup for MysqlStore {
+    fn lookup_credential_secret(
+        &self,
+        kind: &str,
+        public_id: &str,
+    ) -> RecordStoreResult<Option<CredentialSecret>> {
+        Ok(self
+            .list_credentials_since(0)?
+            .into_iter()
+            .find(|c| c.meta.kind == kind && c.meta.public_id == public_id))
+    }
+}
+
 /// A name-keyed `usage_units` map from literal pairs — the 1.6.0 shape of what used to be the four
 /// `TierTokens`/`TierTokensDelta` fields.
 fn units<V: Copy>(pairs: &[(&str, V)]) -> BTreeMap<String, V> {
@@ -95,14 +118,6 @@ fn root_url(url: &str) -> String {
     url.replacen("busbar:busbar@", &format!("root:{password}@"), 1)
 }
 
-/// `purge_windows_before` is UNSCOPED by contract: it deletes every window below the cutoff, across
-/// every bucket. That is correct for a retention sweep and incompatible with this suite's usual
-/// isolation-by-unique-id, so the purge test and the tests that read a window back must not run at
-/// the same time. They cannot be isolated by a throwaway database either: the CI user has no
-/// CREATE DATABASE privilege (see the note above the backfill tests). One shared lock, held only by
-/// the handful of tests that care, keeps the rest of the suite parallel.
-static USAGE_WINDOWS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// The two tests that build a WHOLE schema from nothing against their own throwaway database (the
 /// v2 real-wiring test and the v4->v5 task-store migration) run ~25 DDL statements apiece. MySQL 8's
 /// data dictionary is shared ACROSS databases, so that DDL contends even though the two databases do
@@ -116,10 +131,6 @@ fn lock_fresh_database_ddl() -> std::sync::MutexGuard<'static, ()> {
     FRESH_DATABASE_DDL_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-}
-
-fn lock_usage_windows() -> std::sync::MutexGuard<'static, ()> {
-    USAGE_WINDOWS_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn sample_key(id: &str, generation: &str) -> VirtualKey {
@@ -318,34 +329,6 @@ fn tombstone_and_credential_destruction_share_one_transaction() {
     );
 }
 
-#[test]
-fn scrub_key_requires_tombstone_first() {
-    let Some(s) = fresh_store() else { return };
-    let mut k = sample_key("vk_scrub", "g");
-    k.labels.insert("env".to_string(), "prod".to_string());
-    s.put_key(&k).unwrap();
-    assert!(
-        s.scrub_key("vk_scrub").is_err(),
-        "scrub on a LIVE key must error"
-    );
-    s.delete_key("vk_scrub").unwrap();
-    let before = s.get_key("vk_scrub").unwrap().unwrap();
-    assert!(
-        !before.labels.is_empty(),
-        "precondition: labels survive delete"
-    );
-    s.scrub_key("vk_scrub").unwrap();
-    let row = s.get_key("vk_scrub").unwrap().unwrap();
-    assert_eq!(row.name, "");
-    assert!(row.labels.is_empty(), "scrub must clear labels");
-    assert!(
-        row.revision > before.revision,
-        "scrub must bump the revision: {} > {}",
-        row.revision,
-        before.revision
-    );
-}
-
 // ── Credentials: slot bounds, revoke, secret isolation ──────────────────────────────────────────
 
 #[test]
@@ -430,7 +413,6 @@ fn public_id_lookup_is_case_sensitive() {
 
 #[test]
 fn put_and_get_usage_roundtrips() {
-    let _guard = lock_usage_windows();
     let Some(s) = fresh_store() else { return };
     let ledger = UsageLedger {
         requests: 5,
@@ -456,7 +438,6 @@ fn put_and_get_usage_roundtrips() {
 /// count, and budget hydration reads the window as N times its real usage.
 #[test]
 fn usage_request_counters_do_not_multiply_with_the_model_count() {
-    let _guard = lock_usage_windows();
     let Some(s) = fresh_store() else { return };
     let model = |name: &str| ModelTokens {
         model: name.to_string(),
@@ -512,7 +493,6 @@ fn usage_request_counters_do_not_multiply_with_the_model_count() {
 /// real: a window whose requests were all refunded to zero tokens still has a request count.
 #[test]
 fn usage_with_no_model_breakdown_still_records_its_request_counters() {
-    let _guard = lock_usage_windows();
     let Some(s) = fresh_store() else { return };
     let ledger = UsageLedger {
         requests: 4,
@@ -540,7 +520,6 @@ fn usage_with_no_model_breakdown_still_records_its_request_counters() {
 /// 1.5.5 golden stays deterministic; this test is where the split itself stays proven.
 #[test]
 fn a_request_split_across_two_flushes_keeps_its_count_across_a_reconnect() {
-    let _guard = lock_usage_windows();
     let Some(s) = fresh_store() else { return };
     let admission = UsageDelta {
         requests: 1,
@@ -572,98 +551,6 @@ fn a_request_split_across_two_flushes_keeps_its_count_across_a_reconnect() {
     assert_eq!(back.models[0].tier(UNIT_OUTPUT), 7, "{back:?}");
 }
 
-/// `purge_metering_before` must match the rows `add_metering` actually wrote. The bucket column is
-/// `CHAR(10)` and both the write and the read zero-pad into it; only the purge compared the caller's
-/// raw string, so a caller passing the unpadded form matched nothing and got a successful purge of
-/// zero rows. A retention sweep that reports success having deleted nothing is the shape this whole
-/// release has been chasing.
-#[test]
-fn purge_metering_before_matches_the_padding_the_write_path_uses() {
-    let Some(s) = fresh_store() else { return };
-    s.put_key(&sample_key("vk_purge_meter", "g")).unwrap();
-    let bucket = 20_260_731u64;
-    s.add_metering(&MeteringDelta {
-        key_id: "vk_purge_meter".to_string(),
-        bucket,
-        model: "m".to_string(),
-        provider: "p".to_string(),
-        tokens_input: 1,
-        tokens_output: 1,
-        tokens_cache_read: 0,
-        tokens_cache_write: 0,
-        requests: 1,
-        billable_requests: 1,
-        key_group_at_use: String::new(),
-        pricing_version: String::new(),
-        priced_from_ms: 0,
-        usage_units: BTreeMap::new(),
-    })
-    .unwrap();
-    assert!(
-        s.list_metering(bucket)
-            .unwrap()
-            .iter()
-            .any(|r| r.key_id == "vk_purge_meter"),
-        "precondition: the metering row must exist"
-    );
-
-    // The caller has a u64 bucket and renders it the obvious way. That is the form the trait's
-    // `&str` parameter invites, and it must reach the padded rows.
-    let purged = s.purge_metering_before(&bucket.to_string()).unwrap();
-    assert!(
-        purged >= 1,
-        "the purge must actually match the stored rows, got {purged} deleted"
-    );
-    assert!(
-        !s.list_metering(bucket)
-            .unwrap()
-            .iter()
-            .any(|r| r.key_id == "vk_purge_meter"),
-        "the named bucket must be gone after the purge"
-    );
-}
-
-/// `purge_windows_before` must purge EVERY window below the cutoff, not one capped batch. The
-/// contract is "purge every window whose window_start < before"; a single `LIMIT 5000` statement
-/// leaves a backlog larger than the cap permanently un-swept while returning a nonzero count each
-/// tick that looks like progress.
-#[test]
-fn purge_windows_before_sweeps_past_a_single_batch() {
-    let _guard = lock_usage_windows();
-    let Some(s) = fresh_store() else { return };
-    // Well clear of every other test's windows, and above the batch size so one capped statement
-    // cannot finish the job.
-    let base = 7_000_000u64;
-    let n = 5_200u64;
-    {
-        let mut conn = s.pool.get_conn().unwrap();
-        let mut sql = String::from(
-            "INSERT INTO usage_windows (window_start, bucket_scope, bucket_id, model, requests) VALUES ",
-        );
-        for i in 0..n {
-            if i > 0 {
-                sql.push(',');
-            }
-            sql.push_str(&format!("({}, 'key', 'vk_purge_sweep', '', 1)", base + i));
-        }
-        conn.query_drop(sql).unwrap();
-    }
-
-    let purged = s.purge_windows_before(base + n).unwrap();
-    assert!(
-        purged >= n,
-        "every window below the cutoff must be purged and counted, not just one capped batch: \
-         expected at least {n}, got {purged}"
-    );
-    let left: u64 = {
-        let mut conn = s.pool.get_conn().unwrap();
-        conn.query_first("SELECT COUNT(*) FROM usage_windows WHERE bucket_id = 'vk_purge_sweep'")
-            .unwrap()
-            .unwrap_or(0)
-    };
-    assert_eq!(left, 0, "no window below the cutoff may survive the purge");
-}
-
 #[test]
 fn get_usage_on_an_empty_window_returns_zeroes_not_a_panic() {
     // Regression test: `SUM(x)` with no GROUP BY always returns exactly one row even when zero
@@ -680,10 +567,6 @@ fn get_usage_on_an_empty_window_returns_zeroes_not_a_panic() {
 
 #[test]
 fn add_usage_accumulates_and_floors_at_zero() {
-    // Reads a usage window back, so it has to be serialised against the UNSCOPED
-    // `purge_windows_before` like the other window-reading tests. It was missed when that lock was
-    // introduced, which left it losing its rows to a concurrent purge about 1 run in 18.
-    let _guard = lock_usage_windows();
     let Some(s) = fresh_store() else { return };
     let delta = UsageDelta {
         requests: 3,
@@ -901,7 +784,7 @@ fn connect_establishes_strict_sql_mode_via_init_even_when_the_default_would_be_p
 
 // ── Lock ordering ─────────────────────────────────────────────────────────────────────────────────
 
-/// `delete_key`/`scrub_key` must lock `store_sequence` (via `bump_revision`) BEFORE locking the
+/// `delete_key` must lock `store_sequence` (via `bump_revision`) BEFORE locking the
 /// `api_keys` row, matching every other control-plane transaction (`put_key`, `put_credential`,
 /// `revoke_credential`) — that fixed order is what the module doc claims makes deadlock across the
 /// admin plane structurally impossible. Proves it by racing a tight loop of `put_key` against a tight
@@ -1301,7 +1184,6 @@ fn read_prior_version_hard_fails_on_a_corrupt_stored_value() {
 /// row of another scope for the same bucket id and window is not this bucket's usage.
 #[test]
 fn get_usage_ignores_usage_windows_rows_of_another_scope() {
-    let _guard = lock_usage_windows();
     let Some(s) = fresh_store() else { return };
     let bucket = "vk_scope_pin_unique";
     let window = 7_700_000_000_123u64;
@@ -1766,15 +1648,6 @@ mod conformance {
     }
 
     #[test]
-    fn append_audit_duplicate_seq_is_ok_when_identical_and_an_error_when_different() {
-        let seq = 910_000_000u64 + (std::process::id() as u64 % 1_000_000);
-        let Some((store, _ns)) = setup("aud", seq) else {
-            return;
-        };
-        conf::assert_append_audit_duplicate_seq(&**store, seq);
-    }
-
-    #[test]
     fn plane_task_upsert_get_list() {
         let Some((store, ns)) = setup("ptk", 0) else {
             return;
@@ -1874,90 +1747,6 @@ mod conformance {
             b.join().expect("run B must not panic");
         });
     }
-}
-
-/// Concurrent appends of DIFFERENT seqs must not deadlock.
-///
-/// The duplicate-seq comparison was first written as `SELECT ... FOR UPDATE` then INSERT. Under
-/// REPEATABLE READ (what `TxOpts::default()` leaves the server on) a `FOR UPDATE` on a MISSING row
-/// takes a next-key/gap lock; two appends of different, both-new seqs land in the same gap, and each
-/// side's following INSERT needs an insert-intention lock that conflicts with the other's gap lock.
-/// Four threads over 200 distinct seqs each produced 39 `ERROR 1213` deadlocks that way, against 0
-/// for the plain insert it replaced. `append_audit` is also the one control-plane path that does not
-/// call `bump_revision`, so it sits outside the `store_sequence` serialization that keeps every other
-/// admin-plane transaction deadlock-free.
-///
-/// A durable audit write-through failing under ordinary multi-node load defeats the whole point of
-/// the durable sink, so this pins it.
-#[test]
-fn concurrent_appends_of_distinct_seqs_never_deadlock() {
-    // ONE store, shared by every thread, instead of one `connect()` per worker.
-    //
-    // `MysqlStore::connect` re-runs the whole schema DDL on every call (`init_schema`), and doing
-    // that mid-suite makes sibling tests holding `SELECT ... FOR UPDATE` fail with
-    // `ERROR 1412 (Table definition has changed, please retry transaction)`. An earlier version of
-    // this test connected six extra times and took a suite that was 20/20 clean to 3/20 failing --
-    // while the commit adding it claimed to have REMOVED mid-suite connects. The pool inside one
-    // store is what provides the concurrency here; extra stores only bought extra DDL.
-    let Some(url) = test_url() else { return };
-    let base = 940_000_000u64 + (std::process::id() as u64 % 100_000) * 1_000;
-    let shared = std::sync::Arc::new(MysqlStore::connect(&url).expect("connect"));
-    // Join the one-time wipe barrier before writing anything, or it can fire mid-run and truncate
-    // `audit_log` underneath these 200 appends.
-    ensure_reset(&shared);
-    {
-        let store = std::sync::Arc::clone(&shared);
-        let mut conn = store.conn().expect("conn");
-        let _ = conn.exec_drop(
-            "DELETE FROM audit_log WHERE seq >= :lo AND seq < :hi",
-            params! { "lo" => base, "hi" => base + 1_000 },
-        );
-    }
-
-    let threads: Vec<_> = (0..4u64)
-        .map(|t| {
-            let store = std::sync::Arc::clone(&shared);
-            std::thread::spawn(move || {
-                for i in 0..50u64 {
-                    let seq = base + t * 100 + i;
-                    let rec = AuditRecord {
-                        seq,
-                        ts: 1_700_000_000,
-                        action: "key.mint".into(),
-                        resource: format!("key:vk_{seq}"),
-                        outcome: "applied".into(),
-                        principal: "admin".into(),
-                        prev_hash: String::new(),
-                        hash: format!("h{seq}"),
-                    };
-                    if let Err(e) = store.append_audit(&rec) {
-                        let msg = e.to_string();
-                        assert!(
-                            !msg.contains("Deadlock") && !msg.contains("1213"),
-                            "concurrent appends of DISTINCT seqs deadlocked: {msg}"
-                        );
-                        panic!("append_audit failed unexpectedly: {msg}");
-                    }
-                }
-            })
-        })
-        .collect();
-    for h in threads {
-        h.join().expect("no append thread may fail");
-    }
-
-    let mut conn = shared.conn().expect("conn");
-    let n: Option<u64> = conn
-        .exec_first(
-            "SELECT COUNT(*) FROM audit_log WHERE seq >= :lo AND seq < :hi",
-            params! { "lo" => base, "hi" => base + 1_000 },
-        )
-        .unwrap();
-    assert_eq!(n, Some(200), "every distinct append must be durably stored");
-    let _ = conn.exec_drop(
-        "DELETE FROM audit_log WHERE seq >= :lo AND seq < :hi",
-        params! { "lo" => base, "hi" => base + 1_000 },
-    );
 }
 
 // ── THE NEUTRAL PLANE-RECORD STORE (busbar 1.6.0) ─────────────────────────────────────────────
@@ -3416,7 +3205,6 @@ fn the_1_6_0_key_fields_round_trip() {
 /// absolute `put_usage`.
 #[test]
 fn open_usage_units_round_trip_accumulate_and_floor_at_zero() {
-    let _guard = lock_usage_windows();
     let Some(s) = fresh_store() else { return };
     let ledger = UsageLedger {
         requests: 2,
@@ -3472,18 +3260,6 @@ fn open_usage_units_round_trip_accumulate_and_floor_at_zero() {
     };
     s.put_usage("vk_open_units", 1_000_201, &replaced).unwrap();
     assert_eq!(s.get_usage("vk_open_units", 1_000_201).unwrap(), replaced);
-
-    // And the retention sweep takes a window's open units with it.
-    s.purge_windows_before(1_000_202).unwrap();
-    let mut conn = s.conn().unwrap();
-    let left: Option<u64> = conn
-        .query_first("SELECT COUNT(*) FROM usage_window_units WHERE bucket_id = 'vk_open_units'")
-        .unwrap();
-    assert_eq!(
-        left,
-        Some(0),
-        "a purged window leaves no open-unit rows behind"
-    );
 }
 
 fn metering_delta(key: &str, bucket: u64, priced_from_ms: u64) -> MeteringDelta {
@@ -3538,22 +3314,6 @@ fn metering_cells_split_on_priced_from_ms_and_carry_open_units() {
     assert_eq!(rows[1].priced_from_ms, 1_780_000_000_000);
     assert_eq!(rows[1].requests, 1);
     assert_eq!(rows[1].usage_units, units(&[("tool_calls", 2)]));
-
-    assert!(s.purge_metering_before(&bucket.to_string()).unwrap() >= 2);
-    assert!(s
-        .list_metering(bucket)
-        .unwrap()
-        .iter()
-        .all(|r| r.key_id != "vk_meter79"));
-    let mut conn = s.conn().unwrap();
-    let left: Option<u64> = conn
-        .query_first("SELECT COUNT(*) FROM usage_metering_units WHERE key_id = 'vk_meter79'")
-        .unwrap();
-    assert_eq!(
-        left,
-        Some(0),
-        "a purged cell leaves no open-unit rows behind"
-    );
 }
 
 // ── The store v3 slots (the door's additions to the 1.5.5 op set) ─────────────────────────────
@@ -4265,51 +4025,4 @@ fn a_newer_schema_is_refused_at_open() {
         .unwrap();
     assert!(recreated.is_none(), "no DDL ran before the refusal");
     assert_eq!(schema_version_of(&db), newer.to_string(), "not restamped");
-}
-
-#[test]
-fn purge_metering_before_refuses_a_bucket_that_is_not_an_integer() {
-    let Some(s) = fresh_store() else { return };
-    for bucket in ["abc", "", "12x", "-1", "1.5"] {
-        let e = s.purge_metering_before(bucket).unwrap_err().to_string();
-        assert!(
-            e.contains(&format!(
-                "purge_metering_before: invalid bucket {bucket:?}, expected an integer"
-            )),
-            "{bucket:?}: {e}"
-        );
-    }
-}
-
-/// A server logging in STATEMENT format cannot log the money slots' READ COMMITTED transactions
-/// (ERROR 1665); the open refuses it. The session is set by root; skipped where the binlog is off.
-#[test]
-fn statement_binlog_format_is_refused_at_open() {
-    let Some(url) = test_url() else { return };
-    let opts = std::sync::Arc::new(crate::mysqlwire::Opts::from_url(&root_url(&url)).unwrap());
-    let probe = |fmt: &str| {
-        let set = format!("SET SESSION binlog_format = '{fmt}'");
-        let mut c = harness::block_on(crate::mysqlwire::Conn::open_tcp(
-            &opts,
-            &[crate::INIT[0], set.as_str()],
-        ))
-        .expect("root connects");
-        let log_bin: Option<u64> = harness::block_on(c.query_first("SELECT @@log_bin")).unwrap();
-        (
-            log_bin.unwrap_or(0),
-            harness::block_on(crate::MysqlStore::probe_invariants(&mut c)),
-        )
-    };
-    let (log_bin, row) = probe("ROW");
-    assert!(row.is_ok(), "ROW passes: {row:?}");
-    if log_bin == 0 {
-        eprintln!("skip: the server's binary log is off");
-        return;
-    }
-    let (_, stmt) = probe("STATEMENT");
-    let e = stmt.expect_err("STATEMENT is refused").0;
-    assert!(
-        e.contains("binlog_format=STATEMENT cannot log the money slots' READ COMMITTED"),
-        "{e}"
-    );
 }
