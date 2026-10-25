@@ -107,6 +107,11 @@ pub enum DriverError {
     UnknownAuthPlugin(String),
     OldMysqlPasswordDisabled,
     CleartextPluginDisabled,
+    /// RULING S5: `caching_sha2_password` full authentication over TCP with no pinned server key
+    /// (`address`); nothing was sent.
+    RsaKeyNotPinned(String),
+    /// A chip refusal of an auth step the operator's URL does not allow (`sentence`, `address`).
+    CredentialRefused(String, String),
 }
 
 impl fmt::Display for DriverError {
@@ -145,6 +150,18 @@ impl fmt::Display for DriverError {
             ),
             DriverError::CleartextPluginDisabled => {
                 write!(f, "mysql_clear_password must be enabled on the client side")
+            }
+            DriverError::RsaKeyNotPinned(addr) => write!(
+                f,
+                "the server `{addr}' asked for caching_sha2_password full authentication, which \
+                 over TCP sends the password encrypted to a key the server supplies on this \
+                 unencrypted connection: busbar sends it only to a key the operator pinned. Add \
+                 `server_public_key_sha256=<hex SHA-256 of the server's public key DER>` to the \
+                 URL, connect over the server's unix socket (`socket=`), or log in once over a \
+                 secure channel so the server caches the account (fast authentication)"
+            ),
+            DriverError::CredentialRefused(why, addr) => {
+                write!(f, "{why} (server `{addr}')")
             }
         }
     }
@@ -283,6 +300,10 @@ pub struct Opts {
     pub secure_auth: bool,
     pub enable_cleartext_plugin: bool,
     pub stmt_cache_size: usize,
+    /// The password the auth steps run on (an empty one when the URL has none), carrying the
+    /// operator's auth floor (rulings S4, S5): the cleartext and old-password switches, the unix
+    /// socket and the `server_public_key_sha256` pin.
+    pub cred: Cred,
 }
 
 impl fmt::Debug for Opts {
@@ -388,6 +409,7 @@ impl Opts {
             secure_auth: true,
             enable_cleartext_plugin: false,
             stmt_cache_size: STMT_CACHE_DEFAULT,
+            cred: input.credential(),
         };
         let pairs: HashMap<String, String> = url.query_pairs().into_owned().collect();
         for (key, value) in &pairs {
@@ -426,6 +448,13 @@ impl Opts {
                     opts.enable_cleartext_plugin = value.parse().map_err(|_| invalid())?;
                 }
                 "secure_auth" => opts.secure_auth = value.parse().map_err(|_| invalid())?,
+                // RULING S5: the pin of the server's RSA key for caching_sha2_password full
+                // authentication over TCP (the chip reads it from the URL itself).
+                "server_public_key_sha256" => {
+                    if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+                        return Err(invalid());
+                    }
+                }
                 "compress" => match value.parse::<u32>() {
                     Ok(_) => opts.compress = true,
                     Err(_) => match value.as_str() {
@@ -658,6 +687,18 @@ impl State {
             socket,
         }
     }
+}
+
+/// A credential refused before any byte of it went out, recorded as a credential event in the
+/// plugin's log (rulings S4, S5).
+fn audit_refused(server: &str, reason: &str) {
+    tracing::warn!(
+        target: "busbar::credential",
+        outcome = "refused",
+        server = %server,
+        reason = %reason,
+        "mysql store: credential refused: the auth step is below the operator's floor"
+    );
 }
 
 /// An auth step that may switch plugins and continue (the one recursive path).
@@ -1000,7 +1041,7 @@ impl Conn {
             .collect();
         let user = self.st.opts.user.clone().unwrap_or_default();
         let db = self.st.opts.db_name.clone();
-        let pass = self.st.opts.pass.clone().unwrap_or_else(Cred::empty);
+        let pass = self.st.opts.cred.clone();
         let nonce = self.st.nonce.clone();
         let response = MysqlHandshake {
             seq: 0,
@@ -1035,7 +1076,11 @@ impl Conn {
             self.broken = true;
             return Err(Error::CodecError(e));
         }
-        let seal = build(probe[3]).map_err(|r| Error::IoError(r.to_string()))?;
+        let seal = build(probe[3]).map_err(|r| {
+            let addr = self.st.opts.address();
+            audit_refused(&addr, r.0);
+            Error::DriverError(DriverError::CredentialRefused(r.0.to_string(), addr))
+        })?;
         let written = match &mut self.io {
             Io::Wire(w) => w.write_sealed(&seal).await.map_err(|e| e.to_string()),
             #[cfg(test)]
@@ -1064,6 +1109,7 @@ impl Conn {
             }
             AuthPlugin::MysqlClearPassword => {
                 if !self.st.opts.enable_cleartext_plugin {
+                    audit_refused(&self.st.opts.address(), "mysql_clear_password not enabled");
                     return Err(DriverError::CleartextPluginDisabled.into());
                 }
                 self.continue_native(auth_switched).await
@@ -1123,9 +1169,10 @@ impl Conn {
                     self.handle_ok::<CommonOkPacket>(&payload)
                 }
                 // Full authentication: the password in clear over a socket, else RSA-encrypted
-                // with the server's public key (this connection is never TLS).
+                // with the server's public key (this connection is never TLS) — only to a key the
+                // operator pinned (ruling S5).
                 Some(0x04) => {
-                    let pass = self.st.opts.pass.clone().unwrap_or_else(Cred::empty);
+                    let pass = self.st.opts.cred.clone();
                     if self.st.socket {
                         self.write_sealed_packet(|seq| pass.mysql_clear_packet(seq))
                             .await?;
@@ -1133,6 +1180,11 @@ impl Conn {
                         // The chip XORs with the nonce cyclically; a switch request may carry none.
                         if self.st.nonce.is_empty() {
                             return Err(DriverError::UnexpectedPacket.into());
+                        }
+                        if pass.floor().rsa_pin().is_none() {
+                            let addr = self.st.opts.address();
+                            audit_refused(&addr, "rsa full authentication with no pinned key");
+                            return Err(DriverError::RsaKeyNotPinned(addr).into());
                         }
                         self.write_packet(&[0x02]).await?;
                         let payload = self.read_packet().await?;
@@ -1159,6 +1211,10 @@ impl Conn {
 
     async fn auth_switch(&mut self, req: AuthSwitchRequest<'static>) -> Result<()> {
         if matches!(req.auth_plugin(), AuthPlugin::MysqlOldPassword) && self.st.opts.secure_auth {
+            audit_refused(
+                &self.st.opts.address(),
+                "mysql_old_password with secure_auth on",
+            );
             return Err(DriverError::OldMysqlPasswordDisabled.into());
         }
         if matches!(
@@ -1166,6 +1222,7 @@ impl Conn {
             AuthPlugin::Other(Cow::Borrowed(b"mysql_clear_password"))
         ) && !self.st.opts.enable_cleartext_plugin
         {
+            audit_refused(&self.st.opts.address(), "mysql_clear_password not enabled");
             return Err(DriverError::CleartextPluginDisabled.into());
         }
         self.st.nonce = req.plugin_data().to_vec();
@@ -1191,7 +1248,7 @@ impl Conn {
         };
         match auth {
             Some(a) => {
-                let pass = self.st.opts.pass.clone().unwrap_or_else(Cred::empty);
+                let pass = self.st.opts.cred.clone();
                 let nonce = self.st.nonce.clone();
                 self.write_sealed_packet(|seq| pass.mysql_auth_switch_response(seq, a, &nonce))
                     .await?;
@@ -1662,6 +1719,186 @@ mod tests {
         assert!(run(conn.continue_caching_sha2(true)).is_err());
         drop(conn);
         server.join().unwrap();
+    }
+
+    /// A throwaway 1024-bit RSA public key, as MySQL sends it, and the SHA-256 of its DER.
+    const PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----
+MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDAeGNPEkihhFwx9XuiW0X6VMAp
+LuC5WLdzvwnpZSXfmzok6brqc60v9bnBiCl/T9O5m7/eLcck0usOyQ9eV5p9T4Y4
+ijJ7b5W7pYuuReJdv9h481JKwwV75KY1M6dRf7kpYFOCA4Zo8xgdso69qxPTVUXL
+9WgH5N2PTtsNkF6eCwIDAQAB
+-----END PUBLIC KEY-----
+";
+    const PIN: &str = "6ddde6e6398722551e6dd73f2c62f247560990a999022d11fc55198facec8e98";
+
+    /// A server that asks for caching_sha2 full authentication, serves [`PEM`] when asked, and
+    /// answers OK: every packet the client sent, in order, comes back from the join.
+    fn full_auth_server(url: &str) -> (Conn, std::thread::JoinHandle<Vec<Vec<u8>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut s = listener.accept().unwrap().0;
+            s.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            s.write_all(&packet(0, &[0x01, 0x04])).unwrap();
+            let mut got = Vec::new();
+            loop {
+                let mut head = [0_u8; 4];
+                if s.read_exact(&mut head).is_err() {
+                    return got;
+                }
+                let len = u32::from_le_bytes([head[0], head[1], head[2], 0]) as usize;
+                let mut body = vec![0_u8; len];
+                if s.read_exact(&mut body).is_err() {
+                    return got;
+                }
+                got.push(body.clone());
+                if body == [0x02] {
+                    let mut key = vec![0x01];
+                    key.extend_from_slice(PEM);
+                    s.write_all(&packet(head[3] + 1, &key)).unwrap();
+                } else {
+                    s.write_all(&packet(head[3] + 1, &[0, 0, 0, 2, 0, 0, 0]))
+                        .unwrap();
+                }
+            }
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        let opts = Opts::from_url(url).unwrap();
+        let mut conn = Conn::new(Io::Tcp(stream), Arc::new(opts));
+        conn.st.nonce = (1..=20).collect();
+        (conn, server)
+    }
+
+    /// RULING S5 (RED before: the store fetched the server's key on the cleartext link and
+    /// encrypted the password to whatever came back): over TCP with no pinned key, full
+    /// authentication is refused with a sentence before anything is sent, the key request
+    /// included.
+    #[test]
+    fn rsa_full_auth_over_tcp_is_refused_without_a_pinned_key() {
+        let (mut conn, server) = full_auth_server("mysql://u:zq9pw@127.0.0.1:1/d");
+        let e = run(conn.continue_caching_sha2(true))
+            .expect_err("refused")
+            .to_string();
+        drop(conn);
+        assert!(
+            e.contains("server_public_key_sha256")
+                && e.contains("127.0.0.1:1")
+                && !e.contains("zq9pw"),
+            "{e}"
+        );
+        assert!(server.join().unwrap().is_empty(), "nothing was sent");
+    }
+
+    /// RULING S5: with the operator's pin the password goes RSA-encrypted to the pinned key; a
+    /// server that serves another key gets nothing.
+    #[test]
+    fn rsa_full_auth_goes_only_to_the_pinned_key() {
+        let (mut conn, server) = full_auth_server(&format!(
+            "mysql://u:zq9pw@127.0.0.1:1/d?server_public_key_sha256={PIN}"
+        ));
+        run(conn.continue_caching_sha2(true)).expect("authenticated to the pinned key");
+        drop(conn);
+        let got = server.join().unwrap();
+        assert_eq!(got.len(), 2, "the key request, then the encrypted password");
+        assert_eq!(got[0], [0x02]);
+        assert_eq!(got[1].len(), 128, "one RSA-1024 block");
+        let other = "ab".repeat(32);
+        let (mut conn, server) = full_auth_server(&format!(
+            "mysql://u:zq9pw@127.0.0.1:1/d?server_public_key_sha256={other}"
+        ));
+        let e = run(conn.continue_caching_sha2(true))
+            .expect_err("refused")
+            .to_string();
+        drop(conn);
+        assert!(
+            e.contains("does not match") && e.contains("127.0.0.1:1"),
+            "{e}"
+        );
+        assert_eq!(
+            server.join().unwrap(),
+            vec![vec![0x02]],
+            "only the key request"
+        );
+    }
+
+    /// A server that records every packet the client sends and answers each with OK.
+    fn recording_server(url: &str) -> (Conn, std::thread::JoinHandle<Vec<Vec<u8>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut s = listener.accept().unwrap().0;
+            s.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut got = Vec::new();
+            loop {
+                let mut head = [0_u8; 4];
+                if s.read_exact(&mut head).is_err() {
+                    return got;
+                }
+                let len = u32::from_le_bytes([head[0], head[1], head[2], 0]) as usize;
+                let mut body = vec![0_u8; len];
+                if s.read_exact(&mut body).is_err() {
+                    return got;
+                }
+                got.push(body);
+                s.write_all(&packet(head[3] + 1, &[0, 0, 0, 2, 0, 0, 0]))
+                    .unwrap();
+            }
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        let opts = Opts::from_url(url).unwrap();
+        (Conn::new(Io::Tcp(stream), Arc::new(opts)), server)
+    }
+
+    /// RULING S4, MySQL (kept from 1.5.5): a switch to `mysql_clear_password` or
+    /// `mysql_old_password` is refused, with nothing sent, unless the operator turned the
+    /// driver's switch (`enable_cleartext_plugin=true`, `secure_auth=false`).
+    #[test]
+    fn a_switch_to_clear_or_old_password_needs_the_operators_switch() {
+        use mysql_common::packets::AuthSwitchRequest;
+        let nonce: Vec<u8> = (1..=20).collect();
+        for (plugin, allow, remedy) in [
+            (
+                &b"mysql_clear_password"[..],
+                "enable_cleartext_plugin=true",
+                "mysql_clear_password",
+            ),
+            (
+                &b"mysql_old_password"[..],
+                "secure_auth=false",
+                "old_mysql_password",
+            ),
+        ] {
+            let (mut conn, server) = recording_server("mysql://u:zq9pw@127.0.0.1:1/d");
+            let req = AuthSwitchRequest::new(plugin, &nonce[..]).into_owned();
+            let e = run(conn.auth_switch(req)).expect_err("refused").to_string();
+            drop(conn);
+            assert!(e.contains(remedy), "{e}");
+            assert!(server.join().unwrap().is_empty(), "nothing was sent");
+            let (mut conn, server) =
+                recording_server(&format!("mysql://u:zq9pw@127.0.0.1:1/d?{allow}"));
+            let req = AuthSwitchRequest::new(plugin, &nonce[..]).into_owned();
+            run(conn.auth_switch(req)).expect("allowed by the operator");
+            drop(conn);
+            assert_eq!(
+                server.join().unwrap().len(),
+                1,
+                "the auth response went out"
+            );
+        }
+    }
+
+    /// The pin is a URL parameter of 64 hex digits; anything else is the driver's invalid value.
+    #[test]
+    fn the_rsa_key_pin_is_64_hex_digits() {
+        assert!(Opts::from_url(&format!("mysql://u@h/d?server_public_key_sha256={PIN}")).is_ok());
+        for bad in ["abc", "zz", &"0".repeat(66)] {
+            assert!(
+                Opts::from_url(&format!("mysql://u@h/d?server_public_key_sha256={bad}")).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

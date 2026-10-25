@@ -79,7 +79,19 @@ Configured under the `mysql` module name. The only setting is `url`; any other k
 (`invalid mysql plugin config: unknown setting ... (accepted: url)`), as is a non-string `url`.
 
 URL parameters honoured: `user`, `password`, `host`, `port`, `socket`, `db_name`, `compress`,
-`secure_auth`, `enable_cleartext_plugin`, `tcp_connect_timeout_ms`, `max_allowed_packet`.
+`secure_auth`, `enable_cleartext_plugin`, `tcp_connect_timeout_ms`, `max_allowed_packet`,
+`server_public_key_sha256`.
+
+Auth methods (busbar 1.6.0 rulings S4, S5; the operator's URL decides, never the plugin):
+- `mysql_clear_password` is refused unless `enable_cleartext_plugin=true`, and `mysql_old_password`
+  unless `secure_auth=false` (the 1.5.x driver's defaults).
+- `caching_sha2_password` FULL authentication (a server whose cache does not yet hold the account,
+  e.g. after a restart) over TCP sends the password RSA-encrypted to a key the server supplies on
+  the unencrypted connection. busbar 1.6.0 sends it only to a key the operator pinned:
+  `server_public_key_sha256=<64 hex digits>`, the SHA-256 of the server's public key in DER
+  (`openssl pkey -pubin -in public_key.pem -outform der | openssl dgst -sha256`). Without a pin it
+  is refused with a sentence that says so; over a unix socket (`socket=`) the password goes in clear,
+  as 1.5.x sent it. Fast authentication (a cached account) needs neither.
 
 URL parameters REFUSED (never silently ignored), each with a "not supported by this store" message:
 `pool_min`, `pool_max` (the store keeps 8 connections over the host's connector), `prefer_socket`,
