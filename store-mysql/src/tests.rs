@@ -312,15 +312,29 @@ fn tombstone_and_credential_destruction_share_one_transaction() {
 #[test]
 fn scrub_key_requires_tombstone_first() {
     let Some(s) = fresh_store() else { return };
-    s.put_key(&sample_key("vk_scrub", "g")).unwrap();
+    let mut k = sample_key("vk_scrub", "g");
+    k.labels.insert("env".to_string(), "prod".to_string());
+    s.put_key(&k).unwrap();
     assert!(
         s.scrub_key("vk_scrub").is_err(),
         "scrub on a LIVE key must error"
     );
     s.delete_key("vk_scrub").unwrap();
+    let before = s.get_key("vk_scrub").unwrap().unwrap();
+    assert!(
+        !before.labels.is_empty(),
+        "precondition: labels survive delete"
+    );
     s.scrub_key("vk_scrub").unwrap();
     let row = s.get_key("vk_scrub").unwrap().unwrap();
     assert_eq!(row.name, "");
+    assert!(row.labels.is_empty(), "scrub must clear labels");
+    assert!(
+        row.revision > before.revision,
+        "scrub must bump the revision: {} > {}",
+        row.revision,
+        before.revision
+    );
 }
 
 // ── Credentials: slot bounds, revoke, secret isolation ──────────────────────────────────────────
@@ -700,7 +714,8 @@ fn add_metering_upserts_and_accumulates() {
     s.put_key(&sample_key("vk_meter", "g")).unwrap();
     let d = MeteringDelta {
         key_id: "vk_meter".to_string(),
-        bucket: 20260731,
+        // A bucket no other test uses: the purge tests wipe whole buckets.
+        bucket: 20260915,
         model: "m".to_string(),
         provider: "p".to_string(),
         tokens_input: 10,
@@ -716,7 +731,12 @@ fn add_metering_upserts_and_accumulates() {
     };
     s.add_metering(&d).unwrap();
     s.add_metering(&d).unwrap();
-    let rows = s.list_metering(20260731).unwrap();
+    let rows: Vec<_> = s
+        .list_metering(20260915)
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.key_id == "vk_meter")
+        .collect();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].requests, 2);
     assert_eq!(rows[0].tokens_input, 20);
@@ -728,10 +748,36 @@ fn add_metering_upserts_and_accumulates() {
 #[test]
 fn denylist_add_and_list_roundtrips_and_never_shortens_the_window() {
     let Some(s) = fresh_store() else { return };
-    s.add_denylist("sub1", "revoked").unwrap();
-    assert!(s.list_denylist().unwrap().contains(&"sub1".to_string()));
-    // Re-adding must not error (idempotent upsert path).
-    s.add_denylist("sub1", "revoked again").unwrap();
+    s.add_denylist("sub_window", "revoked").unwrap();
+    assert!(s
+        .list_denylist()
+        .unwrap()
+        .contains(&"sub_window".to_string()));
+    // Push the stored expiry far past anything a re-add computes, and note the revision.
+    let far = 4_000_000_000_000u64;
+    let (before_exp, before_rev): (u64, u64) = {
+        let mut conn = s.pool.get_conn().unwrap();
+        conn.exec_drop(
+            "UPDATE denylist SET expires_at = :far WHERE sub = 'sub_window'",
+            params! { "far" => far },
+        )
+        .unwrap();
+        conn.query_first("SELECT expires_at, revision FROM denylist WHERE sub = 'sub_window'")
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(before_exp, far);
+    // Re-adding must not error (idempotent upsert path), must never shorten the window, and must
+    // bump the revision.
+    s.add_denylist("sub_window", "revoked again").unwrap();
+    let (after_exp, after_rev): (u64, u64) = {
+        let mut conn = s.pool.get_conn().unwrap();
+        conn.query_first("SELECT expires_at, revision FROM denylist WHERE sub = 'sub_window'")
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(after_exp, far, "a re-add must never shorten the window");
+    assert!(after_rev > before_rev, "{after_rev} > {before_rev}");
 }
 
 // ── Boot-time invariant probes ───────────────────────────────────────────────────────────────────
@@ -842,13 +888,12 @@ fn is_check_constraint_violation_accepts_only_the_two_real_engine_codes() {
 fn connect_establishes_strict_sql_mode_via_init_even_when_the_default_would_be_permissive() {
     let Some(url) = test_url() else { return };
     let opts = Opts::from_url(&url).unwrap();
-    let opts = mysql::OptsBuilder::from_opts(opts).init(vec![
-        // Simulates a permissive starting session (as if the server's own default were empty) --
-        // then the SAME append statement connect() itself uses. Both run, in order, on THIS
-        // pool's own connections only; never touches the real shared server default.
-        "SET SESSION sql_mode = ''",
-        "SET SESSION sql_mode = CONCAT(@@sql_mode, ',STRICT_ALL_TABLES')",
-    ]);
+    // Simulates a permissive starting session (as if the server's own default were empty) --
+    // then the SAME statements connect() itself runs (`crate::INIT`). All run, in order, on THIS
+    // pool's own connections only; never touches the real shared server default.
+    let mut init = vec!["SET SESSION sql_mode = ''"];
+    init.extend(crate::INIT.iter().copied());
+    let opts = mysql::OptsBuilder::from_opts(opts).init(init);
     let pool = Pool::new(opts).unwrap();
     let mut conn = pool.get_conn().unwrap();
     let sql_mode: String = conn.query_first("SELECT @@sql_mode").unwrap().unwrap();
