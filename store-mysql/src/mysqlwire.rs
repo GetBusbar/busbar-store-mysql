@@ -295,6 +295,16 @@ impl fmt::Debug for Opts {
     }
 }
 
+/// `msg` with every occurrence of the URL password (`secret`, decoded, as the server and the
+/// handshake see it) replaced by `<redacted>`: text a server, proxy or connector echoes back never
+/// carries the credential into an error. Text without the password is returned unchanged.
+fn scrub(msg: String, secret: Option<&str>) -> String {
+    match secret.filter(|s| !s.is_empty()) {
+        Some(s) if msg.contains(s) => msg.replace(s, "<redacted>"),
+        _ => msg,
+    }
+}
+
 /// The refusal of a URL parameter this store accepts nowhere because it could never apply.
 fn not_supported(key: &str, why: &str) -> UrlError {
     UrlError::Refused(format!(
@@ -729,7 +739,7 @@ impl Conn {
         let could_not = |e: busbar_contract::abi::sdk::conn::ConnFailure| {
             Error::DriverError(DriverError::CouldNotConnect(Some((
                 opts.address(),
-                e.to_string(),
+                scrub(e.to_string(), opts.pass.as_deref()),
             ))))
         };
         wire.connect_timed(need, Some(&opts.target()), timeout)
@@ -851,7 +861,9 @@ impl Conn {
                     {
                         ErrPacket::Error(server_error) => {
                             self.handle_err();
-                            return Err(Error::MySqlError(MySqlError::from(server_error)));
+                            let mut e = MySqlError::from(server_error);
+                            e.message = scrub(e.message, self.st.opts.pass.as_deref());
+                            return Err(Error::MySqlError(e));
                         }
                         ErrPacket::Progress(_) => continue,
                     }
@@ -1602,6 +1614,31 @@ mod tests {
             Poll::Ready(v) => v,
             Poll::Pending => panic!("the TCP transport must not pend"),
         }
+    }
+
+    /// The URL password never reaches an error: a server (or a proxy in front of it) whose ERR
+    /// packet echoes it is scrubbed, and so is `Debug`.
+    #[test]
+    fn a_server_error_echoing_the_password_is_scrubbed() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut s = listener.accept().unwrap().0;
+            let mut err = vec![0xff, 0x15, 0x04];
+            err.extend_from_slice(b"Access denied for u using password CANARY-my-p4ss");
+            s.write_all(&packet(0, &err)).unwrap();
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        let opts = Opts::from_url("mysql://u:CANARY%2Dmy%2Dp4ss@127.0.0.1:1/d").unwrap();
+        let mut conn = Conn::new(Io::Tcp(stream), Arc::new(opts));
+        let Err(err) = run(conn.handshake(&[])) else {
+            panic!("the ERR packet refuses");
+        };
+        server.join().unwrap();
+        for out in [err.to_string(), format!("{err:?}"), format!("{conn:?}")] {
+            assert!(!out.contains("CANARY"), "password leaked: {out}");
+        }
+        assert!(err.to_string().contains("Access denied"), "{err}");
     }
 
     #[test]
