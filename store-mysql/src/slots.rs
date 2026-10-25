@@ -13,15 +13,37 @@
 //! answer, nothing applied; different: a conflict). A refused or failed op rolls back with its row,
 //! so nothing is recorded (S3). Rows older than [`OP_ID_RETENTION_SECS`] are swept (S4).
 //!
-//! EPOCH (ARCHITECT 2026-10-02): fixed at 0. No store ABI operation advances the epoch yet, so a
-//! `reserve` or `slice_release` is never refused for the epoch it states and every head states 0.
-//! When WIRE-STORE adds the advance, the store persists the epoch and refuses stale writers.
+//! EPOCH AND SLICE LIFE (`abi::store::money`, rules (a)-(c); this store is shared by a fleet): the
+//! fleet's ONE epoch is the `store_epoch` row. A `reserve` presenting a higher epoch raises it in
+//! its own transaction, atomically with its draw; one presenting a lower epoch is `StaleEpoch`,
+//! applies nothing and records nothing under its `op_id`; nothing lowers it, and it survives a
+//! restart. Every slice is granted `valid_until_ms = now + SLICE_TTL_MS` on the DATABASE's clock
+//! ([`DB_NOW_MS`]: one clock for the fleet, not each node's), a concurrency gauge's slice included.
+//! A `reserve` returns the unreturned part of the slices of its slots that have expired to their
+//! windows' headroom before it tests them, so a node that crashed holding a slice strands nothing
+//! past one TTL. A `slice_release` always applies, whatever the epoch; it first does the same
+//! reclaim for the slots of the slices it names, so an expired slice answers 0 (its unreturned part
+//! already went back at expiry). A slice that is no longer a row but whose id is at or below the
+//! slice-id high-water was granted and has closed (released whole, or expired): it answers 0; an id
+//! above it (or 0) was never granted and fails the release. Heads state epoch 0, as the reference
+//! store does. Do not run schema-v8 nodes against a v9 database (`SCHEMA_VERSION`): a v9 build
+//! refuses a NEWER database at open, but a v8 build already shipped has no such check and cannot
+//! refuse a v9 one, so the operator must upgrade every node before any shared traffic.
 //!
-//! GRANT LIFETIME: `reserve` carries no requested lifetime (`ReserveIn`, `UnitCell`), so a grant
-//! never expires (`valid_until_ms = u64::MAX`): a slice holds its draw until it is released.
+//! ISOLATION: `reserve`, `slice_release` and `window_caps` run READ COMMITTED. Under InnoDB's default REPEATABLE
+//! READ a locking read takes gap locks: a reserve's reclaim scan of a slot's slices, or a lock of a
+//! cap row that is not there, would gap-lock ranges other reserves insert into, and two such
+//! transactions deadlock (ERROR 1213). READ COMMITTED locks only the rows that match, and lets the
+//! epoch fence read the latest committed epoch without a lock. (READ COMMITTED needs row-based or
+//! mixed binary logging when the binlog is on, MySQL 8's default.)
 //!
-//! LOCK ORDER: a call that locks several cap or slice rows locks them in key order first, so two
-//! concurrent draws over the same slots cannot deadlock on each other.
+//! LOCK ORDER: the epoch row (shared, held to the commit; exclusive only to raise it), then cap rows
+//! in key order, then slice rows (a slot's slices only under its cap row's lock), so no two money
+//! ops wait on each other in a cycle. `slice_release` reads its slices' slots unlocked first (a
+//! slice's slot never changes) to lock their cap rows before any slice. `window_caps` CLAIMS a cap
+//! row by inserting it before reading it, so two first pushes of one cap serialise on the row
+//! (the second waits for the first's commit) instead of both gap-locking its absence and
+//! deadlocking.
 //!
 //! CONNECTIONS: every slot runs on one of the instance's kept connections over the host's
 //! connector, as straight-line async code driven by the store SDK's `wire::drive_kept` (busbar THE
@@ -53,8 +75,10 @@ use busbar_contract::records::{
     PlaneSelector, RecordStoreResult, UsageDelta, UsageLedger, VirtualKey,
 };
 
+use busbar_contract::abi::store::SLICE_TTL_MS;
+
 use crate::mysqlwire::{Conn, Error, Params, Transaction, Value as SqlValue};
-use crate::{crate_now, store_err, MysqlStore, INIT, NAME};
+use crate::{crate_now, store_err, MysqlStore, DB_NOW_MS, INIT, NAME};
 
 const NO_TEXT: AbiStr = AbiStr {
     ptr: std::ptr::null(),
@@ -124,10 +148,11 @@ macro_rules! on_conn {
 
 /// One `op_id`-carrying write (module doc, DEDUPE) on `$conn`: a replay answers the original
 /// answer, a conflict applies nothing, and a new op runs `$apply` in the op's transaction (its
-/// answer, or an `$E`) and is recorded only if it applied. Evaluates to the answer; returns the
-/// refusal from the enclosing fn.
+/// answer, or an `$E`) and is recorded only if it applied. `$read_committed`: the transaction runs
+/// READ COMMITTED (module doc, ISOLATION), else at the server's level. Evaluates to the answer;
+/// returns the refusal from the enclosing fn.
 macro_rules! deduped {
-    ($conn:expr, $op:expr, $body:expr, $E:ty, |$tx:ident| $apply:block) => {{
+    ($conn:expr, $op:expr, $body:expr, $E:ty, $read_committed:expr, |$tx:ident| $apply:block) => {{
         let conn: &mut Conn = $conn;
         let op: OpId = $op;
         let body: &str = $body;
@@ -140,6 +165,12 @@ macro_rules! deduped {
                 return Err(<$E as Refusal>::backend(
                     "store_ops: the op's row kept vanishing between its claim and its read".into(),
                 ));
+            }
+            if $read_committed {
+                // The NEXT transaction only: nothing outlives this op on the kept connection.
+                conn.query_drop("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                    .await
+                    .map_err(backend::<$E, _>)?;
             }
             let mut tx = conn
                 .start_transaction()
@@ -286,7 +317,10 @@ impl Refusal for ReserveRefused {
     fn conflict() -> Self {
         ReserveRefused::Conflict
     }
-    fn backend(_: String) -> Self {
+    /// `Unavailable` carries no text across the ABI, so the reason is logged here first (the door
+    /// captures it into the plugin's log). Driver and SQL errors only: never the URL.
+    fn backend(text: String) -> Self {
+        tracing::warn!(reason = %text, "reserve: the store is unavailable");
         ReserveRefused::Unavailable
     }
 }
@@ -352,7 +386,7 @@ async fn lock_caps(
 /// A deduped write whose answer is "done": `apply` is the effect's body.
 macro_rules! done_op {
     ($conn:expr, $op:expr, $body:expr, |$tx:ident| $apply:block) => {{
-        let answer = deduped!($conn, $op, $body, OpRefused, |$tx| {
+        let answer = deduped!($conn, $op, $body, OpRefused, false, |$tx| {
             $apply;
             Ok(Value::Null)
         });
@@ -423,7 +457,7 @@ async fn v3_append_batch(
     stream: String,
     records: Vec<RecordBytes>,
 ) -> OpResult<Head> {
-    let answer = deduped!(conn, op, &body, OpRefused, |tx| {
+    let answer = deduped!(conn, op, &body, OpRefused, false, |tx| {
         let last: Option<u64> = tx
             .exec_first(
                 "SELECT seq FROM store_journal WHERE stream = :stream \
@@ -449,34 +483,137 @@ async fn v3_append_batch(
     }
 }
 
+/// Slice life (c): the unreturned part of `slot`'s slices expired at `now` goes back to its window.
+/// The expired slices are deleted (each unit returns once) and their sum answered. The caller holds
+/// the slot's cap row (every change to a slot's slices is made under that lock).
+async fn reclaim_expired(tx: &mut Conn, slot: &Slot, now: u64) -> Result<u64, Error> {
+    let expired: Vec<(u64, u64)> = tx
+        .exec(
+            format!(
+                "SELECT slice_id, remaining FROM store_slices WHERE {SLOT_WHERE} \
+                 AND remaining <> 0 AND valid_until_ms <= :now FOR UPDATE"
+            ),
+            slot_params(slot, vec![("now", now.into())]),
+        )
+        .await?;
+    let mut back = 0u64;
+    for (id, remaining) in expired {
+        tx.exec_drop(
+            "DELETE FROM store_slices WHERE slice_id = :id",
+            params! { "id" => id },
+        )
+        .await?;
+        back = back.saturating_add(remaining);
+    }
+    Ok(back)
+}
+
+/// The database's clock now, in ms ([`DB_NOW_MS`]).
+async fn db_now_ms(tx: &mut Conn) -> Result<u64, String> {
+    tx.query_first::<u64>(format!("SELECT {DB_NOW_MS}"))
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "the database clock read returned no row".into())
+}
+
+/// The highest slice id ever granted (0 before the first): the AUTO_INCREMENT high-water, which
+/// InnoDB persists across a restart (MySQL 8), never below the highest id still a row. Read live:
+/// MySQL 8 caches `information_schema.tables` statistics unless the session's expiry is 0 (MariaDB
+/// has no such variable and no such cache, so its refusal is ignored).
+async fn slice_high_water(tx: &mut Conn) -> Result<u64, Error> {
+    match tx
+        .query_drop("SET SESSION information_schema_stats_expiry = 0")
+        .await
+    {
+        Ok(()) => {}
+        // ER_UNKNOWN_SYSTEM_VARIABLE: a server without the cache.
+        Err(Error::MySqlError(e)) if e.code == 1193 => {}
+        Err(e) => return Err(e),
+    }
+    let next: Option<Option<u64>> = tx
+        .query_first(
+            "SELECT auto_increment FROM information_schema.tables \
+             WHERE table_schema = DATABASE() AND table_name = 'store_slices'",
+        )
+        .await?;
+    let max: Option<Option<u64>> = tx
+        .query_first("SELECT MAX(slice_id) FROM store_slices")
+        .await?;
+    let below_next = next.flatten().map_or(0, |n| n.saturating_sub(1));
+    Ok(below_next.max(max.flatten().unwrap_or(0)))
+}
+
+/// `reserve` over the cells' slots, under the fleet `epoch` the caller presents.
 async fn v3_reserve(
     conn: &mut Conn,
     op: OpId,
     body: String,
+    epoch: u64,
     cells: Vec<(Slot, u64)>,
 ) -> Result<Vec<Grant>, ReserveRefused> {
-    let answer = deduped!(conn, op, &body, ReserveRefused, |tx| {
-        let slots: Vec<Slot> = cells.iter().map(|(s, _)| s.clone()).collect();
-        let held = lock_caps(tx, slots.iter().cloned())
+    let answer = deduped!(conn, op, &body, ReserveRefused, true, |tx| {
+        // THE EPOCH FENCE. Read the latest committed epoch unlocked; only a reserve that would RAISE
+        // it takes the row exclusively (`epoch < :e`, compared unsigned: the column is BIGINT
+        // UNSIGNED). Then every reserve reads it SHARED, held to the commit: a concurrent raiser
+        // waits for every in-flight draw of the old epoch to finish, and a draw of an old epoch
+        // that starts after the raise reads the new one and is refused. A draw that does not raise
+        // never asks for the exclusive lock, so draws never wait on each other here, and a
+        // share-then-exclusive upgrade (two raisers deadlocking) never happens.
+        let stored: Option<u64> = tx
+            .query_first("SELECT epoch FROM store_epoch WHERE one = 1")
             .await
             .map_err(backend::<ReserveRefused, _>)?;
+        if stored.is_some_and(|stored| stored < epoch) {
+            tx.exec_drop(
+                "UPDATE store_epoch SET epoch = :e WHERE one = 1 AND epoch < :e",
+                params! { "e" => epoch },
+            )
+            .await
+            .map_err(backend::<ReserveRefused, _>)?;
+        }
+        let fenced: Option<(u64, u64)> = tx
+            .query_first(format!(
+                "SELECT epoch, {DB_NOW_MS} FROM store_epoch WHERE one = 1 LOCK IN SHARE MODE"
+            ))
+            .await
+            .map_err(backend::<ReserveRefused, _>)?;
+        let Some((stored, now)) = fenced else {
+            return Err(backend::<ReserveRefused, _>("store_epoch has no row"));
+        };
+        if stored > epoch {
+            // Dropping the transaction rolls it back: nothing applied, nothing recorded.
+            return Err(ReserveRefused::StaleEpoch);
+        }
+        let valid_until = now.saturating_add(SLICE_TTL_MS);
+
+        let slots: Vec<Slot> = cells.iter().map(|(s, _)| s.clone()).collect();
+        let mut held = lock_caps(tx, slots.iter().cloned())
+            .await
+            .map_err(backend::<ReserveRefused, _>)?;
+        // Slice life (c): an expired slice's unreturned part goes back to its window's headroom
+        // before the cells are tested.
+        for (slot, (_, _, used)) in held.iter_mut() {
+            let back = reclaim_expired(tx, slot, now)
+                .await
+                .map_err(backend::<ReserveRefused, _>)?;
+            *used = used.saturating_sub(back);
+        }
         // The chain draw is all or nothing: test every cell against what the cells before it
         // in THIS draw add, and apply only when every cell passes.
-        let mut drawn: BTreeMap<&Slot, u64> = BTreeMap::new();
         for (i, ((_, amount), slot)) in cells.iter().zip(&slots).enumerate() {
-            let Some(&(cap, _, used)) = held.get(slot) else {
+            let Some((cap, _, used)) = held.get_mut(slot) else {
                 return Err(ReserveRefused::NoCap { cell: i as u32 });
             };
-            let used = used.saturating_add(drawn.get(slot).copied().unwrap_or(0));
-            if exhausted(slot.3, used, *amount, cap) {
+            if exhausted(slot.3, *used, *amount, *cap) {
                 return Err(ReserveRefused::Exhausted { cell: i as u32 });
             }
-            *drawn.entry(slot).or_default() += *amount;
+            *used = used.saturating_add(*amount);
         }
-        for (slot, amount) in &drawn {
+        // Every total is computed here and stored bit for bit (never `used + x` in SQL).
+        for (slot, (_, _, used)) in &held {
             tx.exec_drop(
-                format!("UPDATE store_caps SET used = used + :amount WHERE {SLOT_WHERE}"),
-                slot_params(slot, vec![("amount", (*amount).into())]),
+                format!("UPDATE store_caps SET used = :used WHERE {SLOT_WHERE}"),
+                slot_params(slot, vec![("used", (*used).into())]),
             )
             .await
             .map_err(backend::<ReserveRefused, _>)?;
@@ -485,14 +622,21 @@ async fn v3_reserve(
         for ((_, amount), slot) in cells.iter().zip(&slots) {
             tx.exec_drop(
                 "INSERT INTO store_slices \
-                 (bucket, pooled, pool, dimension, class_key, window_start, remaining) \
-                 VALUES (:bucket, :pooled, :pool, :dimension, :class_key, :window_start, :amount)",
-                slot_params(slot, vec![("amount", (*amount).into())]),
+                 (bucket, pooled, pool, dimension, class_key, window_start, remaining, \
+                  valid_until_ms) \
+                 VALUES (:bucket, :pooled, :pool, :dimension, :class_key, :window_start, :amount, \
+                         :until)",
+                slot_params(
+                    slot,
+                    vec![("amount", (*amount).into()), ("until", valid_until.into())],
+                ),
             )
             .await
             .map_err(backend::<ReserveRefused, _>)?;
-            let slice_id = tx.last_insert_id().ok_or(ReserveRefused::Unavailable)?;
-            granted.push(json!([slice_id, amount, u64::MAX]));
+            let slice_id = tx.last_insert_id().ok_or_else(|| {
+                backend::<ReserveRefused, _>("the slice insert answered no slice id")
+            })?;
+            granted.push(json!([slice_id, amount, valid_until]));
         }
         Ok(Value::Array(granted))
     });
@@ -514,14 +658,41 @@ async fn v3_slice_release(
     body: String,
     items: Vec<(u64, u64)>,
 ) -> OpResult<Vec<u64>> {
-    let answer = deduped!(conn, op, &body, OpRefused, |tx| {
-        // Lock every named slice in id order, then refuse the whole call on one not held.
+    let answer = deduped!(conn, op, &body, OpRefused, true, |tx| {
+        type Row = (String, bool, String, u32, String, u64, u64);
         let mut ids: Vec<u64> = items.iter().map(|(id, _)| *id).collect();
         ids.sort_unstable();
         ids.dedup();
+        // LOCK ORDER (module doc): the named slices' slots, read unlocked (a slice's slot never
+        // changes), then their cap rows in key order, then the slices.
+        let mut slots: Vec<Slot> = Vec::new();
+        for id in &ids {
+            let row: Option<Row> = tx
+                .exec_first(
+                    "SELECT bucket, pooled, pool, dimension, class_key, window_start, \
+                     remaining FROM store_slices WHERE slice_id = :id",
+                    params! { "id" => *id },
+                )
+                .await
+                .map_err(backend::<OpRefused, _>)?;
+            if let Some((b, pd, p, d, c, w, _)) = row {
+                slots.push((b, pd, p, d, c, w));
+            }
+        }
+        let mut caps = lock_caps(tx, slots.into_iter())
+            .await
+            .map_err(OpRefused::Failed)?;
+        // An expired slice's unreturned part already went back at expiry (slice life (c)), reclaimed
+        // or not: return it now, so the release below finds the slice closed and answers 0.
+        let now = db_now_ms(tx).await.map_err(OpRefused::Failed)?;
+        for (slot, (_, _, used)) in caps.iter_mut() {
+            let back = reclaim_expired(tx, slot, now)
+                .await
+                .map_err(backend::<OpRefused, _>)?;
+            *used = used.saturating_sub(back);
+        }
         let mut held: BTreeMap<u64, (Slot, u64)> = BTreeMap::new();
         for id in ids {
-            type Row = (String, bool, String, u32, String, u64, u64);
             let row: Option<Row> = tx
                 .exec_first(
                     "SELECT bucket, pooled, pool, dimension, class_key, window_start, \
@@ -530,19 +701,34 @@ async fn v3_slice_release(
                 )
                 .await
                 .map_err(backend::<OpRefused, _>)?;
-            let Some((b, pd, p, d, c, w, remaining)) = row else {
-                return Err(OpRefused::Failed(format!(
-                    "slice_release: slice {id} is not held"
-                )));
-            };
-            held.insert(id, ((b, pd, p, d, c, w), remaining));
+            if let Some((b, pd, p, d, c, w, remaining)) = row {
+                held.insert(id, ((b, pd, p, d, c, w), remaining));
+            }
         }
         // Clamp each item to what its slice has left: an item naming a slice an EARLIER item
-        // of this call emptied takes back 0.
+        // of this call emptied takes back 0. A slice that is not a row is closed (0) when its id
+        // was granted, and fails the whole release when it never was.
+        let mut high_water: Option<u64> = None;
         let mut back_all = Vec::with_capacity(items.len());
         let mut by_slot: BTreeMap<Slot, u64> = BTreeMap::new();
         for (id, unspent) in &items {
-            let (slot, left) = held.get_mut(id).expect("every item's slice is held");
+            let Some((slot, left)) = held.get_mut(id) else {
+                let top = match high_water {
+                    Some(top) => top,
+                    None => *high_water.insert(
+                        slice_high_water(tx)
+                            .await
+                            .map_err(backend::<OpRefused, _>)?,
+                    ),
+                };
+                if *id >= 1 && *id <= top {
+                    back_all.push(0);
+                    continue;
+                }
+                return Err(OpRefused::Failed(format!(
+                    "slice_release: slice {id} was never granted"
+                )));
+            };
             let back = (*unspent).min(*left);
             *left -= back;
             // A release on window 0 is final (`abi::store` slice life (e)): window 0 never rolls,
@@ -551,12 +737,14 @@ async fn v3_slice_release(
             if slot.5 == 0 {
                 *left = 0;
             }
-            *by_slot.entry(slot.clone()).or_default() += back;
+            let total = by_slot.entry(slot.clone()).or_default();
+            *total = total.saturating_add(back);
             back_all.push(back);
         }
         for (id, (slot, left)) in &held {
-            // A closed window-0 slice stays as a row with nothing left (no schema change): a
-            // second release of it answers 0 where a deleted row would answer "not held".
+            // A closed window-0 slice stays as a row with nothing left: a second release of it
+            // answers 0 from the row. A rolling-window slice returned whole is deleted (the
+            // high-water says it was granted).
             if *left == 0 && slot.5 != 0 {
                 tx.exec_drop(
                     "DELETE FROM store_slices WHERE slice_id = :id",
@@ -573,11 +761,25 @@ async fn v3_slice_release(
             .map_err(backend::<OpRefused, _>)?;
         }
         for (slot, back) in &by_slot {
+            if let Some((_, _, used)) = caps.get_mut(slot) {
+                *used = used.saturating_sub(*back);
+            } else {
+                // A slice whose slot was not seen by the unlocked read (granted after it): its cap
+                // row is taken out of order, in SQL, rather than not returned at all.
+                tx.exec_drop(
+                    format!(
+                        "UPDATE store_caps SET used = used - LEAST(used, :back) WHERE {SLOT_WHERE}"
+                    ),
+                    slot_params(slot, vec![("back", (*back).into())]),
+                )
+                .await
+                .map_err(backend::<OpRefused, _>)?;
+            }
+        }
+        for (slot, (_, _, used)) in &caps {
             tx.exec_drop(
-                format!(
-                    "UPDATE store_caps SET used = used - LEAST(used, :back) WHERE {SLOT_WHERE}"
-                ),
-                slot_params(slot, vec![("back", (*back).into())]),
+                format!("UPDATE store_caps SET used = :used WHERE {SLOT_WHERE}"),
+                slot_params(slot, vec![("used", (*used).into())]),
             )
             .await
             .map_err(backend::<OpRefused, _>)?;
@@ -593,39 +795,59 @@ async fn v3_window_caps(
     body: String,
     caps: Vec<(Slot, u64, u64)>,
 ) -> Result<(), CapsRefused> {
-    let _ = deduped!(conn, op, &body, CapsRefused, |tx| {
-        let slots: Vec<Slot> = caps.iter().map(|(s, _, _)| s.clone()).collect();
-        let stored = lock_caps(tx, slots.iter().cloned())
-            .await
-            .map_err(CapsRefused::Failed)?;
-        // Atomic per push: find the first conflict before applying any cap.
-        let mut pushed: BTreeMap<&Slot, (u64, u64)> = BTreeMap::new();
-        for (index, ((_, cap, config_gen), slot)) in caps.iter().zip(&slots).enumerate() {
-            let prior = pushed
-                .get(slot)
-                .copied()
-                .or_else(|| stored.get(slot).map(|&(cap, gen, _)| (cap, gen)));
-            match prior {
-                Some((c, gen)) if gen == *config_gen && c != *cap => {
-                    return Err(CapsRefused::CapConflict { index });
-                }
-                Some((_, gen)) if gen >= *config_gen => {}
-                _ => {
-                    pushed.insert(slot, (*cap, *config_gen));
-                }
-            }
-        }
-        for (slot, (cap, gen)) in pushed {
+    let _ = deduped!(conn, op, &body, CapsRefused, true, |tx| {
+        // Atomic per push: every cap is checked (against the stored cap and the ones before it in
+        // this push) before the push commits, and a conflict rolls it all back. Caps are taken in
+        // SLOT order, like `reserve`'s locks, so two pushes (or a push and a draw) never wait on
+        // each other in a cycle; the conflict reported is the smallest caller index among the
+        // conflicting caps.
+        let mut order: Vec<usize> = (0..caps.len()).collect();
+        order.sort_by(|&a, &b| caps[a].0.cmp(&caps[b].0));
+        let mut conflict: Option<usize> = None;
+        for index in order {
+            let (slot, cap, gen) = &caps[index];
+            // CLAIM the row first (codeaudit D23): `SELECT .. FOR UPDATE` of an absent row only
+            // gap-locks its absence, so two first pushes both saw nothing, both inserted, and
+            // deadlocked (one failed) or the later write overwrote the higher generation. Inserting
+            // is the lock: a second pusher's duplicate waits on the first's commit, then reads it.
+            // The no-op update leaves an existing row as it was.
             tx.exec_drop(
                 "INSERT INTO store_caps \
                  (bucket, pooled, pool, dimension, class_key, window_start, cap, config_gen) \
                  VALUES (:bucket, :pooled, :pool, :dimension, :class_key, :window_start, \
                          :cap, :gen) \
-                 ON DUPLICATE KEY UPDATE cap = VALUES(cap), config_gen = VALUES(config_gen)",
-                slot_params(slot, vec![("cap", cap.into()), ("gen", gen.into())]),
+                 ON DUPLICATE KEY UPDATE config_gen = config_gen",
+                slot_params(slot, vec![("cap", (*cap).into()), ("gen", (*gen).into())]),
             )
             .await
             .map_err(backend::<CapsRefused, _>)?;
+            let stored: Option<(u64, u64)> = tx
+                .exec_first(
+                    format!("SELECT cap, config_gen FROM store_caps WHERE {SLOT_WHERE} FOR UPDATE"),
+                    slot_params(slot, vec![]),
+                )
+                .await
+                .map_err(backend::<CapsRefused, _>)?;
+            let Some((stored_cap, stored_gen)) = stored else {
+                return Err(CapsRefused::Failed(
+                    "window_caps: a claimed cap row is not there".into(),
+                ));
+            };
+            if stored_gen == *gen && stored_cap != *cap {
+                conflict = Some(conflict.map_or(index, |c| c.min(index)));
+            } else if stored_gen < *gen {
+                tx.exec_drop(
+                    format!(
+                        "UPDATE store_caps SET cap = :cap, config_gen = :gen WHERE {SLOT_WHERE}"
+                    ),
+                    slot_params(slot, vec![("cap", (*cap).into()), ("gen", (*gen).into())]),
+                )
+                .await
+                .map_err(backend::<CapsRefused, _>)?;
+            }
+        }
+        if let Some(index) = conflict {
+            return Err(CapsRefused::CapConflict { index });
         }
         Ok(Value::Null)
     });
@@ -699,7 +921,7 @@ impl StoreSlots for MysqlStore {
     fn connect(&self, cx: &mut Op<'_>) -> Step<Result<(), String>> {
         on_conn!(self, cx, text, |c| MysqlStore::connect_step(&mut c)
             .await
-            .map_err(|e| e.0))
+            .map_err(|e| c.scrub(e.0)))
     }
 
     fn add_usage_op(
@@ -886,7 +1108,7 @@ impl StoreSlots for MysqlStore {
         let body = format!("reserve:{epoch}:{cells:?}");
         let owned: Vec<(Slot, u64)> = cells.iter().map(|c| (slot_of(&c.key), c.amount)).collect();
         match on_conn!(self, cx, backend::<ReserveRefused, _>, |c| v3_reserve(
-            &mut c, op, body, owned
+            &mut c, op, body, epoch, owned
         )
         .await)
         {

@@ -161,7 +161,8 @@ pub enum UrlError {
     UnsupportedScheme(String),
     InvalidValue(String, String),
     UnknownParameter(String),
-    InvalidPoolConstraints { min: usize, max: usize },
+    /// A refusal in this store's own words (a parameter it does not support; text withheld because the URL carries a password).
+    Refused(String),
     BadUrl,
 }
 
@@ -176,10 +177,7 @@ impl fmt::Display for UrlError {
             UrlError::UnknownParameter(parameter) => {
                 write!(f, "Unknown URL parameter `{parameter}'")
             }
-            UrlError::InvalidPoolConstraints { min, max } => write!(
-                f,
-                "Invalid pool constraints: pool_min ({min}) > pool_max ({max})"
-            ),
+            UrlError::Refused(m) => f.write_str(m),
             UrlError::BadUrl => write!(f, "Invalid or incomplete connection URL"),
         }
     }
@@ -207,6 +205,21 @@ pub enum Error {
 }
 
 impl Error {
+    /// This error with the URL's password redacted from every text it carries.
+    pub(crate) fn scrubbed(self, opts: &Opts) -> Self {
+        match self {
+            Error::IoError(m) => Error::IoError(opts.scrub(m)),
+            Error::MySqlError(mut e) => {
+                e.message = opts.scrub(e.message);
+                Error::MySqlError(e)
+            }
+            Error::DriverError(DriverError::CouldNotConnect(Some((a, d)))) => {
+                Error::DriverError(DriverError::CouldNotConnect(Some((a, opts.scrub(d)))))
+            }
+            e => e,
+        }
+    }
+
     fn server_disconnected() -> Self {
         Error::IoError("server disconnected".into())
     }
@@ -247,9 +260,6 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 // ── the connection URL (the driver's `Opts::from_url`) ──────────────────────────────────────────
 
-/// The driver's default pool constraints, which `pool_min`/`pool_max` are validated against.
-const POOL_MIN_DEFAULT: usize = 10;
-const POOL_MAX_DEFAULT: usize = 100;
 /// The driver's per-connection prepared-statement cache.
 const STMT_CACHE_DEFAULT: usize = 32;
 
@@ -270,6 +280,8 @@ pub struct Opts {
     pub secure_auth: bool,
     pub enable_cleartext_plugin: bool,
     pub stmt_cache_size: usize,
+    /// Every spelling of the URL's password (decoded, as written, percent-encoded): what `scrub` redacts.
+    secrets: Vec<String>,
 }
 
 impl fmt::Debug for Opts {
@@ -293,6 +305,51 @@ fn scrub(msg: String, secret: Option<&str>) -> String {
     }
 }
 
+/// The refusal of a URL parameter this store accepts nowhere because it could never apply.
+fn not_supported(key: &str, why: &str) -> UrlError {
+    UrlError::Refused(format!(
+        "mysql store: URL parameter `{key}` is not supported: {why}"
+    ))
+}
+
+fn is_tls_parameter(k: &str) -> bool {
+    let k = k.to_ascii_lowercase();
+    k.starts_with("ssl")
+        || k.starts_with("tls")
+        || matches!(k.as_str(), "require_ssl" | "verify_ca" | "verify_identity")
+}
+
+/// Whether the URL text carries a password: userinfo `:pass`, a `password=` parameter, or an `@`
+/// after the `?` (an unencoded password that split the URL there).
+fn url_carries_password(url_str: &str) -> bool {
+    let rest = url_str.split_once("://").map_or(url_str, |(_, r)| r);
+    let (head, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let userinfo_pass = head
+        .rsplit_once('@')
+        .is_some_and(|(ui, _)| ui.contains(':'));
+    userinfo_pass || query.contains('@') || query.split('&').any(|p| p.starts_with("password="))
+}
+
+/// Every spelling of the URL's password: decoded, as written in the URL, percent-encoded.
+fn password_spellings(url_str: &str, decoded: Option<&str>) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(d) = decoded {
+        out.push(d.to_string());
+        out.push(
+            percent_encoding::utf8_percent_encode(d, percent_encoding::NON_ALPHANUMERIC)
+                .to_string(),
+        );
+    }
+    if let Ok(u) = url::Url::parse(url_str) {
+        if let Some(p) = u.password() {
+            out.push(p.to_string());
+        }
+    }
+    out.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    out.dedup();
+    out
+}
+
 fn decode(s: &str) -> String {
     percent_encoding::percent_decode(s.as_bytes())
         .decode_utf8_lossy()
@@ -306,6 +363,33 @@ impl Opts {
     /// # Errors
     /// The driver's [`UrlError`].
     pub fn from_url(url_str: &str) -> Result<Opts, UrlError> {
+        Self::parse_url(url_str).map_err(|e| match e {
+            // These echo URL text; an unencoded password (`u:12?abc@h`) splits at `?` and its tail
+            // arrives here as a "parameter". Withhold the text when the URL carries a password.
+            UrlError::UnknownParameter(_) | UrlError::InvalidValue(..)
+                if url_carries_password(url_str) =>
+            {
+                UrlError::Refused(
+                    "mysql store: invalid URL parameter (its text is withheld: the URL carries a \
+                     password; percent-encode `?`, `@`, `/` and `:` inside it)"
+                        .into(),
+                )
+            }
+            e => e,
+        })
+    }
+
+    /// `text` with the URL's password (every spelling of it) redacted.
+    #[must_use]
+    pub fn scrub(&self, text: String) -> String {
+        let mut out = text;
+        for s in self.secrets.iter().filter(|s| !s.is_empty()) {
+            out = out.replace(s.as_str(), "<redacted>");
+        }
+        out
+    }
+
+    fn parse_url(url_str: &str) -> Result<Opts, UrlError> {
         let url = url::Url::parse(url_str)?;
         if url.scheme() != "mysql" {
             return Err(UrlError::UnsupportedScheme(url.scheme().to_string()));
@@ -336,15 +420,18 @@ impl Opts {
             secure_auth: true,
             enable_cleartext_plugin: false,
             stmt_cache_size: STMT_CACHE_DEFAULT,
+            secrets: Vec::new(),
         };
         let pairs: HashMap<String, String> = url.query_pairs().into_owned().collect();
-        let mut pool_min = POOL_MIN_DEFAULT;
-        let mut pool_max = POOL_MAX_DEFAULT;
         for (key, value) in &pairs {
             let invalid = || UrlError::InvalidValue(key.to_string(), value.to_string());
             match key.as_str() {
-                "pool_min" => pool_min = value.parse().map_err(|_| invalid())?,
-                "pool_max" => pool_max = value.parse().map_err(|_| invalid())?,
+                "pool_min" | "pool_max" => {
+                    return Err(not_supported(
+                        key,
+                        "this store keeps 8 connections over the host's connector",
+                    ));
+                }
                 "user" => opts.user = Some(value.to_string()),
                 "password" => opts.pass = Some(value.to_string()),
                 "host" => {
@@ -354,26 +441,25 @@ impl Opts {
                 "port" => opts.port = value.parse().map_err(|_| invalid())?,
                 "socket" => opts.socket = Some(value.to_string()),
                 "db_name" => opts.db_name = Some(value.to_string()),
-                // Accepted as the driver accepted them; the connection is the host's (its
-                // connector owns the socket's options and the transport it dials).
-                "prefer_socket" | "reset_connection" | "check_health" => {
-                    value.parse::<bool>().map_err(|_| invalid())?;
+                // Refused rather than accepted and dropped: the connection is the host's (its
+                // connector owns the socket, its options, its health and its reset).
+                "prefer_socket"
+                | "reset_connection"
+                | "check_health"
+                | "tcp_keepalive_time_ms"
+                | "tcp_keepalive_probe_interval_secs"
+                | "tcp_keepalive_probe_count"
+                | "tcp_user_timeout_ms" => {
+                    return Err(not_supported(
+                        key,
+                        "the host's connector owns the connection and its sockets, so this \
+                         option could never apply",
+                    ));
                 }
                 "enable_cleartext_plugin" => {
                     opts.enable_cleartext_plugin = value.parse().map_err(|_| invalid())?;
                 }
                 "secure_auth" => opts.secure_auth = value.parse().map_err(|_| invalid())?,
-                "tcp_keepalive_time_ms" => {
-                    value.parse::<u32>().map_err(|_| invalid())?;
-                }
-                #[cfg(any(target_os = "linux", target_os = "macos"))]
-                "tcp_keepalive_probe_interval_secs" | "tcp_keepalive_probe_count" => {
-                    value.parse::<u32>().map_err(|_| invalid())?;
-                }
-                #[cfg(target_os = "linux")]
-                "tcp_user_timeout_ms" => {
-                    value.parse::<u32>().map_err(|_| invalid())?;
-                }
                 "compress" => match value.parse::<u32>() {
                     Ok(_) => opts.compress = true,
                     Err(_) => match value.as_str() {
@@ -384,19 +470,25 @@ impl Opts {
                 "tcp_connect_timeout_ms" => {
                     opts.tcp_connect_timeout_ms = Some(value.parse().map_err(|_| invalid())?);
                 }
-                "stmt_cache_size" => opts.stmt_cache_size = value.parse().map_err(|_| invalid())?,
+                "stmt_cache_size" => {
+                    return Err(not_supported(
+                        key,
+                        "this store's per-connection statement cache has a fixed size",
+                    ));
+                }
                 "max_allowed_packet" => {
                     opts.max_allowed_packet = Some(value.parse().map_err(|_| invalid())?);
+                }
+                k if is_tls_parameter(k) => {
+                    return Err(UrlError::Refused(format!(
+                        "mysql store: URL parameter `{k}` is not supported: TLS is not supported by \
+                         this store (the connection is plaintext over the host's connector)"
+                    )));
                 }
                 _ => return Err(UrlError::UnknownParameter(key.to_string())),
             }
         }
-        if pool_min > pool_max {
-            return Err(UrlError::InvalidPoolConstraints {
-                min: pool_min,
-                max: pool_max,
-            });
-        }
+        opts.secrets = password_spellings(url_str, opts.pass.as_deref());
         Ok(opts)
     }
 
@@ -625,6 +717,22 @@ impl Conn {
     /// # Errors
     /// The connector's failure (as the driver's connect failure), or the server's refusal.
     pub async fn open(wire: Wire, opts: &Arc<Opts>, need: u32, init: &[&str]) -> Result<Conn> {
+        Self::open_unscrubbed(wire, opts, need, init)
+            .await
+            .map_err(|e| e.scrubbed(opts))
+    }
+
+    /// `text` with this connection's URL password redacted.
+    pub(crate) fn scrub(&self, text: String) -> String {
+        self.st.opts.scrub(text)
+    }
+
+    async fn open_unscrubbed(
+        wire: Wire,
+        opts: &Arc<Opts>,
+        need: u32,
+        init: &[&str],
+    ) -> Result<Conn> {
         let timeout = opts
             .tcp_connect_timeout_ms
             .map_or(0, |ms| u32::try_from(ms).unwrap_or(u32::MAX));
@@ -1595,17 +1703,10 @@ mod tests {
             "URL scheme `postgres' is not supported"
         );
         assert_eq!(e("mysql://u@h/d?bogus=1"), "Unknown URL parameter `bogus'");
-        assert_eq!(
-            e("mysql://u@h/d?require_ssl=true"),
-            "Unknown URL parameter `require_ssl'"
-        );
+        assert!(e("mysql://u@h/d?require_ssl=true").contains("TLS is not supported"));
         assert_eq!(
             e("mysql://u@h/d?port=x"),
             "Invalid value `x' for URL parameter `port'"
-        );
-        assert_eq!(
-            e("mysql://u@h/d?pool_max=5"),
-            "Invalid pool constraints: pool_min (10) > pool_max (5)"
         );
         assert_eq!(
             e("mysql://u@h/d?compress=maybe"),
@@ -1618,6 +1719,112 @@ mod tests {
         assert_eq!(
             e("not a url"),
             "URL ParseError { relative URL without a base }"
+        );
+    }
+
+    /// An unencoded `?` in a password splits the URL there: the tail becomes a "parameter". No
+    /// refusal may echo any part of the password, raw or percent-decoded.
+    #[test]
+    fn a_url_refusal_never_carries_the_password() {
+        for url in [
+            "mysql://u:12?abc@h/db",
+            "mysql://u:12?port=zz@h/db",
+            "mysql://u:p%40ss%3Fword@h/db?bogus=1",
+            "mysql://u@h/db?password=hunter2&bogus=1",
+            "mysql://u@h/db?password=hunter2&port=zz",
+        ] {
+            let e = Opts::from_url(url).unwrap_err().to_string();
+            for secret in [
+                "12?abc",
+                "abc@h",
+                "p@ss?word",
+                "p%40ss%3Fword",
+                "hunter2",
+                "zz@h",
+            ] {
+                assert!(!e.contains(secret), "{url}: {secret:?} leaked in {e:?}");
+            }
+        }
+        let e = Opts::from_url("mysql://u:12?abc@h/db")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("withheld") && e.contains("percent-encode"),
+            "{e}"
+        );
+        // A URL without a password still names the parameter, as the driver did.
+        assert_eq!(
+            Opts::from_url("mysql://u@h/d?bogus=1")
+                .unwrap_err()
+                .to_string(),
+            "Unknown URL parameter `bogus'"
+        );
+    }
+
+    #[test]
+    fn an_accepted_but_ignored_parameter_is_refused_never_silent() {
+        let e = |u: &str| Opts::from_url(u).unwrap_err().to_string();
+        for k in [
+            "pool_min=1",
+            "pool_max=5",
+            "prefer_socket=true",
+            "reset_connection=false",
+            "check_health=false",
+            "tcp_keepalive_time_ms=1000",
+            "tcp_keepalive_probe_interval_secs=5",
+            "tcp_keepalive_probe_count=3",
+            "tcp_user_timeout_ms=1000",
+            "stmt_cache_size=4",
+        ] {
+            let name = k.split('=').next().unwrap();
+            let m = e(&format!("mysql://u@h/d?{k}"));
+            assert!(
+                m.starts_with(&format!(
+                    "mysql store: URL parameter `{name}` is not supported:"
+                )),
+                "{k}: {m}"
+            );
+        }
+        assert_eq!(
+            e("mysql://u@h/d?pool_max=5"),
+            "mysql store: URL parameter `pool_max` is not supported: this store keeps 8 \
+             connections over the host's connector"
+        );
+        for k in [
+            "ssl",
+            "ssl-mode",
+            "ssl_mode",
+            "require_ssl",
+            "verify_ca",
+            "verify_identity",
+        ] {
+            let m = e(&format!("mysql://u@h/d?{k}=true"));
+            assert!(
+                m.contains(&format!("`{k}`")) && m.contains("TLS is not supported by this store"),
+                "{k}: {m}"
+            );
+        }
+        // What is honoured still parses.
+        let o = Opts::from_url(
+            "mysql://u@h/d?tcp_connect_timeout_ms=500&max_allowed_packet=65536&compress=true\
+             &secure_auth=true&enable_cleartext_plugin=false",
+        )
+        .unwrap();
+        assert_eq!(o.tcp_connect_timeout_ms, Some(500));
+        assert!(o.compress);
+    }
+
+    #[test]
+    fn scrub_redacts_every_spelling_of_the_password() {
+        let o = Opts::from_url("mysql://u:p%40ss%3Aw@127.0.0.1:1/d").unwrap();
+        assert_eq!(
+            o.scrub("a p%40ss%3Aw b p@ss:w c p%40ss%3aw".into()),
+            "a <redacted> b <redacted> c p%40ss%3aw"
+        );
+        assert_eq!(o.scrub("plain".into()), "plain");
+        assert!(
+            !format!("{o:?}").contains("ss"),
+            "Debug stays redacting: {o:?}"
         );
     }
 }
