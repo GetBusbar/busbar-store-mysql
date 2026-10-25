@@ -18,7 +18,9 @@ env:
   PLUGIN_C_DIR: ""
   CARGO_TERM_COLOR: "never"
   PLUGIN_CI: |
-    # plugin-ci for ModernCI: busbar's reusable plugin-ci.yml (pin f6376ed) as one bash program.
+    # plugin-ci for ModernCI: busbar's reusable plugin-ci.yml as one bash program, at busbar dd677873c
+    # ("Delete the gate machinery"): the plugin QA template is fmt, clippy, build, test, the published
+    # conformance suite (linked and dropped in, RED arms kept) and cargo deny; xtask plugin-gates are gone.
     # Called as `bash -c "$PLUGIN_CI" plugin-ci <pin|linux>` with PLUGIN_* set by the branch file.
     # The GitHub layout is kept: $GITHUB_WORKSPACE/plugin is this checkout, $GITHUB_WORKSPACE/busbar is
     # busbar at the plugin's .busbar-ref pin, so busbar's own scripts read the paths they always did.
@@ -160,7 +162,6 @@ env:
         export BUSBAR_CHECKOUT="$W/busbar" BUSBAR_TARGET_DIR="$W/busbar/target" CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
       fi
     }
-    s_gates() { (cd busbar && cargo build --locked -q -p xtask && target/debug/xtask plugin-gates selftest); }
     s_fmt() { (cd plugin && cargo fmt --all -- --check); }
     s_clippy() { (cd plugin && cargo clippy --workspace --all-targets --locked -- -D warnings); }
     s_build() {
@@ -188,7 +189,6 @@ env:
       suite="the_linked_and_the_dropped_in_door_are_one_plugin red_a_moved_crossing_count_is_refused red_a_door_at_another_kind_abi_is_refused red_a_failing_ready_refuses_the_boot red_a_networked_door_with_no_connection_table_is_refused the_declared_needs_are_the_statements the_suite_runs_in_the_profile_it_was_asked_to"
       list="$RUNNER_TEMP/conformance.list"
       cargo test --release --locked -p "$PLUGIN_CRATE" --test conformance -- --list > "$list" || { echo "no conformance target"; exit 1; }
-      "$W/busbar/target/debug/xtask" plugin-gates bothways "$list"
       for t in $suite; do grep -qx "$t: test" "$list" || { echo "the published suite's test '$t' is not in the conformance target"; exit 1; }; done
       out="$(cargo test --release --locked -p "$PLUGIN_CRATE" --test conformance 2>&1 | tee /dev/stderr)"
       for t in $suite; do printf '%s\n' "$out" | grep -qx "test $t ... ok" || { echo "the published suite's test '$t' did not RUN green"; exit 1; }; done
@@ -197,53 +197,12 @@ env:
       fi
       printf '%s\n' "$red" | grep -q "crossing(s), pinned" || { printf '%s\n' "$red" >&2; echo "RED: the moved count failed for another reason"; exit 1; }
     }
-    s_plane() { (cd busbar && "$W/busbar/target/debug/xtask" plugin-gates plane "$W/busbar" "$W/plugin" "${PLUGIN_CRATE%-plugin}"); }
     s_deny() {
       cd plugin
       fetch "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-$DENY.tar.gz" "$DENYSHA" "$T/deny-$DENY.tgz"
       tar -xzf "$T/deny-$DENY.tgz" -C "$RUNNER_TEMP"; deny="$RUNNER_TEMP/cargo-deny-0.20.2-$DENY/cargo-deny"
       "$deny" --locked --format json check advisories 2> "$RUNNER_TEMP/advisories.jsonl" || true
       "$deny" --locked check
-    }
-    s_meta() {
-      cd plugin
-      cargo metadata --format-version 1 --locked --filter-platform x86_64-unknown-linux-gnu > "$RUNNER_TEMP/meta.json"
-      : > "$RUNNER_TEMP/tree.txt"
-      for pkg in $(cargo metadata --format-version 1 --locked --no-deps | jq -r '.packages[].name'); do
-        cargo tree --locked --package "$pkg" --edges normal,build --target all --prefix none --format '{p}|{f}' >> "$RUNNER_TEMP/tree.txt"
-      done
-    }
-    G() { "$W/busbar/target/debug/xtask" plugin-gates "$@"; }
-    s_depwall() { G depwall "$RUNNER_TEMP/meta.json" "$REPO" --tree "$RUNNER_TEMP/tree.txt"; }
-    s_netban() {
-      rc=0
-      G netban "$RUNNER_TEMP/meta.json" busbar/.github/fleet/deps.toml "$REPO" --tree "$RUNNER_TEMP/tree.txt" || rc=1
-      feat=""; if (cd plugin && has_dropped_in); then feat="--features dropped-in"; fi
-      (cd plugin && CARGO_PROFILE_RELEASE_LTO=true CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 cargo build --release --locked -p "$PLUGIN_CRATE" --lib $feat) || exit 1
-      lib="plugin/target/release/lib${PLUGIN_CRATE//-/_}.so"; [ -f "$lib" ] || { echo "no cdylib at $lib"; exit 1; }
-      nm -D --undefined-only "$lib" | awk '{print $NF}' > "$RUNNER_TEMP/undef.txt"
-      readelf -d "$lib" | sed -nE 's/.*\(NEEDED\).*\[(.*)\].*/\1/p' > "$RUNNER_TEMP/needed.txt"
-      G imports "$RUNNER_TEMP/undef.txt" "$RUNNER_TEMP/needed.txt" busbar/.github/fleet/deps.toml "$REPO" || rc=1
-      rm -rf plugin/target/release
-      exit $rc
-    }
-    s_cdeps() { G cdeps "$RUNNER_TEMP/meta.json" busbar/.github/fleet/deps.toml --tree "$RUNNER_TEMP/tree.txt"; }
-    s_parity() {
-      adv=(); [ -f "$RUNNER_TEMP/advisories.jsonl" ] && adv=(--advisories "$RUNNER_TEMP/advisories.jsonl")
-      G parity plugin/Cargo.lock busbar/Cargo.lock busbar/.github/fleet/deps.toml "$REPO" "${adv[@]}"
-    }
-    s_declares() {
-      f="$(cd plugin && git ls-files | grep -E '(^|/)declares\.json$' | head -n1)"
-      [ -n "$f" ] || { echo "no declares.json in the repo"; exit 1; }
-      G declares busbar "$PLUGIN_KIND" "plugin/$f"
-    }
-    s_former() {
-      G former-names busbar/plugins.yaml "$REPO"
-      rel=plugin/.github/workflows/release.yml
-      if [ -f "$rel" ]; then
-        declared="$(sed -nE 's/^[[:space:]]*former_names:[[:space:]]*"?([^"#]*)"?.*$/\1/p' "$rel" | head -n1)"
-        G former-names busbar/plugins.yaml "$REPO" --declared "$declared"
-      fi
     }
     s_cconf() {
       cd busbar
@@ -263,7 +222,6 @@ env:
     s_env
     echo "=== services ($PLUGIN_SERVICE)"
     services || { echo "!!! FAILED: services"; exit 1; }   # in this shell: its URLs and container name are the job's
-    step ok "the plugin gates at the pin, and their selftest" s_gates
     if [ "$present" = true ]; then
       step ok fmt s_fmt; step ok "clippy (-D warnings)" s_clippy; step ok build s_build
     fi
@@ -276,15 +234,8 @@ env:
       step ok test s_test
       [ -n "$PLUGIN_EXTRA_TEST" ] && step ok "extra test command" s_extra
       step always "the published conformance suite at the pin" s_conformance
-      [ "$PLUGIN_KIND" = plane ] && step always "busbar's plane gates over this plane" s_plane
       step always "cargo deny" s_deny
-      if step always "the shipped closure (cargo metadata)" s_meta; then
-        step always dep-wall s_depwall; step always "socket/TLS ban" s_netban; step always "C-dependency allow-list" s_cdeps
-      fi
-      step always "Cargo.lock parity with busbar's lock at the pin" s_parity
-      step always "declares.json states the kind's contract ABI" s_declares
     fi
-    step always "a renamed plugin answers its 1.5.5 manifest name" s_former
     [ "$PLUGIN_LANG" = c ] && step always "C: the kind's conformance through load_dropped" s_cconf
     exit $fail
 on:
