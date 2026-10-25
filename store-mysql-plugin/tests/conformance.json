@@ -1,5 +1,6 @@
 {
-  "settings": { "url": "mysql://busbar:busbar@127.0.0.1:3306/{fold}" },
+  "settings": { "url": "mysql://conf_canary:CANARY-my-conf-2f6a@127.0.0.1:3306/{fold}" },
+  "credentials": ["CANARY-my-conf-2f6a"],
   "store": {
     "credential_kind": "sigv4",
     "node": 7,

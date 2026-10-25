@@ -73,6 +73,17 @@ fn fold_root(settings: &[u8]) -> (mysql::Conn, String) {
 fn create_fold_database(namespace: &str, settings: &[u8]) {
     use mysql::prelude::Queryable;
     let (mut root, user) = fold_root(settings);
+    // THE CANARY'S USER: the store authenticates as it with the credential conformance.json
+    // names, so every fold's handshake carries it and the suite's canary searches for it.
+    let inputs: serde_json::Value =
+        serde_json::from_str(include_str!("conformance.json")).expect("conformance.json is JSON");
+    let canary = inputs["credentials"][0]
+        .as_str()
+        .expect("conformance.json names the canary credential");
+    root.query_drop(format!(
+        "CREATE USER IF NOT EXISTS '{user}'@'%' IDENTIFIED BY '{canary}'"
+    ))
+    .expect("the canary user is made");
     root.query_drop(format!("CREATE DATABASE IF NOT EXISTS `{namespace}`"))
         .expect("the fold's database is created");
     root.query_drop(format!(

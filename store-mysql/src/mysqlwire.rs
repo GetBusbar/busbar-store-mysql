@@ -38,7 +38,7 @@ use mysql_common::io::{ParseBuf, ReadMysqlExt};
 use mysql_common::named_params::ParsedNamedParams;
 use mysql_common::packets::{
     AuthPlugin, AuthSwitchRequest, Column, ComStmtClose, ComStmtExecuteRequestBuilder,
-    ComStmtSendLongData, CommonOkPacket, ErrPacket, HandshakePacket, HandshakeResponse, OkPacket,
+    ComStmtSendLongData, CommonOkPacket, ErrPacket, HandshakePacket, OkPacket,
     OkPacketDeserializer, OkPacketKind, OldAuthSwitchRequest, OldEofPacket, ResultSetTerminator,
     StmtPacket,
 };
@@ -52,6 +52,8 @@ pub use mysql_common::params::Params;
 pub use mysql_common::row::Row;
 pub use mysql_common::value::Value;
 
+use busbar_contract::abi::sdk::chip::{MysqlAuth, MysqlHandshake, Refused};
+use busbar_contract::abi::sdk::cred::{Cred, CredUrl, PasswordAt, Seal};
 use busbar_contract::abi::sdk::store::wire::Wire;
 
 // ── errors (the driver's, in its words) ─────────────────────────────────────────────────────────
@@ -205,16 +207,16 @@ pub enum Error {
 }
 
 impl Error {
-    /// This error with the URL's password redacted from every text it carries.
-    pub(crate) fn scrubbed(self, opts: &Opts) -> Self {
+    /// This error with any echo of the URL's password taken out by the chip.
+    pub(crate) fn quieted(self, opts: &Opts) -> Self {
         match self {
-            Error::IoError(m) => Error::IoError(opts.scrub(m)),
+            Error::IoError(m) => Error::IoError(opts.quiet(m)),
             Error::MySqlError(mut e) => {
-                e.message = opts.scrub(e.message);
+                e.message = opts.quiet(e.message);
                 Error::MySqlError(e)
             }
             Error::DriverError(DriverError::CouldNotConnect(Some((a, d)))) => {
-                Error::DriverError(DriverError::CouldNotConnect(Some((a, opts.scrub(d)))))
+                Error::DriverError(DriverError::CouldNotConnect(Some((a, opts.quiet(d)))))
             }
             e => e,
         }
@@ -265,10 +267,11 @@ const STMT_CACHE_DEFAULT: usize = 32;
 
 /// What a `mysql://` URL says (the parts a connection over the host's connector uses; the TCP
 /// socket options the driver accepted are accepted and validated alike, and served by the host).
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct Opts {
     pub user: Option<String>,
-    pub pass: Option<String>,
+    /// The password, sealed: the chip builds every auth message from it.
+    pub pass: Option<Cred>,
     pub host: url::Host,
     pub port: u16,
     pub db_name: Option<String>,
@@ -280,8 +283,6 @@ pub struct Opts {
     pub secure_auth: bool,
     pub enable_cleartext_plugin: bool,
     pub stmt_cache_size: usize,
-    /// Every spelling of the URL's password (decoded, as written, percent-encoded): what `scrub` redacts.
-    secrets: Vec<String>,
 }
 
 impl fmt::Debug for Opts {
@@ -309,37 +310,6 @@ fn is_tls_parameter(k: &str) -> bool {
         || matches!(k.as_str(), "require_ssl" | "verify_ca" | "verify_identity")
 }
 
-/// Whether the URL text carries a password: userinfo `:pass`, a `password=` parameter, or an `@`
-/// after the `?` (an unencoded password that split the URL there).
-fn url_carries_password(url_str: &str) -> bool {
-    let rest = url_str.split_once("://").map_or(url_str, |(_, r)| r);
-    let (head, query) = rest.split_once('?').unwrap_or((rest, ""));
-    let userinfo_pass = head
-        .rsplit_once('@')
-        .is_some_and(|(ui, _)| ui.contains(':'));
-    userinfo_pass || query.contains('@') || query.split('&').any(|p| p.starts_with("password="))
-}
-
-/// Every spelling of the URL's password: decoded, as written in the URL, percent-encoded.
-fn password_spellings(url_str: &str, decoded: Option<&str>) -> Vec<String> {
-    let mut out = Vec::new();
-    if let Some(d) = decoded {
-        out.push(d.to_string());
-        out.push(
-            percent_encoding::utf8_percent_encode(d, percent_encoding::NON_ALPHANUMERIC)
-                .to_string(),
-        );
-    }
-    if let Ok(u) = url::Url::parse(url_str) {
-        if let Some(p) = u.password() {
-            out.push(p.to_string());
-        }
-    }
-    out.sort_by_key(|s| std::cmp::Reverse(s.len()));
-    out.dedup();
-    out
-}
-
 fn decode(s: &str) -> String {
     percent_encoding::percent_decode(s.as_bytes())
         .decode_utf8_lossy()
@@ -353,37 +323,42 @@ impl Opts {
     /// # Errors
     /// The driver's [`UrlError`].
     pub fn from_url(url_str: &str) -> Result<Opts, UrlError> {
-        Self::parse_url(url_str).map_err(|e| match e {
-            // These echo URL text; an unencoded password (`u:12?abc@h`) splits at `?` and its tail
-            // arrives here as a "parameter". Withhold the text when the URL carries a password.
-            UrlError::UnknownParameter(_) | UrlError::InvalidValue(..)
-                if url_carries_password(url_str) =>
-            {
-                UrlError::Refused(
-                    "mysql store: invalid URL parameter (its text is withheld: the URL carries a \
-                     password; percent-encode `?`, `@`, `/` and `:` inside it)"
-                        .into(),
-                )
+        const WITHHELD: &str = "mysql store: invalid URL parameter (its text is withheld: the URL \
+                                carries a password; percent-encode `?`, `@`, `/` and `:` inside it)";
+        let input = CredUrl::parse(url_str).map_err(|_| UrlError::Refused(WITHHELD.into()))?;
+        match input.password_at() {
+            // An unencoded password (`u:12?abc@h`) splits the URL at `?` for the driver's reader.
+            Some(PasswordAt::UserinfoUnencoded) => return Err(UrlError::Refused(WITHHELD.into())),
+            Some(PasswordAt::Query("pass")) => {
+                return Err(UrlError::UnknownParameter("pass".into()))
+            }
+            _ => {}
+        }
+        let carries = input.password().is_some()
+            || input
+                .public()
+                .split_once('?')
+                .is_some_and(|(_, q)| q.contains('@'));
+        Self::parse_url(&input).map_err(|e| match e {
+            // These echo URL text; withhold it when the URL carries a password.
+            UrlError::UnknownParameter(_) | UrlError::InvalidValue(..) if carries => {
+                UrlError::Refused(WITHHELD.into())
             }
             e => e,
         })
     }
 
-    /// `text` with the URL's password (every spelling of it, and the decoded password itself)
-    /// redacted: the ONE redaction every error this crate builds from server, connector or URL
-    /// text goes through. Text without the password is returned unchanged.
+    /// `text` as the server may have echoed it, with the password the chip holds taken out.
     #[must_use]
-    pub fn scrub(&self, text: String) -> String {
-        let mut out = text;
-        let decoded = self.pass.iter();
-        for s in self.secrets.iter().chain(decoded).filter(|s| !s.is_empty()) {
-            out = out.replace(s.as_str(), "<redacted>");
+    pub fn quiet(&self, text: String) -> String {
+        match &self.pass {
+            Some(pass) => pass.redact_echo(&text),
+            None => text,
         }
-        out
     }
 
-    fn parse_url(url_str: &str) -> Result<Opts, UrlError> {
-        let url = url::Url::parse(url_str)?;
+    fn parse_url(input: &CredUrl) -> Result<Opts, UrlError> {
+        let url = url::Url::parse(input.public())?;
         if url.scheme() != "mysql" {
             return Err(UrlError::UnsupportedScheme(url.scheme().to_string()));
         }
@@ -391,7 +366,7 @@ impl Opts {
             return Err(UrlError::BadUrl);
         }
         let user = Some(url.username()).filter(|u| !u.is_empty()).map(decode);
-        let pass = url.password().map(decode);
+        let pass = input.password().cloned();
         let host = url
             .host()
             .ok_or(UrlError::BadUrl)
@@ -413,7 +388,6 @@ impl Opts {
             secure_auth: true,
             enable_cleartext_plugin: false,
             stmt_cache_size: STMT_CACHE_DEFAULT,
-            secrets: Vec::new(),
         };
         let pairs: HashMap<String, String> = url.query_pairs().into_owned().collect();
         for (key, value) in &pairs {
@@ -426,7 +400,6 @@ impl Opts {
                     ));
                 }
                 "user" => opts.user = Some(value.to_string()),
-                "password" => opts.pass = Some(value.to_string()),
                 "host" => {
                     opts.host = url::Host::parse(value)
                         .unwrap_or_else(|_| url::Host::Domain(value.to_owned()));
@@ -481,7 +454,6 @@ impl Opts {
                 _ => return Err(UrlError::UnknownParameter(key.to_string())),
             }
         }
-        opts.secrets = password_spellings(url_str, opts.pass.as_deref());
         Ok(opts)
     }
 
@@ -710,29 +682,24 @@ impl Conn {
     /// # Errors
     /// The connector's failure (as the driver's connect failure), or the server's refusal.
     pub async fn open(wire: Wire, opts: &Arc<Opts>, need: u32, init: &[&str]) -> Result<Conn> {
-        Self::open_unscrubbed(wire, opts, need, init)
+        Self::open_quiet(wire, opts, need, init)
             .await
-            .map_err(|e| e.scrubbed(opts))
+            .map_err(|e| e.quieted(opts))
     }
 
-    /// `text` with this connection's URL password redacted.
-    pub(crate) fn scrub(&self, text: String) -> String {
-        self.st.opts.scrub(text)
+    /// `text` with any echo of this connection's URL password taken out by the chip.
+    pub(crate) fn quiet(&self, text: String) -> String {
+        self.st.opts.quiet(text)
     }
 
-    async fn open_unscrubbed(
-        wire: Wire,
-        opts: &Arc<Opts>,
-        need: u32,
-        init: &[&str],
-    ) -> Result<Conn> {
+    async fn open_quiet(wire: Wire, opts: &Arc<Opts>, need: u32, init: &[&str]) -> Result<Conn> {
         let timeout = opts
             .tcp_connect_timeout_ms
             .map_or(0, |ms| u32::try_from(ms).unwrap_or(u32::MAX));
         let could_not = |e: busbar_contract::abi::sdk::conn::ConnFailure| {
             Error::DriverError(DriverError::CouldNotConnect(Some((
                 opts.address(),
-                opts.scrub(e.to_string()),
+                opts.quiet(e.to_string()),
             ))))
         };
         wire.connect_timed(need, Some(&opts.target()), timeout)
@@ -855,7 +822,7 @@ impl Conn {
                         ErrPacket::Error(server_error) => {
                             self.handle_err();
                             let mut e = MySqlError::from(server_error);
-                            e.message = self.st.opts.scrub(e.message);
+                            e.message = self.st.opts.quiet(e.message);
                             return Err(Error::MySqlError(e));
                         }
                         ErrPacket::Progress(_) => continue,
@@ -890,12 +857,6 @@ impl Conn {
             return Err(Error::IoError(e));
         }
         Ok(())
-    }
-
-    async fn write_struct<T: MySerialize>(&mut self, s: &T) -> Result<()> {
-        let mut buf = Vec::new();
-        s.serialize(&mut buf);
-        self.write_packet(&buf).await
     }
 
     async fn write_command_raw<T: MySerialize>(&mut self, cmd: &T) -> Result<()> {
@@ -1022,30 +983,73 @@ impl Conn {
     }
 
     async fn write_handshake_response(&mut self) -> Result<()> {
-        let pass = self.st.opts.pass.clone();
-        let auth_data = self
-            .st
-            .auth_plugin
-            .gen_data(pass.as_deref(), &self.st.nonce)
-            .map(|x| x.into_owned());
-        let user = self.st.opts.user.clone();
+        // utf8mb4_general_ci from 5.5.3, else utf8_general_ci: the driver's choice.
+        let collation = if self.st.server_version.unwrap_or((0, 0, 0)) >= (5, 5, 3) {
+            45
+        } else {
+            33
+        };
+        let auth = match self.st.auth_plugin {
+            AuthPlugin::CachingSha2Password => MysqlAuth::CachingSha2,
+            _ => MysqlAuth::Native,
+        };
+        let attrs = connect_attrs();
+        let attrs: Vec<(&[u8], &[u8])> = attrs
+            .iter()
+            .map(|(k, v)| (k.as_bytes(), v.as_bytes()))
+            .collect();
+        let user = self.st.opts.user.clone().unwrap_or_default();
         let db = self.st.opts.db_name.clone();
-        let response = HandshakeResponse::new(
-            auth_data.as_deref(),
-            self.st.server_version.unwrap_or((0, 0, 0)),
-            user.as_deref().map(str::as_bytes),
-            db.as_deref().map(str::as_bytes),
-            Some(self.st.auth_plugin.clone()),
-            self.st.caps,
-            Some(connect_attrs()),
-            self.st
+        let pass = self.st.opts.pass.clone().unwrap_or_else(Cred::empty);
+        let nonce = self.st.nonce.clone();
+        let response = MysqlHandshake {
+            seq: 0,
+            capabilities: self.st.caps.bits(),
+            max_packet: self
+                .st
                 .opts
                 .max_allowed_packet
                 .unwrap_or(DEFAULT_MAX_ALLOWED_PACKET) as u32,
-        );
-        let mut buf = Vec::new();
-        response.serialize(&mut buf);
-        self.write_packet(&buf).await
+            collation,
+            user: user.as_bytes(),
+            database: db.as_deref().map(str::as_bytes),
+            auth,
+            nonce: &nonce,
+            attrs: &attrs,
+        };
+        self.write_sealed_packet(|seq| {
+            pass.mysql_handshake_response(&MysqlHandshake { seq, ..response })
+        })
+        .await
+    }
+
+    /// Write the chip's whole auth packet at the codec's next sequence id. The codec states no
+    /// sequence id: framing an empty payload into a scratch buffer reads it and moves the codec past
+    /// this packet, which the chip frames itself (authentication runs before any compression).
+    async fn write_sealed_packet(
+        &mut self,
+        build: impl FnOnce(u8) -> std::result::Result<Seal, Refused>,
+    ) -> Result<()> {
+        let mut probe = BytesMut::new();
+        if let Err(e) = self.st.codec.encode(&mut &[][..], &mut probe) {
+            self.broken = true;
+            return Err(Error::CodecError(e));
+        }
+        let seal = build(probe[3]).map_err(|r| Error::IoError(r.to_string()))?;
+        let written = match &mut self.io {
+            Io::Wire(w) => w.write_sealed(&seal).await.map_err(|e| e.to_string()),
+            #[cfg(test)]
+            Io::Tcp(s) => std::io::Write::write_all(
+                s,
+                &busbar_contract::abi::sdk::test_support::chip::sealed_bytes(&seal),
+            )
+            .map_err(|e| e.to_string()),
+        };
+        if let Err(e) = written {
+            self.broken = true;
+            return Err(Error::IoError(e));
+        }
+        Ok(())
     }
 
     fn continue_auth(&mut self, auth_switched: bool) -> AuthStep<'_> {
@@ -1121,29 +1125,21 @@ impl Conn {
                 // Full authentication: the password in clear over a socket, else RSA-encrypted
                 // with the server's public key (this connection is never TLS).
                 Some(0x04) => {
-                    let mut pass = self
-                        .st
-                        .opts
-                        .pass
-                        .as_deref()
-                        .map(|p| p.as_bytes().to_vec())
-                        .unwrap_or_default();
-                    pass.push(0);
+                    let pass = self.st.opts.pass.clone().unwrap_or_else(Cred::empty);
                     if self.st.socket {
-                        self.write_packet(&pass).await?;
+                        self.write_sealed_packet(|seq| pass.mysql_clear_packet(seq))
+                            .await?;
                     } else {
-                        // The XOR below cycles the nonce; a switch request may carry none.
+                        // The chip XORs with the nonce cyclically; a switch request may carry none.
                         if self.st.nonce.is_empty() {
                             return Err(DriverError::UnexpectedPacket.into());
                         }
                         self.write_packet(&[0x02]).await?;
                         let payload = self.read_packet().await?;
-                        let key = &payload[1..];
-                        for (i, c) in pass.iter_mut().enumerate() {
-                            *c ^= self.st.nonce[i % self.st.nonce.len()];
-                        }
-                        let encrypted = mysql_common::crypto::encrypt(&pass, key);
-                        self.write_packet(&encrypted).await?;
+                        let key = payload[1..].to_vec();
+                        let nonce = self.st.nonce.clone();
+                        self.write_sealed_packet(|seq| pass.mysql_rsa_packet(seq, &nonce, &key))
+                            .await?;
                     }
                     let payload = self.read_packet().await?;
                     self.handle_ok::<CommonOkPacket>(&payload)
@@ -1174,15 +1170,12 @@ impl Conn {
         }
         self.st.nonce = req.plugin_data().to_vec();
         self.st.auth_plugin = req.auth_plugin().into_owned();
-        let pass = self.st.opts.pass.clone();
-        let data = match self.st.auth_plugin {
+        let auth = match self.st.auth_plugin {
             AuthPlugin::MysqlOldPassword => {
                 if self.st.opts.secure_auth {
                     return Err(DriverError::OldMysqlPasswordDisabled.into());
                 }
-                self.st
-                    .auth_plugin
-                    .gen_data(pass.as_deref(), &self.st.nonce)
+                Some(MysqlAuth::Old)
             }
             AuthPlugin::MysqlClearPassword => {
                 if !self.st.opts.enable_cleartext_plugin {
@@ -1190,19 +1183,19 @@ impl Conn {
                         DriverError::UnknownAuthPlugin("mysql_clear_password".into()).into(),
                     );
                 }
-                self.st
-                    .auth_plugin
-                    .gen_data(pass.as_deref(), &self.st.nonce)
+                Some(MysqlAuth::Clear)
             }
-            AuthPlugin::Other(_) => None,
-            _ => self
-                .st
-                .auth_plugin
-                .gen_data(pass.as_deref(), &self.st.nonce),
-        }
-        .map(|d| d.into_owned());
-        match data {
-            Some(d) => self.write_struct(&d).await?,
+            AuthPlugin::MysqlNativePassword => Some(MysqlAuth::Native),
+            AuthPlugin::CachingSha2Password => Some(MysqlAuth::CachingSha2),
+            _ => None,
+        };
+        match auth {
+            Some(a) => {
+                let pass = self.st.opts.pass.clone().unwrap_or_else(Cred::empty);
+                let nonce = self.st.nonce.clone();
+                self.write_sealed_packet(|seq| pass.mysql_auth_switch_response(seq, a, &nonce))
+                    .await?;
+            }
             None => self.write_packet(&[]).await?,
         }
         self.continue_auth(true).await
@@ -1676,14 +1669,14 @@ mod tests {
         let o =
             Opts::from_url("mysql://u%40x:p%3Ass@db.internal:3307/busbar?compress=true").unwrap();
         assert_eq!(o.user.as_deref(), Some("u@x"));
-        assert_eq!(o.pass.as_deref(), Some("p:ss"));
+        assert!(o.pass.as_ref().is_some_and(|p| p.verify_eq(b"p:ss")));
         assert_eq!(o.target(), "db.internal:3307");
         assert_eq!(o.db_name.as_deref(), Some("busbar"));
         assert!(o.compress);
         let o = Opts::from_url("mysql://u@[::1]/d").unwrap();
         assert_eq!(o.target(), "[::1]:3306");
         assert_eq!(o.address(), "::1:3306");
-        assert_eq!(o.pass, None);
+        assert!(o.pass.is_none());
         let o = Opts::from_url("mysql://u@localhost/d?socket=/run/mysqld/mysqld.sock").unwrap();
         assert_eq!(o.target(), "unix:/run/mysqld/mysqld.sock");
     }
@@ -1808,13 +1801,11 @@ mod tests {
     }
 
     #[test]
-    fn scrub_redacts_every_spelling_of_the_password() {
+    fn the_password_is_sealed_and_an_echo_of_it_is_taken_out() {
         let o = Opts::from_url("mysql://u:p%40ss%3Aw@127.0.0.1:1/d").unwrap();
-        assert_eq!(
-            o.scrub("a p%40ss%3Aw b p@ss:w c p%40ss%3aw".into()),
-            "a <redacted> b <redacted> c p%40ss%3aw"
-        );
-        assert_eq!(o.scrub("plain".into()), "plain");
+        assert!(o.pass.as_ref().is_some_and(|p| p.verify_eq(b"p@ss:w")));
+        assert_eq!(o.quiet("a b p@ss:w c".into()), "a b [redacted] c");
+        assert_eq!(o.quiet("plain".into()), "plain");
         assert!(
             !format!("{o:?}").contains("ss"),
             "Debug stays redacting: {o:?}"

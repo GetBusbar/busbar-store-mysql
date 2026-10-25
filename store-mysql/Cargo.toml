@@ -20,7 +20,7 @@ crate-type = ["rlib"]
 [dependencies]
 # The ONE busbar crate a plugin names (#40: contract only; DECISIONS #84 merged the plugin SDK into it
 # as `busbar_contract::abi::sdk`). Pinned by git rev to the busbar commit in `.busbar-ref`.
-busbar-contract = { workspace = true }
+busbar-contract = { workspace = true, features = ["chip-rsa"] }
 # THE MYSQL CLIENT PROTOCOL WITHOUT A SOCKET (busbar THE DESIGN, the connections section: the store
 # reaches its server only over the host's connector, ARCHITECT rulings 2026-10-03 on Q-L14-1 /
 # Q-L16-2): `mysql_common` is the sans-IO core the 1.5.5 `mysql` driver is built on (packets, the
@@ -51,4 +51,6 @@ ulid = { workspace = true }
 # (`TcpConns`, `test-support`). The 1.5.5 `mysql` driver verifies what landed INDEPENDENTLY of the
 # store (tests only; never in the shipped image).
 busbar-plugin-loader = { workspace = true, features = ["test-support"] }
+# A unit test's fake server writes the chip's sealed auth packets itself (`test_support::chip`).
+busbar-contract = { workspace = true, features = ["test-seal"] }
 mysql = { workspace = true }
