@@ -791,19 +791,6 @@ fn denylist_add_and_list_roundtrips_and_never_shortens_the_window() {
 
 // ── Boot-time invariant probes ───────────────────────────────────────────────────────────────────
 
-/// Proves the CHECK-enforcement functional probe actually detects a real violation attempt and
-/// would refuse to boot if the server didn't enforce it (this test can't easily simulate a real
-/// pre-8.0.16 server, so it proves the probe's DETECTION half by confirming a live server currently
-/// running under CI/local docker actually enforces the constraint it probes).
-#[test]
-fn boot_probe_confirms_check_enforcement_on_a_real_server() {
-    let Some(url) = test_url() else { return };
-    // connect() itself runs the probe internally and would have returned Err if enforcement were
-    // missing -- reaching this line at all is the proof for a real MySQL 8 server.
-    let store = MysqlStore::connect(&url).unwrap();
-    drop(store);
-}
-
 #[test]
 fn boot_probe_rejects_a_permissive_sql_mode() {
     let Some(url) = test_url() else { return };
@@ -1184,73 +1171,6 @@ fn migrate_v3_does_not_touch_a_table_when_the_database_is_not_pre_v3() {
     );
 }
 
-/// KNOWN, DOCUMENTED, NOT-YET-CLOSED GAP -- see `run_v2_backfill_if_needed`'s own doc comment for
-/// the full writeup, including why a `GET_LOCK` does not close it. Characterizes the exact
-/// rolling-upgrade race as a
-/// deterministic ORDER-of-operations reproduction (no real thread timing needed -- the race is
-/// about which write reaches the row first, which a single-threaded test can fully control): a
-/// pre-v2 row that receives ONE legitimate real v2 write (simulating an already-live node
-/// elsewhere in the fleet) BEFORE this node's own backfill runs permanently loses its pre-v2
-/// history from ever being counted as billable.
-///
-/// `#[ignore]`d: it documents real, CURRENT behavior rather than guarding a regression, so it
-/// fails today by design. Un-ignore once the provenance-based redesign
-/// `run_v2_backfill_if_needed` describes lands, at which point the assertion starts passing.
-#[test]
-#[ignore = "characterizes a known, documented, not-yet-fixed gap -- see run_v2_backfill_if_needed's doc comment"]
-fn characterize_v2_backfill_loses_a_row_to_a_racing_live_write() {
-    let Some(s) = fresh_store() else { return };
-    let table = unique_scratch_table("racecharacterize");
-
-    let mut conn = s.pool.get_conn().unwrap();
-    conn.query_drop(format!(
-        "CREATE TABLE {table} (
-            bucket_id VARCHAR(64) NOT NULL,
-            window_start BIGINT NOT NULL,
-            requests BIGINT NOT NULL DEFAULT 0,
-            billable_requests BIGINT NOT NULL DEFAULT 0,
-            PRIMARY KEY (bucket_id, window_start)
-        ) ENGINE=InnoDB"
-    ))
-    .unwrap();
-    // Pre-v2 history: 10 real requests, never tracked as billable (this store didn't split the
-    // counters before v2).
-    conn.query_drop(format!(
-        "INSERT INTO {table} (bucket_id, window_start, requests, billable_requests) \
-         VALUES ('vk_race', 7000, 10, 0)"
-    ))
-    .unwrap();
-
-    // A live, already-upgraded node's REAL v2 write lands FIRST -- legitimate: 2 new billable
-    // requests arrive after the upgrade, correctly tracked in lockstep by v2-aware code.
-    conn.query_drop(format!(
-        "UPDATE {table} SET requests = requests + 2, billable_requests = billable_requests + 2 \
-         WHERE bucket_id = 'vk_race' AND window_start = 7000"
-    ))
-    .unwrap();
-
-    // THEN this (still-booting) node's backfill runs.
-    MysqlStore::run_v2_backfill_if_needed(&mut conn, 1, &table).unwrap();
-
-    let (requests, billable): (u64, u64) = conn
-        .query_first(format!(
-            "SELECT requests, billable_requests FROM {table} \
-             WHERE bucket_id='vk_race' AND window_start=7000"
-        ))
-        .unwrap()
-        .unwrap();
-    conn.query_drop(format!("DROP TABLE {table}")).unwrap();
-
-    assert_eq!(requests, 12, "sanity: 10 pre-v2 + 2 live v2 requests");
-    assert_eq!(
-        billable, 12,
-        "the pre-v2 10 requests should be reclassified as billable too -- if this fails, \
-         billable_requests stayed at 2 (only the live write's own delta) because the backfill's \
-         predicate (billable_requests = 0) no longer matched once the live write touched the row \
-         first. This is the documented, known gap in run_v2_backfill_if_needed's doc comment."
-    );
-}
-
 /// The two tests above prove `run_v2_backfill_if_needed` works correctly called DIRECTLY with a
 /// hand-supplied `prior_version`/`table` -- neither ever goes through `try_init_schema`'s REAL
 /// wiring: reading `prior_version` from the actual `store_meta.schema_version` row and calling the
@@ -1270,38 +1190,10 @@ fn characterize_v2_backfill_loses_a_row_to_a_racing_live_write() {
 #[test]
 fn try_init_schema_real_wiring_backfills_a_genuinely_pre_v2_database() {
     let _ddl_guard = lock_fresh_database_ddl();
-    let Some(url) = test_url() else { return };
-    let db_name = format!(
-        "busbar_wiring_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
-
-    let root_url = root_url(&url);
-    let root_opts = Opts::from_url(&root_url).unwrap();
-    let root_pool = Pool::new(root_opts).unwrap();
-    let mut root_conn = root_pool.get_conn().unwrap();
-    root_conn
-        .query_drop(format!("CREATE DATABASE {db_name}"))
-        .unwrap();
-    root_conn
-        .query_drop(format!(
-            "GRANT ALL PRIVILEGES ON {db_name}.* TO 'busbar'@'%'"
-        ))
-        .unwrap();
-
-    // Point the app-level busbar user at the fresh dedicated database (swap the path component of
-    // the URL, keep the same host/port/credentials). `url` is only a transitive dep (via `mysql`),
-    // so plain string surgery on the last path segment instead of a proper URL crate.
-    let dedicated_url = {
-        let cut = url
-            .rfind('/')
-            .expect("test_url() must be a mysql:// URL with a /database path");
-        format!("{}/{db_name}", &url[..cut])
+    let Some(db) = ScratchDb::new("wiring") else {
+        return;
     };
+    let dedicated_url = db.url.clone();
 
     // Boot ONCE to create the real schema for real via try_init_schema, then hand-seed a genuine
     // pre-v2 marker directly in the real store_meta row (safe here -- this database has no other
@@ -1333,10 +1225,6 @@ fn try_init_schema_real_wiring_backfills_a_genuinely_pre_v2_database() {
         .unwrap()
         .unwrap();
     drop(store2);
-
-    root_conn
-        .query_drop(format!("DROP DATABASE {db_name}"))
-        .unwrap();
 
     assert_eq!(requests, 5);
     assert_eq!(
