@@ -1328,3 +1328,17 @@ fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
     }
     None
 }
+
+#[cfg(test)]
+mod prefix_end_tests {
+    use super::prefix_end;
+
+    #[test]
+    fn prefix_end_carries_past_trailing_0xff_and_has_no_successor_for_all_0xff_or_empty() {
+        assert_eq!(prefix_end(b"a"), Some(b"b".to_vec()));
+        assert_eq!(prefix_end(b"b\xff"), Some(b"c".to_vec()));
+        assert_eq!(prefix_end(b"b\xff\xff"), Some(b"c".to_vec()));
+        assert_eq!(prefix_end(b"\xff\xff"), None);
+        assert_eq!(prefix_end(b""), None);
+    }
+}

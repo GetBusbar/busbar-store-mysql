@@ -256,6 +256,14 @@ impl MysqlStore {
         block_on(crate::MysqlStore::read_prior_version(&mut c, table))
     }
 
+    pub(crate) fn stamp_schema_version(
+        conn: &mut mysql::PooledConn,
+        table: &str,
+    ) -> RecordStoreResult<()> {
+        let mut c = own_client_like(conn);
+        block_on(crate::MysqlStore::stamp_schema_version(&mut c, table))
+    }
+
     pub(crate) fn probe_invariants(conn: &mut mysql::PooledConn) -> RecordStoreResult<()> {
         let mut c = own_client_like(conn);
         block_on(crate::MysqlStore::probe_invariants(&mut c))

@@ -81,6 +81,8 @@ fn open_refuses_settings_it_cannot_run_in_its_own_words() {
 /// process).
 #[test]
 fn an_op_id_write_applies_once_durably_and_a_different_body_conflicts() {
+    // `purge_windows_before` is unscoped; hold the lock so it cannot delete this window mid-test.
+    let _guard = super::lock_usage_windows();
     let Some(s) = fresh_store() else { return };
     let bucket = fresh("dedupe");
     let delta = UsageDelta {

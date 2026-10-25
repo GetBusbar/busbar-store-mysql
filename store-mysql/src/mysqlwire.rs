@@ -748,6 +748,11 @@ impl Conn {
                         ErrPacket::Progress(_) => continue,
                     }
                 }
+                // No response packet is ever empty; callers index the first byte.
+                Ok(()) if buffer.is_empty() => {
+                    self.broken = true;
+                    return Err(DriverError::UnexpectedPacket.into());
+                }
                 Ok(()) => return Ok(buffer),
                 Err(e) => {
                     self.handle_err();
@@ -1014,6 +1019,10 @@ impl Conn {
                     if self.st.socket {
                         self.write_packet(&pass).await?;
                     } else {
+                        // The XOR below cycles the nonce; a switch request may carry none.
+                        if self.st.nonce.is_empty() {
+                            return Err(DriverError::UnexpectedPacket.into());
+                        }
                         self.write_packet(&[0x02]).await?;
                         let payload = self.read_packet().await?;
                         let key = &payload[1..];
@@ -1108,7 +1117,13 @@ impl Conn {
             _ => {
                 let mut reader = &pld[..];
                 let column_count = reader.read_lenenc_int().map_err(io_err)?;
-                let mut columns: Vec<Column> = Vec::with_capacity(column_count as usize);
+                // Only the preallocation is bounded (the server's count is untrusted; 4096 is
+                // MySQL's column ceiling); a lying count ends in the read error below.
+                let mut columns: Vec<Column> = Vec::with_capacity(
+                    usize::try_from(column_count)
+                        .unwrap_or(usize::MAX)
+                        .min(4096),
+                );
                 for _ in 0..column_count {
                     let pld = self.read_packet().await?;
                     columns.push(ParseBuf(&pld).parse(()).map_err(io_err)?);
@@ -1446,7 +1461,77 @@ impl Transaction<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Opts, UrlError};
+    use super::{Conn, Io, Opts, UrlError};
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Waker};
+
+    /// One MySQL packet: 3-byte little-endian length, the sequence id, the payload.
+    fn packet(seq: u8, payload: &[u8]) -> Vec<u8> {
+        let n = payload.len().to_le_bytes();
+        let mut out = vec![n[0], n[1], n[2], seq];
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// A `Conn` over a plain TCP stream to a fake server running `script` on its own thread.
+    fn fake_server(
+        script: impl FnOnce(TcpStream) + Send + 'static,
+    ) -> (Conn, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || script(listener.accept().unwrap().0));
+        let stream = TcpStream::connect(addr).unwrap();
+        let opts = Opts::from_url("mysql://u:p@127.0.0.1:1/d").unwrap();
+        (Conn::new(Io::Tcp(stream), Arc::new(opts)), server)
+    }
+
+    /// Drive `f` to completion: the TCP transport blocks, so one poll finishes it.
+    fn run<T>(f: impl std::future::Future<Output = T>) -> T {
+        let mut f = std::pin::pin!(f);
+        match f.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(v) => v,
+            Poll::Pending => panic!("the TCP transport must not pend"),
+        }
+    }
+
+    #[test]
+    fn an_empty_reply_packet_is_refused_not_a_panic() {
+        let (mut conn, server) = fake_server(|mut s| {
+            s.write_all(&packet(0, &[])).unwrap();
+        });
+        assert!(run(conn.handle_result_set()).is_err());
+        assert!(conn.broken, "a corrupt reply must not keep the connection");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_lying_column_count_is_refused_not_an_allocation() {
+        let (mut conn, server) = fake_server(|mut s| {
+            let mut header = vec![0xfe];
+            header.extend_from_slice(&u64::MAX.to_le_bytes());
+            s.write_all(&packet(0, &header)).unwrap();
+        });
+        assert!(run(conn.handle_result_set()).is_err());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn full_auth_over_tcp_with_an_empty_nonce_is_refused_not_a_panic() {
+        let (mut conn, server) = fake_server(|mut s| {
+            s.write_all(&packet(0, &[0x01, 0x04])).unwrap();
+            // The client's 0x02 request (if it sends one), then a key packet.
+            let mut buf = [0_u8; 5];
+            if s.read(&mut buf).unwrap_or(0) > 0 {
+                let _ = s.write_all(&packet(2, &[0x01, b'k']));
+            }
+        });
+        conn.st.nonce.clear();
+        assert!(run(conn.continue_caching_sha2(true)).is_err());
+        drop(conn);
+        server.join().unwrap();
+    }
 
     #[test]
     fn a_url_parses_as_the_driver_parsed_it() {
