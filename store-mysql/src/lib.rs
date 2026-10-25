@@ -119,7 +119,18 @@ fn store_err<E: std::fmt::Display>(e: E) -> RecordStoreError {
 /// v8: the store v3 door (busbar 1.6.0's plugin ABI). Six NEW tables (`store_ops`, `store_caps`,
 /// `store_slices`, `store_journal`, `store_sessions`, `store_records`); purely additive, no
 /// existing table or row is touched.
-const SCHEMA_VERSION: u32 = 8;
+/// v9 (the store kind's epoch and slice life, `abi::store::money` rules (a)-(c)), ADDITIVE:
+/// `store_epoch` (the ONE fleet epoch `reserve` fences with, `0` before any reserve),
+/// `store_slices.valid_until_ms` (the instant a slice expires and its unreturned part goes back to
+/// its window's headroom) and `idx_store_slices_expiry` (a reserve's reclaim of its slots' expired
+/// slices). Slices a v8 build left open (granted `u64::MAX`, never expiring) are stamped to expire
+/// one `SLICE_TTL_MS` after the upgrade on the database's clock, so money a crashed node stranded
+/// under the old never-expires grant is returned rather than held forever -- see
+/// `run_v9_slice_life_upgrade`. Do not run v8 nodes against a v9 database: a v8 node's slice insert
+/// takes the column default `0`, which is already expired, so the next v9 `reserve` returns that
+/// slice to the window at once (the window can be over-granted for up to one TTL), and a v8 node
+/// neither fences on the epoch nor expires anything.
+const SCHEMA_VERSION: u32 = 9;
 
 /// The version each one-time migration step targets crossing INTO — named so a gate reads as "did
 /// this database predate step N" rather than a bare magic number, and so a future step can't be
@@ -129,6 +140,13 @@ const SCHEMA_VERSION: u32 = 8;
 const V2_BILLABLE_REQUESTS_BACKFILL: u32 = 2;
 const V3_KEY_GROUP_AT_USE_ASCII_BIN: u32 = 3;
 const V7_PLANE_RECORDS: u32 = 7;
+const V9_SLICE_LIFE: u32 = 9;
+
+/// THE STORE'S ONE CLOCK: the database server's, in ms since the Unix epoch, as a SQL expression.
+/// Computed in UTC (`UTC_TIMESTAMP`), so no session time zone or DST shift enters it. Every node of a
+/// fleet reads the same clock, so a slice's expiry means the same instant on all of them.
+pub(crate) const DB_NOW_MS: &str =
+    "TIMESTAMPDIFF(MICROSECOND, '1970-01-01 00:00:00', UTC_TIMESTAMP(6)) DIV 1000";
 
 const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS store_meta (
@@ -378,7 +396,9 @@ const SCHEMA: &[&str] = &[
         PRIMARY KEY (bucket, pooled, pool, dimension, class_key, window_start)
     ) ENGINE=InnoDB",
     // THE OPEN SLICES: what each grant still holds against its slot, until `slice_release` takes
-    // it back. A slice released to zero is deleted.
+    // it back or it expires (`valid_until_ms`, v9, the database's clock). A rolling-window slice
+    // released to zero or expired is deleted; the AUTO_INCREMENT high-water says it was granted.
+    // `idx_store_slices_expiry` (v9) is created by `run_v9_slice_life_upgrade`, after the column.
     "CREATE TABLE IF NOT EXISTS store_slices (
         slice_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
         bucket VARCHAR(191) COLLATE utf8mb4_bin NOT NULL,
@@ -387,7 +407,17 @@ const SCHEMA: &[&str] = &[
         dimension INT UNSIGNED NOT NULL,
         class_key VARCHAR(191) COLLATE utf8mb4_bin NOT NULL,
         window_start BIGINT UNSIGNED NOT NULL,
-        remaining BIGINT UNSIGNED NOT NULL
+        remaining BIGINT UNSIGNED NOT NULL,
+        valid_until_ms BIGINT UNSIGNED NOT NULL DEFAULT 0
+    ) ENGINE=InnoDB",
+    // ── v9 (the store kind's epoch and slice life) ────────────────────────────────────────────
+    //
+    // THE FLEET'S ONE EPOCH (`abi::store::money` (a)): a u64, 0 before any reserve, raised only by a
+    // reserve presenting a higher one, never lowered. The single row is the CHECK-pinned `one = 1`.
+    "CREATE TABLE IF NOT EXISTS store_epoch (
+        one TINYINT UNSIGNED PRIMARY KEY,
+        epoch BIGINT UNSIGNED NOT NULL,
+        CONSTRAINT ck_store_epoch_one CHECK (one = 1)
     ) ENGINE=InnoDB",
     // THE JOURNAL (`append_batch`/`heads`): fixed-size records per stream, at seq 1.. in order.
     "CREATE TABLE IF NOT EXISTS store_journal (
@@ -830,6 +860,97 @@ impl MysqlStore {
         Ok(())
     }
 
+    /// v9 SCHEMA upgrade (see `SCHEMA_VERSION`), IN PLACE, IDEMPOTENT and safe on a concurrent first
+    /// boot. MySQL DDL commits on its own, so there is no one transaction to hide the steps in; each
+    /// step is instead gated on what the database HAS (like `run_v7_schema_upgrade`) and a lost race
+    /// is "already there" (1060 / 1061), so a crash or a concurrent booter at any point converges.
+    ///
+    /// * the epoch row is seeded at 0 if absent (never overwritten: nothing lowers the epoch);
+    /// * `store_slices.valid_until_ms` is ADDED with a default of the upgrade's own stamp (the
+    ///   database's clock + `SLICE_TTL_MS`), so every slice a v8 build left open expires one TTL
+    ///   after the upgrade the instant the column exists: no window where another node already on v9
+    ///   reads it as `0` (expired) and returns a still-held slice early. The default is then set to
+    ///   `0` (a v9 insert always names its expiry), which leaves the rows already stamped as they are;
+    /// * crossing INTO v9 only, any open slice still at `0` (a v8 node's insert during a rolling
+    ///   upgrade) is stamped the same way;
+    /// * `idx_store_slices_expiry` serves a reserve's reclaim of its slots' expired slices.
+    pub(crate) async fn run_v9_slice_life_upgrade(
+        conn: &mut Conn,
+        prior_version: u32,
+    ) -> RecordStoreResult<()> {
+        conn.query_drop(
+            "INSERT INTO store_epoch (one, epoch) VALUES (1, 0) ON DUPLICATE KEY UPDATE one = one",
+        )
+        .await
+        .map_err(store_err)?;
+        let ttl = busbar_contract::abi::store::SLICE_TTL_MS;
+        let stamp = |now: Option<u64>| -> RecordStoreResult<u64> {
+            now.map(|n| n.saturating_add(ttl))
+                .ok_or_else(|| store_err("the database clock read returned no row"))
+        };
+        if !Self::column_exists(conn, "store_slices", "valid_until_ms").await? {
+            let until = stamp(
+                conn.query_first::<u64>(format!("SELECT {DB_NOW_MS}"))
+                    .await
+                    .map_err(store_err)?,
+            )?;
+            Self::ensure_column(
+                conn,
+                "store_slices",
+                "valid_until_ms",
+                &format!("BIGINT UNSIGNED NOT NULL DEFAULT {until}"),
+            )
+            .await?;
+        }
+        let default: Option<Option<String>> = conn
+            .query_first(
+                "SELECT column_default FROM information_schema.columns \
+                 WHERE table_schema = DATABASE() AND table_name = 'store_slices' \
+                 AND column_name = 'valid_until_ms'",
+            )
+            .await
+            .map_err(store_err)?;
+        if default.flatten().as_deref() != Some("0") {
+            conn.query_drop("ALTER TABLE store_slices ALTER COLUMN valid_until_ms SET DEFAULT 0")
+                .await
+                .map_err(|e| {
+                    store_err(format!(
+                        "schema upgrade failed defaulting store_slices.valid_until_ms: {e}"
+                    ))
+                })?;
+        }
+        if prior_version > 0 && prior_version < V9_SLICE_LIFE {
+            let until = stamp(
+                conn.query_first::<u64>(format!("SELECT {DB_NOW_MS}"))
+                    .await
+                    .map_err(store_err)?,
+            )?;
+            conn.exec_drop(
+                "UPDATE store_slices SET valid_until_ms = :until \
+                 WHERE valid_until_ms = 0 AND remaining <> 0",
+                params! { "until" => until },
+            )
+            .await
+            .map_err(store_err)?;
+        }
+        if !Self::index_exists(conn, "store_slices", "idx_store_slices_expiry").await? {
+            if let Err(e) = conn
+                .query_drop(
+                    "CREATE INDEX idx_store_slices_expiry ON store_slices \
+                     (bucket, pooled, pool, dimension, class_key, window_start, valid_until_ms)",
+                )
+                .await
+            {
+                if !Self::is_ddl_race(&e) {
+                    return Err(store_err(format!(
+                        "schema upgrade failed indexing store_slices expiry: {e}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Read the version this database was AT before this boot from `store_meta`, tolerating "no row
     /// yet" (a genuinely fresh database, or one already at v2 that never needed a marker written
     /// pre-v2) as version 0, but propagating any OTHER query failure (a connection blip, a lock
@@ -917,6 +1038,7 @@ impl MysqlStore {
         Self::run_v3_ascii_bin_fix_if_needed(conn, prior_version, "usage_metering").await?;
         Self::run_v7_schema_upgrade(conn, "api_keys", "usage_metering").await?;
         Self::run_v7_plane_record_copy_if_needed(conn, prior_version).await?;
+        Self::run_v9_slice_life_upgrade(conn, prior_version).await?;
 
         Self::stamp_schema_version(conn, "store_meta").await?;
         conn.query_drop(

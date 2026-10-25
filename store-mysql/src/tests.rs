@@ -86,6 +86,15 @@ fn ensure_reset(store: &MysqlStore) {
     });
 }
 
+/// The server's `root` on the test URL's host, for the DDL the `busbar` user may not run (CREATE
+/// DATABASE). CI's service container sets root's password to `busbar`; a local server with another
+/// one names it in `BUSBAR_TEST_MYSQL_ROOT_PASSWORD`.
+fn root_url(url: &str) -> String {
+    let password =
+        std::env::var("BUSBAR_TEST_MYSQL_ROOT_PASSWORD").unwrap_or_else(|_| "busbar".into());
+    url.replacen("busbar:busbar@", &format!("root:{password}@"), 1)
+}
+
 /// `purge_windows_before` is UNSCOPED by contract: it deletes every window below the cutoff, across
 /// every bucket. That is correct for a retention sweep and incompatible with this suite's usual
 /// isolation-by-unique-id, so the purge test and the tests that read a window back must not run at
@@ -1271,7 +1280,7 @@ fn try_init_schema_real_wiring_backfills_a_genuinely_pre_v2_database() {
             .as_nanos()
     );
 
-    let root_url = url.replacen("busbar:busbar@", "root:busbar@", 1);
+    let root_url = root_url(&url);
     let root_opts = Opts::from_url(&root_url).unwrap();
     let root_pool = Pool::new(root_opts).unwrap();
     let mut root_conn = root_pool.get_conn().unwrap();
@@ -3687,7 +3696,7 @@ impl ScratchDb {
                 .unwrap()
                 .as_nanos()
         );
-        let root_url = url.replacen("busbar:busbar@", "root:busbar@", 1);
+        let root_url = root_url(&url);
         let root = Pool::new(Opts::from_url(&root_url).unwrap()).unwrap();
         let mut c = root.get_conn().unwrap();
         c.query_drop(format!("CREATE DATABASE {name}")).unwrap();

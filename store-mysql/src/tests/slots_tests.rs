@@ -14,9 +14,13 @@ use busbar_contract::abi::sdk::store::{
 use busbar_contract::abi::store::OpId;
 use busbar_contract::kinds::{Head, RecordBytes};
 use busbar_contract::records::{AuditRecord, RecordStore, UsageDelta};
+use mysql::prelude::Queryable;
 
-/// The epoch every draw here states (fixed at 0 until WIRE-STORE adds the advance).
-const EPOCH: u64 = 0;
+/// The epoch every draw against the SHARED test database states. The fleet epoch is one row of that
+/// database and only rises, so every suite drawing against it states the same high epoch (the
+/// plugin's conformance scenario states `1 << 62` too); a test that moves the epoch runs in a
+/// database of its own ([`Iso`]).
+const EPOCH: u64 = 1 << 62;
 
 /// A name no other test (or earlier run) uses.
 fn fresh(tag: &str) -> String {
@@ -193,10 +197,8 @@ fn reserve_needs_a_cap_grants_whole_cells_and_refuses_past_the_cap() {
     );
     assert_eq!(
         release(&s, op(8), &[(g[1].slice_id, 1)]),
-        Err(OpRefused::Failed(format!(
-            "slice_release: slice {} is not held",
-            g[1].slice_id
-        )))
+        Ok(vec![0]),
+        "a closed slice is a granted id: a later release of it returns 0"
     );
     reserve(&s, op(9), EPOCH, &[cell(3)]).expect("the released 3 can be drawn again");
 }
@@ -272,26 +274,36 @@ fn a_release_on_window_0_is_final() {
     );
 }
 
-/// Epoch 0 until WIRE-STORE adds the advance: no epoch a caller states is refused, and a grant,
-/// which `reserve` gives no lifetime, never expires.
+/// Rules (a)-(c): an equal or higher epoch draws (a higher one raises the fleet epoch), a lower one
+/// is StaleEpoch, and every grant is bounded by SLICE_TTL_MS on the store's clock, never `u64::MAX`.
 #[test]
-fn no_epoch_is_stale_and_a_grant_never_expires() {
-    let Some(s) = fresh_store() else { return };
-    let bucket = fresh("epoch");
-    let k = key(&bucket, 0);
-    s.window_caps(
-        op(10),
-        &[Cap {
-            key: k,
-            cap: 100,
-            config_gen: 1,
-        }],
-    )
-    .expect("cap");
-    for (i, epoch) in [7, 0, u64::MAX].into_iter().enumerate() {
-        let g = reserve(&s, op(11 + i as u64), epoch, &[Cell { key: k, amount: 1 }])
-            .expect("never stale");
-        assert_eq!(g[0].valid_until_ms, u64::MAX);
+fn only_a_lower_epoch_is_stale_and_every_grant_is_bounded() {
+    let Some(iso) = Iso::new("epoch") else { return };
+    iso.cap("epoch", 100);
+    for (epoch, stale) in [
+        (7, false),
+        (7, false),
+        (0, true),
+        (u64::MAX, false),
+        (7, true),
+    ] {
+        let before = iso.now_ms();
+        let drawn = iso.draw("epoch", 1, epoch);
+        if stale {
+            assert_eq!(
+                drawn.map(drop),
+                Err(ReserveRefused::StaleEpoch),
+                "epoch {epoch}"
+            );
+            continue;
+        }
+        let g = drawn.expect("an equal or higher epoch draws");
+        assert_ne!(g.valid_until_ms, u64::MAX, "a fleet store's grant expires");
+        assert!(
+            g.valid_until_ms >= before + TTL && g.valid_until_ms <= iso.now_ms() + TTL,
+            "valid_until_ms {} is not now + SLICE_TTL_MS",
+            g.valid_until_ms
+        );
     }
 }
 
@@ -426,4 +438,403 @@ fn an_op_id_plane_append_dedupes_and_still_refuses_a_fork() {
         .list_plane_records("slots_test", &PlaneSelector::Parent(parent.as_str().into()))
         .expect("list");
     assert_eq!(chain, vec![b"one".to_vec()]);
+}
+
+// ── THE FLEET EPOCH AND SLICE LIFE (`abi::store::money`, rules (a)-(c)) ─────────────────────────
+
+/// A store in a DATABASE of its own. The fleet epoch is one row for the whole database, so a test
+/// that raises it must not do so in the shared one, where every other test draws at [`EPOCH`]. The
+/// database is dropped with the guard.
+struct Iso {
+    db: super::ScratchDb,
+    store: Option<MysqlStore>,
+}
+
+impl Iso {
+    fn new(tag: &str) -> Option<Self> {
+        let db = super::ScratchDb::new(&format!("iso_{tag}"))?;
+        // Building a whole schema is a DDL burst; one at a time (see `lock_fresh_database_ddl`).
+        let store = {
+            let _ddl = super::lock_fresh_database_ddl();
+            MysqlStore::connect(&db.url).expect("connect the isolated store")
+        };
+        Some(Iso {
+            db,
+            store: Some(store),
+        })
+    }
+
+    fn s(&self) -> &MysqlStore {
+        self.store.as_ref().expect("open")
+    }
+
+    /// A RESTART: the instance goes away and a fresh one opens over the same state.
+    fn restart(&mut self) {
+        self.store = None;
+        self.store = Some(self.node());
+    }
+
+    /// A second, independent instance over the same state (another node of the fleet).
+    fn node(&self) -> MysqlStore {
+        MysqlStore::connect(&self.db.url).expect("connect another node")
+    }
+
+    /// The database's clock in ms: the store's one clock.
+    fn now_ms(&self) -> u64 {
+        self.db
+            .conn()
+            .query_first::<u64, _>(
+                "SELECT TIMESTAMPDIFF(MICROSECOND, '1970-01-01', UTC_TIMESTAMP(6)) DIV 1000",
+            )
+            .unwrap()
+            .unwrap()
+    }
+
+    /// Move the store's clock forward by `ms`: every slice's expiry moves back by as much.
+    fn advance_ms(&self, ms: u64) {
+        self.db
+            .conn()
+            .exec_drop(
+                "UPDATE store_slices SET valid_until_ms = GREATEST(valid_until_ms, ?) - ?",
+                (ms, ms),
+            )
+            .unwrap();
+    }
+
+    fn cap(&self, bucket: &str, cap: u64) {
+        self.s()
+            .window_caps(
+                op(30),
+                &[Cap {
+                    key: requests(bucket),
+                    cap,
+                    config_gen: 1,
+                }],
+            )
+            .expect("the cap is pushed");
+    }
+
+    fn draw(&self, bucket: &str, amount: u64, epoch: u64) -> Result<Grant, ReserveRefused> {
+        reserve(
+            self.s(),
+            op(31),
+            epoch,
+            &[Cell {
+                key: requests(bucket),
+                amount,
+            }],
+        )
+        .map(|g| g[0])
+    }
+
+    /// Release under `epoch` (a fresh `op_id`).
+    fn release_at(&self, epoch: u64, items: &[(u64, u64)]) -> Result<Vec<u64>, OpRefused> {
+        let mut back = Vec::new();
+        self.s()
+            .slice_release(op(32), epoch, items.iter().copied(), &mut back)?;
+        Ok(back)
+    }
+}
+
+fn requests(bucket: &str) -> CellKey<'_> {
+    key(bucket, 1_790_000_000_000)
+}
+
+const TTL: u64 = busbar_contract::abi::store::SLICE_TTL_MS;
+
+/// Rule (b): a reserve under an epoch below the stored one is StaleEpoch, applies nothing and records
+/// nothing under its `op_id` (the same id retried under a current epoch is evaluated afresh).
+#[test]
+fn a_stale_epoch_is_refused_and_applies_nothing() {
+    let Some(iso) = Iso::new("stale") else { return };
+    iso.cap("stale", 10);
+    iso.draw("stale", 1, 2).expect("epoch 2 draws");
+    let id = op(33);
+    let cell = Cell {
+        key: requests("stale"),
+        amount: 1,
+    };
+    assert_eq!(
+        reserve(iso.s(), id, 1, &[cell]),
+        Err(ReserveRefused::StaleEpoch),
+        "a reserve under an epoch below the stored one is StaleEpoch"
+    );
+    assert!(
+        reserve(iso.s(), id, 2, &[cell]).is_ok(),
+        "the refused reserve left a row under its op_id"
+    );
+    iso.draw("stale", 8, 2)
+        .expect("the stale reserve applied nothing: 1 + 1 + 8 of 10");
+    assert_eq!(
+        iso.draw("stale", 1, 2).map(drop),
+        Err(ReserveRefused::Exhausted { cell: 0 })
+    );
+}
+
+/// Rule (a): the stored epoch survives a restart, and a second node sees the same fleet epoch.
+#[test]
+fn the_epoch_survives_a_restart() {
+    let Some(mut iso) = Iso::new("restart") else {
+        return;
+    };
+    iso.cap("restart", 10);
+    iso.draw("restart", 1, 3).expect("epoch 3 draws");
+    let other = iso.node();
+    iso.restart();
+    assert_eq!(
+        iso.draw("restart", 1, 2).map(drop),
+        Err(ReserveRefused::StaleEpoch),
+        "the epoch was lost on restart"
+    );
+    assert_eq!(
+        reserve(
+            &other,
+            op(34),
+            2,
+            &[Cell {
+                key: requests("restart"),
+                amount: 1
+            }]
+        ),
+        Err(ReserveRefused::StaleEpoch),
+        "another node of the fleet did not see the epoch"
+    );
+}
+
+/// Rule (c): a grant is valid for at most SLICE_TTL_MS from the store's clock, and an expired slice's
+/// unreturned part is drawable again.
+#[test]
+fn a_grant_is_bounded_and_an_expired_slice_returns_to_the_window() {
+    let Some(iso) = Iso::new("ttl") else { return };
+    iso.cap("ttl", 5);
+    let before = iso.now_ms();
+    let g = iso.draw("ttl", 5, 2).expect("draws the whole window");
+    let after = iso.now_ms();
+    assert!(
+        g.valid_until_ms >= before + TTL && g.valid_until_ms <= after + TTL,
+        "valid_until_ms {} is not within [{before} + SLICE_TTL_MS, {after} + SLICE_TTL_MS]",
+        g.valid_until_ms
+    );
+    assert_eq!(
+        iso.draw("ttl", 1, 2).map(drop),
+        Err(ReserveRefused::Exhausted { cell: 0 })
+    );
+    iso.advance_ms(TTL + 1);
+    iso.draw("ttl", 5, 2)
+        .expect("an expired slice's unspent returned to the window");
+}
+
+/// A release applies whatever the epoch, returns each unit once, and an expiry after the release
+/// returns nothing more.
+#[test]
+fn a_stale_epoch_release_applies_exactly_once() {
+    let Some(iso) = Iso::new("release") else {
+        return;
+    };
+    iso.cap("release", 10);
+    iso.cap("release-fence", 1);
+    let g = iso.draw("release", 4, 5).expect("epoch 5 draws");
+    iso.draw("release-fence", 1, 6).expect("epoch 6 draws");
+    assert_eq!(
+        iso.release_at(5, &[(g.slice_id, 4)]),
+        Ok(vec![4]),
+        "never refused"
+    );
+    assert_eq!(
+        iso.release_at(6, &[(g.slice_id, 4)]),
+        Ok(vec![0]),
+        "nothing left"
+    );
+    iso.advance_ms(TTL + 1);
+    iso.draw("release", 10, 6)
+        .expect("the returned 4 are drawable");
+    assert_eq!(
+        iso.draw("release", 1, 6).map(drop),
+        Err(ReserveRefused::Exhausted { cell: 0 }),
+        "expiry returned the released slice again"
+    );
+    assert_eq!(
+        iso.release_at(6, &[(g.slice_id, 4)]),
+        Ok(vec![0]),
+        "a slice closed and gone answers 0"
+    );
+}
+
+/// An EXPIRED slice's unreturned part went back at expiry, whether or not a reserve has reclaimed
+/// it yet: its release answers 0, and the window's headroom comes back exactly once.
+#[test]
+fn a_release_of_an_expired_slice_returns_zero_and_the_headroom_once() {
+    let Some(iso) = Iso::new("expired") else {
+        return;
+    };
+    iso.cap("expired", 5);
+    let g = iso.draw("expired", 3, 0).expect("a draw");
+    iso.advance_ms(TTL + 1);
+    assert_eq!(
+        iso.release_at(0, &[(g.slice_id, 3)]),
+        Ok(vec![0]),
+        "an expired slice's unreturned part already went back at expiry"
+    );
+    iso.draw("expired", 5, 0)
+        .expect("the expired 3 are back: the whole cap draws");
+    assert_eq!(
+        iso.draw("expired", 1, 0).map(drop),
+        Err(ReserveRefused::Exhausted { cell: 0 }),
+        "the expired slice's headroom came back twice"
+    );
+}
+
+/// A closed rolling-window slice is a granted id: a later release of it (a new `op_id`) answers 0 and
+/// does not fail the batch it rides in; an id never granted still FAILS.
+#[test]
+fn a_closed_slice_releases_zero_and_a_never_granted_id_fails() {
+    let Some(iso) = Iso::new("closed") else {
+        return;
+    };
+    iso.cap("closed", 10);
+    iso.cap("closed-peer", 10);
+    let a = iso.draw("closed", 3, 0).expect("draw a");
+    let b = iso.draw("closed-peer", 4, 0).expect("draw b");
+    let rel = |items: &[(u64, u64)]| iso.release_at(0, items);
+    assert_eq!(rel(&[(a.slice_id, 3)]), Ok(vec![3]), "fully returned");
+    assert_eq!(
+        rel(&[(b.slice_id, 4), (a.slice_id, 3)]),
+        Ok(vec![4, 0]),
+        "the closed slice answers 0 and the other item still lands"
+    );
+    assert_eq!(rel(&[(a.slice_id, 3)]), Ok(vec![0]));
+    // Expired and reclaimed by a later reserve is closed too.
+    let c = iso.draw("closed", 2, 0).expect("draw c");
+    iso.advance_ms(TTL + 1);
+    // The last grant: the highest slice id ever granted.
+    let last = iso.draw("closed", 10, 0).expect("c's 2 came back").slice_id;
+    assert_eq!(rel(&[(c.slice_id, 2)]), Ok(vec![0]));
+    for never in [last + 1, last + 1000, u64::MAX, 0] {
+        assert!(
+            matches!(rel(&[(never, 1)]), Err(OpRefused::Failed(_))),
+            "slice {never} was never granted"
+        );
+    }
+}
+
+/// Two nodes pushing the first cap of a new window at once: the higher generation wins whichever
+/// lands first, and the same generation with a different cap is a CapConflict for exactly one.
+#[test]
+fn a_concurrent_first_cap_push_keeps_the_higher_generation() {
+    const ROUNDS: usize = 150;
+    let Some(iso) = Iso::new("race") else { return };
+    let barrier = std::sync::Barrier::new(2);
+    let push = |cap: u64, gen: u64, tag: &'static str| {
+        let node = iso.node();
+        let barrier = &barrier;
+        move || {
+            (0..ROUNDS)
+                .map(|i| {
+                    barrier.wait();
+                    node.window_caps(
+                        op(35),
+                        &[Cap {
+                            key: requests(&format!("race-{tag}-{i}")),
+                            cap,
+                            config_gen: gen,
+                        }],
+                    )
+                })
+                .collect::<Vec<_>>()
+        }
+    };
+    // Round i of "lt" is gen 6 cap 200 against gen 5 cap 100; of "eq" gen 7 cap 100 against 200.
+    let (hi, lo) = std::thread::scope(|sc| {
+        let hi = sc.spawn(push(200, 6, "lt"));
+        let lo = sc.spawn(push(100, 5, "lt"));
+        (hi.join().unwrap(), lo.join().unwrap())
+    });
+    assert!(hi.iter().all(Result::is_ok), "{hi:?}");
+    assert!(lo.iter().all(Result::is_ok), "{lo:?}");
+    let rows: Vec<(u64, u64)> = iso
+        .db
+        .conn()
+        .query("SELECT cap, config_gen FROM store_caps")
+        .unwrap();
+    let lower_won = rows.iter().filter(|r| r.0 != 200 || r.1 != 6).count();
+    assert_eq!(rows.len(), ROUNDS);
+    assert_eq!(lower_won, 0, "a lower generation overwrote a higher one");
+
+    let (x, y) = std::thread::scope(|sc| {
+        let x = sc.spawn(push(100, 7, "eq"));
+        let y = sc.spawn(push(200, 7, "eq"));
+        (x.join().unwrap(), y.join().unwrap())
+    });
+    for (i, (x, y)) in x.iter().zip(&y).enumerate() {
+        let ok = x.is_ok() as u8 + y.is_ok() as u8;
+        let conflict = [x, y]
+            .iter()
+            .filter(|r| matches!(r, Err(CapsRefused::CapConflict { index: 0 })))
+            .count();
+        assert_eq!(
+            (ok, conflict),
+            (1, 1),
+            "round {i}: the same generation with a different cap must conflict: {x:?} {y:?}"
+        );
+    }
+}
+
+/// A slice of 2^63 or more must still expire and come back (every `u64` is kept bit for bit).
+#[test]
+fn a_huge_expired_slice_returns_to_the_window() {
+    let Some(iso) = Iso::new("huge") else { return };
+    iso.cap("huge", u64::MAX);
+    iso.draw("huge", u64::MAX - 1, 0).expect("a huge draw");
+    iso.advance_ms(TTL + 1);
+    iso.draw("huge", u64::MAX - 1, 0)
+        .expect("the expired huge slice came back");
+}
+
+/// The v8 -> v9 step: slices a v8 build left open (granted `u64::MAX`, never expiring) are stamped
+/// to expire one SLICE_TTL_MS after the upgrade, the epoch row exists at 0, and the step runs once.
+#[test]
+fn the_v9_upgrade_stamps_open_slices_and_creates_the_epoch() {
+    let Some(mut iso) = Iso::new("v9") else {
+        return;
+    };
+    iso.cap("legacy", 5);
+    iso.draw("legacy", 5, 0).expect("a slice");
+    {
+        // Put the database back to what a v8 build left: no epoch table, no expiry column.
+        let mut c = iso.db.conn();
+        for stmt in [
+            "DROP TABLE store_epoch",
+            "ALTER TABLE store_slices DROP INDEX idx_store_slices_expiry",
+            "ALTER TABLE store_slices DROP COLUMN valid_until_ms",
+            "UPDATE store_meta SET v = '8' WHERE k = 'schema_version'",
+        ] {
+            c.query_drop(stmt).unwrap();
+        }
+    }
+    let before = iso.now_ms();
+    iso.restart();
+    let after = iso.now_ms();
+    let read = |iso: &Iso| -> (u64, u64) {
+        let mut c = iso.db.conn();
+        let until = c
+            .query_first("SELECT valid_until_ms FROM store_slices")
+            .unwrap()
+            .unwrap();
+        let epoch = c
+            .query_first("SELECT epoch FROM store_epoch")
+            .unwrap()
+            .unwrap();
+        (until, epoch)
+    };
+    let (until, epoch) = read(&iso);
+    assert_eq!(epoch, 0);
+    assert!(
+        before + TTL <= until && until <= after + TTL,
+        "the stranded slice expires one TTL after the upgrade, not never: {until}"
+    );
+    iso.restart();
+    assert_eq!(read(&iso), (until, 0), "a second boot re-stamped the slice");
+    iso.advance_ms(TTL + 1);
+    iso.draw("legacy", 5, 0)
+        .expect("the stranded slice's money came back");
 }

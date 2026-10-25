@@ -32,6 +32,9 @@ bytes = { workspace = true }
 url = { workspace = true }
 percent-encoding = { workspace = true }
 serde_json = { workspace = true }
+# `reserve`'s `Unavailable` carries no text across the ABI: its reason is logged (the door captures
+# tracing into the plugin's own log).
+tracing = { workspace = true }
 [dev-dependencies]
 # The `Store` contract conformance suite used to arrive here as `busbar-plugin-testkit`; the owner
 # ruled that crate DELETED on 2026-09-22 and #2/#31 forbid a shared test util between plugins, so
