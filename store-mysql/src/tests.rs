@@ -4026,3 +4026,65 @@ fn a_newer_schema_is_refused_at_open() {
     assert!(recreated.is_none(), "no DDL ran before the refusal");
     assert_eq!(schema_version_of(&db), newer.to_string(), "not restamped");
 }
+
+// ── D19: store keys are EXACT ──────────────────────────────────────────────────────────────────
+
+/// D19, RED BEFORE GREEN: `'abc'` and `'abc '` are TWO keys, as they are in every other store
+/// (postgres, sqlite, valkey, memory). MySQL's `ascii_bin`/`utf8mb4_bin` collations are PAD SPACE,
+/// so under them the trailing space vanished from every comparison: a key minted as `'abc '`
+/// overwrote `'abc'`, a spent token's space-padded twin was refused as already spent, and a record
+/// schema read back another schema's rows. Each surface below writes both spellings and reads
+/// each back as itself.
+#[test]
+fn keys_differing_only_by_trailing_space_are_distinct() {
+    let _ddl_guard = lock_fresh_database_ddl();
+    let Some(db) = ScratchDb::new("exact") else {
+        return;
+    };
+    let store = MysqlStore::connect(&db.url).expect("a fresh database opens");
+
+    // Virtual keys (`api_keys.id`, ascii_bin before the fix).
+    store.put_key(&sample_key("abc", "gen-plain")).unwrap();
+    store.put_key(&sample_key("abc ", "gen-padded")).unwrap();
+    assert_eq!(
+        store.get_key("abc").unwrap().unwrap().generation_hash,
+        "gen-plain",
+        "'abc ' overwrote 'abc'"
+    );
+    let padded = store.get_key("abc ").unwrap().expect("'abc ' is its own key");
+    assert_eq!(padded.id, "abc ");
+    assert_eq!(padded.generation_hash, "gen-padded");
+
+    // Plane records (`plane_records.ident`, utf8mb4_bin before the fix).
+    store
+        .upsert_plane_record(active_task("abc", "working", TASK_LIVE_TS + 1).view())
+        .unwrap();
+    store
+        .upsert_plane_record(active_task("abc ", "submitted", TASK_LIVE_TS + 2).view())
+        .unwrap();
+    assert_eq!(get_task(&store, "abc").unwrap()["state"], "working");
+    assert_eq!(get_task(&store, "abc ").unwrap()["state"], "submitted");
+
+    // The single-use ledger (`plane_tokens.token`): spending 'abc' does not spend 'abc '.
+    assert!(store
+        .redeem_plane_token("ask", "abc", TRUST_NOW + 900, TRUST_NOW)
+        .unwrap());
+    assert!(
+        store
+            .redeem_plane_token("ask", "abc ", TRUST_NOW + 900, TRUST_NOW)
+            .unwrap(),
+        "'abc ' was refused as already spent because 'abc' was"
+    );
+
+    // Kernel records (`store_records.schema_id`).
+    store.record_put("abc", b"k", b"plain").unwrap();
+    store.record_put("abc ", b"k", b"padded").unwrap();
+    assert_eq!(
+        store.record_get("abc", b"k").unwrap().unwrap().as_slice(),
+        b"plain"
+    );
+    assert_eq!(
+        store.record_get("abc ", b"k").unwrap().unwrap().as_slice(),
+        b"padded"
+    );
+}
