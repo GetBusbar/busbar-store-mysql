@@ -214,8 +214,13 @@ fn clear(url: &str) {
         ("DELETE FROM usage_windows WHERE bucket_id = ?", BUCKET),
         ("DELETE FROM store_records WHERE schema_id = ?", SCHEMA),
     ] {
-        conn.exec_drop(sql, (v,))
-            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        // ERROR 1146: the store has not made its schema yet (a first run on an empty database),
+        // so there is nothing of the scenario's to clear.
+        match conn.exec_drop(sql, (v,)) {
+            Ok(()) => {}
+            Err(mysql::Error::MySqlError(e)) if e.code == 1146 => {}
+            Err(e) => panic!("{sql}: {e}"),
+        }
     }
 }
 
