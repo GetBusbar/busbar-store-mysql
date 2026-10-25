@@ -295,16 +295,6 @@ impl fmt::Debug for Opts {
     }
 }
 
-/// `msg` with every occurrence of the URL password (`secret`, decoded, as the server and the
-/// handshake see it) replaced by `<redacted>`: text a server, proxy or connector echoes back never
-/// carries the credential into an error. Text without the password is returned unchanged.
-fn scrub(msg: String, secret: Option<&str>) -> String {
-    match secret.filter(|s| !s.is_empty()) {
-        Some(s) if msg.contains(s) => msg.replace(s, "<redacted>"),
-        _ => msg,
-    }
-}
-
 /// The refusal of a URL parameter this store accepts nowhere because it could never apply.
 fn not_supported(key: &str, why: &str) -> UrlError {
     UrlError::Refused(format!(
@@ -379,11 +369,14 @@ impl Opts {
         })
     }
 
-    /// `text` with the URL's password (every spelling of it) redacted.
+    /// `text` with the URL's password (every spelling of it, and the decoded password itself)
+    /// redacted: the ONE redaction every error this crate builds from server, connector or URL
+    /// text goes through. Text without the password is returned unchanged.
     #[must_use]
     pub fn scrub(&self, text: String) -> String {
         let mut out = text;
-        for s in self.secrets.iter().filter(|s| !s.is_empty()) {
+        let decoded = self.pass.iter();
+        for s in self.secrets.iter().chain(decoded).filter(|s| !s.is_empty()) {
             out = out.replace(s.as_str(), "<redacted>");
         }
         out
@@ -739,7 +732,7 @@ impl Conn {
         let could_not = |e: busbar_contract::abi::sdk::conn::ConnFailure| {
             Error::DriverError(DriverError::CouldNotConnect(Some((
                 opts.address(),
-                scrub(e.to_string(), opts.pass.as_deref()),
+                opts.scrub(e.to_string()),
             ))))
         };
         wire.connect_timed(need, Some(&opts.target()), timeout)
@@ -862,7 +855,7 @@ impl Conn {
                         ErrPacket::Error(server_error) => {
                             self.handle_err();
                             let mut e = MySqlError::from(server_error);
-                            e.message = scrub(e.message, self.st.opts.pass.as_deref());
+                            e.message = self.st.opts.scrub(e.message);
                             return Err(Error::MySqlError(e));
                         }
                         ErrPacket::Progress(_) => continue,
