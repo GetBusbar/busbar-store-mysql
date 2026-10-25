@@ -483,7 +483,7 @@ impl MysqlStore {
         for attempt in 1..=MAX_ATTEMPTS {
             match Self::try_init_schema(conn).await {
                 Ok(()) => return Ok(()),
-                Err(e) if attempt < MAX_ATTEMPTS && e.0.contains("Deadlock found") => {
+                Err(e) if attempt < MAX_ATTEMPTS && Self::is_deadlock(&e.0) => {
                     // Linear backoff plus a per-process/per-thread jitter, so two booters that
                     // deadlocked once do not retry in lockstep and deadlock again.
                     let jitter = {
@@ -679,10 +679,10 @@ impl MysqlStore {
     /// v7 SCHEMA upgrade, IN PLACE and IDEMPOTENT. Gated on what the database actually HAS rather
     /// than on `schema_version`, so it converges whatever path a database took to get here: a fresh
     /// database already carries every column (the `CREATE TABLE`s above declare the v7 shape) and
-    /// this is four cheap no-op lookups; a released 1.5.x database (v3) gains the columns; a crash
+    /// this is five cheap no-op lookups; a released 1.5.x database (v3) gains the columns; a crash
     /// half-way through is finished on the next boot.
     ///
-    /// Purely ADDITIVE on `api_keys`: four NULLable trailing columns (an instant ADD on MySQL 8),
+    /// Purely ADDITIVE on `api_keys`: five NULLable trailing columns (an instant ADD on MySQL 8),
     /// every existing row reading back exactly as before -- `NULL` is `None` for every new field,
     /// which is what the 1.6.0 contract says a pre-field key reads as.
     ///
@@ -861,6 +861,22 @@ impl MysqlStore {
         }
     }
 
+    /// Stamps `schema_version`. Takes `table` purely for test isolation, like `read_prior_version`;
+    /// production passes `"store_meta"`.
+    pub(crate) async fn stamp_schema_version(
+        conn: &mut Conn,
+        table: &str,
+    ) -> RecordStoreResult<()> {
+        conn.query_drop(
+            format!(
+                "INSERT INTO {table} (k, v) VALUES ('schema_version', '{SCHEMA_VERSION}') \
+                 ON DUPLICATE KEY UPDATE v = IF(CAST(v AS UNSIGNED) > {SCHEMA_VERSION}, v, VALUES(v))"
+            ),
+        )
+        .await
+        .map_err(store_err)
+    }
+
     async fn try_init_schema(conn: &mut Conn) -> RecordStoreResult<()> {
         // `read_prior_version` needs `store_meta` to already exist -- create it FIRST (SCHEMA[0],
         // `IF NOT EXISTS` so harmless to re-run when the full loop below reaches it again) so a
@@ -887,8 +903,9 @@ impl MysqlStore {
             // "duplicate key name" error (a concurrent booter won the race after the check above)
             // is swallowed here — every other error propagates.
             if let Err(e) = conn.query_drop(*stmt).await {
+                let race = Self::is_ddl_race(&e);
                 let msg = e.to_string();
-                if !(msg.contains("Duplicate key name") || msg.contains("already exists")) {
+                if !race {
                     return Err(store_err(format!(
                         "schema init failed: {msg}\nstatement: {stmt}"
                     )));
@@ -901,14 +918,7 @@ impl MysqlStore {
         Self::run_v7_schema_upgrade(conn, "api_keys", "usage_metering").await?;
         Self::run_v7_plane_record_copy_if_needed(conn, prior_version).await?;
 
-        conn.query_drop(
-            "INSERT INTO store_meta (k, v) VALUES ('schema_version', :v) \
-             ON DUPLICATE KEY UPDATE v = :v"
-                .replace(':', "?")
-                .replace("?v", &format!("'{SCHEMA_VERSION}'")),
-        )
-        .await
-        .map_err(store_err)?;
+        Self::stamp_schema_version(conn, "store_meta").await?;
         conn.query_drop(
             "INSERT INTO store_sequence (id, revision) VALUES (1, 0) \
              ON DUPLICATE KEY UPDATE id = id",
@@ -917,6 +927,18 @@ impl MysqlStore {
         .map_err(store_err)?;
 
         Ok(())
+    }
+
+    /// A `CREATE INDEX`/`CREATE TABLE` that lost a race to a concurrent booter.
+    pub(crate) fn is_ddl_race(e: &Error) -> bool {
+        // ER_DUP_KEYNAME (1061) / ER_TABLE_EXISTS_ERROR (1050): codes, not the server's
+        // (localisable) message text.
+        matches!(e, Error::MySqlError(inner) if inner.code == 1061 || inner.code == 1050)
+    }
+
+    /// A deadlock (`ERROR 1213`) surfaced through `store_err`'s text.
+    pub(crate) fn is_deadlock(text: &str) -> bool {
+        text.contains("ERROR 1213 (")
     }
 
     /// A rejected probe INSERT is proof of CHECK enforcement ONLY if it's the SPECIFIC
@@ -1781,7 +1803,8 @@ impl MysqlStore {
         let rows: Vec<(String, u64, u64, u64, u64)> = conn
             .exec(
                 "SELECT model, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write \
-                 FROM usage_windows WHERE bucket_id = :b AND window_start = :w AND model <> ''",
+                 FROM usage_windows WHERE window_start = :w AND bucket_scope = 'key' \
+                 AND bucket_id = :b AND model <> ''",
                 params! { "b" => bucket_id, "w" => window_start },
             )
             .await
@@ -1799,7 +1822,7 @@ impl MysqlStore {
         let totals: Option<(u64, u64)> = conn
             .exec_first(
                 "SELECT COALESCE(SUM(requests), 0), COALESCE(SUM(billable_requests), 0) \
-                 FROM usage_windows WHERE bucket_id = :b AND window_start = :w",
+                 FROM usage_windows WHERE window_start = :w AND bucket_scope = 'key' AND bucket_id = :b",
                 params! { "b" => bucket_id, "w" => window_start },
             )
             .await
@@ -1954,8 +1977,13 @@ impl MysqlStore {
             .map_err(store_err)?;
         let units: Vec<(String, String, String, u64, String, u64)> = conn
             .exec(
-                "SELECT key_id, model, provider, priced_from_ms, unit, count \
-                 FROM usage_metering_units WHERE bucket = :b",
+                // Joined to the cell in SQL: both tables fold model/provider case-insensitively and
+                // may hold different spellings, so a byte-exact match here would drop units.
+                "SELECT m.key_id, m.model, m.provider, m.priced_from_ms, u.unit, u.count \
+                 FROM usage_metering_units u JOIN usage_metering m \
+                 ON m.bucket = u.bucket AND m.key_id = u.key_id AND m.model = u.model \
+                 AND m.provider = u.provider AND m.priced_from_ms = u.priced_from_ms \
+                 WHERE u.bucket = :b",
                 params! { "b" => &bucket_s },
             )
             .await

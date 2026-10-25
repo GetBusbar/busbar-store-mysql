@@ -1353,6 +1353,183 @@ fn read_prior_version_hard_fails_on_a_corrupt_stored_value() {
     );
 }
 
+// ── Audit fixes: usage_windows scope, metering collation, schema stamp, DDL race codes ───────────
+
+/// The `usage_windows` reads must pin `bucket_scope = 'key'`: it sits inside the primary key, and a
+/// row of another scope for the same bucket id and window is not this bucket's usage.
+#[test]
+fn get_usage_ignores_usage_windows_rows_of_another_scope() {
+    let _guard = lock_usage_windows();
+    let Some(s) = fresh_store() else { return };
+    let bucket = "vk_scope_pin_unique";
+    let window = 7_700_000_000_123u64;
+    s.add_usage(
+        bucket,
+        window,
+        &UsageDelta {
+            requests: 2,
+            billable_requests: 1,
+            models: vec![ModelTokensDelta {
+                model: "m-key-scope".to_string(),
+                usage_units: units(&[(UNIT_INPUT, 10), (UNIT_OUTPUT, 5)]),
+            }],
+        },
+    )
+    .unwrap();
+    let mut conn = s.pool.get_conn().unwrap();
+    conn.exec_drop(
+        "INSERT INTO usage_windows (window_start, bucket_scope, bucket_id, model, requests, \
+         billable_requests, tokens_input, tokens_output) VALUES (:w, 'group', :b, 'm-group-scope', 40, 30, 900, 800)",
+        params! { "w" => window, "b" => bucket },
+    )
+    .unwrap();
+    let back = s.get_usage(bucket, window).unwrap();
+    conn.exec_drop(
+        "DELETE FROM usage_windows WHERE window_start = :w AND bucket_id = :b",
+        params! { "w" => window, "b" => bucket },
+    )
+    .unwrap();
+    assert_eq!((back.requests, back.billable_requests), (2, 1), "{back:?}");
+    assert_eq!(back.models.len(), 1, "{back:?}");
+    assert_eq!(back.models[0].model, "m-key-scope", "{back:?}");
+    assert_eq!(back.models[0].tier(UNIT_INPUT), 10, "{back:?}");
+}
+
+/// `model`/`provider` in the metering tables use the database's case-insensitive default
+/// collation, so the two tables can keep different spellings of one cell; the units must still land
+/// on their cell.
+#[test]
+fn list_metering_matches_units_to_cells_whatever_the_model_spelling() {
+    let Some(s) = fresh_store() else { return };
+    let key = "vk_meter_collation_unique";
+    s.put_key(&sample_key(key, "g")).unwrap();
+    let bucket = 20_991_231u64;
+    let mut conn = s.pool.get_conn().unwrap();
+    let clean = |conn: &mut PooledConn| {
+        for t in ["usage_metering_units", "usage_metering"] {
+            conn.exec_drop(
+                format!("DELETE FROM {t} WHERE key_id = :k AND bucket = :b"),
+                params! { "k" => key, "b" => format!("{bucket:010}") },
+            )
+            .unwrap();
+        }
+    };
+    clean(&mut conn);
+    let delta = |model: &str, usage_units: BTreeMap<String, u64>| MeteringDelta {
+        key_id: key.to_string(),
+        bucket,
+        model: model.to_string(),
+        provider: "p".to_string(),
+        tokens_input: 1,
+        tokens_output: 1,
+        tokens_cache_read: 0,
+        tokens_cache_write: 0,
+        requests: 1,
+        billable_requests: 1,
+        key_group_at_use: String::new(),
+        pricing_version: "v1".to_string(),
+        priced_from_ms: 0,
+        usage_units,
+    };
+    s.add_metering(&delta("GPT-4o", BTreeMap::new())).unwrap();
+    s.add_metering(&delta("gpt-4o", units(&[("tool_calls", 5)])))
+        .unwrap();
+    let rows: Vec<_> = s
+        .list_metering(bucket)
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.key_id == key)
+        .collect();
+    clean(&mut conn);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].usage_units.get("tool_calls"), Some(&5), "{rows:?}");
+}
+
+#[test]
+fn stamp_schema_version_never_lowers_a_newer_marker() {
+    let Some(s) = fresh_store() else { return };
+    let mut conn = s.pool.get_conn().unwrap();
+    let table = scratch_meta_table(&mut conn, "stampversion");
+    let read = |conn: &mut PooledConn| -> Option<String> {
+        conn.query_first(format!("SELECT v FROM {table} WHERE k = 'schema_version'"))
+            .unwrap()
+    };
+    let mut results = Vec::new();
+    // No row yet.
+    MysqlStore::stamp_schema_version(&mut conn, &table).unwrap();
+    results.push(read(&mut conn));
+    // An older marker is raised.
+    conn.query_drop(format!(
+        "UPDATE {table} SET v = '3' WHERE k = 'schema_version'"
+    ))
+    .unwrap();
+    MysqlStore::stamp_schema_version(&mut conn, &table).unwrap();
+    results.push(read(&mut conn));
+    // A newer build's marker is kept.
+    let newer = (SCHEMA_VERSION + 1).to_string();
+    conn.query_drop(format!(
+        "UPDATE {table} SET v = '{newer}' WHERE k = 'schema_version'"
+    ))
+    .unwrap();
+    MysqlStore::stamp_schema_version(&mut conn, &table).unwrap();
+    results.push(read(&mut conn));
+    conn.query_drop(format!("DROP TABLE {table}")).unwrap();
+    let current = Some(SCHEMA_VERSION.to_string());
+    assert_eq!(results[0], current, "no row -> stamped");
+    assert_eq!(results[1], current, "older marker -> raised");
+    assert_eq!(
+        results[2].as_deref(),
+        Some(newer.as_str()),
+        "a newer marker must not be lowered"
+    );
+}
+
+fn server_error(code: u16, state: &str, message: &str) -> crate::mysqlwire::Error {
+    crate::mysqlwire::Error::MySqlError(crate::mysqlwire::MySqlError {
+        code,
+        state: state.into(),
+        message: message.into(),
+    })
+}
+
+/// Boot DDL races are recognised by server error code, not by English message text.
+#[test]
+fn ddl_race_is_recognised_by_code_not_by_english_text() {
+    assert!(crate::MysqlStore::is_ddl_race(&server_error(
+        1061,
+        "42000",
+        "Doppelter Schlüsselname 'idx'"
+    )));
+    assert!(crate::MysqlStore::is_ddl_race(&server_error(
+        1050,
+        "42S01",
+        "Tabelle 't' existiert bereits"
+    )));
+    assert!(
+        !crate::MysqlStore::is_ddl_race(&server_error(
+            1146,
+            "42S02",
+            "Table 'x.y' already exists in some other sense"
+        )),
+        "an unrelated error whose text says 'already exists' is not a race"
+    );
+}
+
+#[test]
+fn deadlock_is_recognised_by_code_not_by_english_text() {
+    let e = server_error(
+        1213,
+        "40001",
+        "Verklemmung beim Versuch, eine Sperre zu bekommen",
+    );
+    assert!(crate::MysqlStore::is_deadlock(&format!(
+        "schema init failed: {e}\nstatement: CREATE INDEX x"
+    )));
+    assert!(!crate::MysqlStore::is_deadlock(
+        "schema init failed: ERROR 1146 (42S02): Deadlock found in a message"
+    ));
+}
+
 /// `revoke_credential` must reject an unknown/typo'd id loudly, not silently return `Ok(())`.
 /// An unconditional `UPDATE ... WHERE id=:id` that never checks for a matched row cannot produce
 /// the `Err` this asserts.
