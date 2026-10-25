@@ -67,6 +67,11 @@ Drop the built `.so`/`.dll`/`.dylib` into busbar's `plugins_dir`, or install it 
   `plane_records` table keyed by `(kind, identity, seq)`, with the record body stored opaquely and
   byte-for-byte; single-use tokens (`redeem_plane_token`) live in `plane_tokens`. Retention for the
   `task` kind drops only terminal rows and takes their event chain with it.
+- The store v3 tables are `store_ops` (the durable op-id dedupe log) and `store_records` (the
+  kernel's records). The store keeps ledger counts, not money: busbar derives money from the counts
+  and its rate card. Schema v10 drops the tables a pre-release v8/v9 build created for the deleted
+  store slots (`store_caps`, `store_slices`, `store_epoch`, `store_journal`, `store_sessions`) and
+  their op-id dedupe rows.
 - Upgrades are IN PLACE on boot. A database written by the 1.5.x plugin (v1.0.x, schema v3) gains
   five nullable `api_keys` columns (`allowed_scopes_ext`, `idp_subject`, `binding_mode`,
   `minted_by`, `idp_provider`), `usage_metering.priced_from_ms` (default 0, and part of the metering key, so a

@@ -11,7 +11,7 @@
 //! bound to its own dispatcher and opened the way the host opens a store (`LoadedStore`), and gives
 //! one transcript: the Statement facts, the refusals the store's own `open` answers for bad
 //! settings, and — against a live MySQL — a scenario through the 1.5.5 op set and the v3 slots
-//! (window caps, a whole-cell reserve, its replay, a release, the journal, sessions and records).
+//! (a usage batch, its replay, and the kernel's records).
 //! The two transcripts must agree line for line.
 //!
 //! THE RED ARMS, each its own test: the library asked for as another kind is refused before `dlopen`; a
@@ -96,11 +96,10 @@ fn drop_fold_database(namespace: &str, settings: &[u8]) {
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use busbar_contract::abi::sdk::store::{Cap, Cell, CellKey, Dimension};
 use busbar_contract::abi::store::OpId;
 use busbar_contract::kinds::RecordBytes;
 use busbar_contract::records::{
-    PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore, VirtualKey,
+    PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore, UsageDelta, VirtualKey,
 };
 use busbar_contract::store_calls::StoreCalls;
 use busbar_plugin_loader::dispatch::kinds::secret::Secret;
@@ -201,13 +200,7 @@ const TASK_ID: &str = "conformance-doors-task";
 const PARENT: &str = "conformance-doors-parent";
 const TOKEN: &str = "conformance-doors-nonce";
 const BUCKET: &str = "conformance-doors-bucket";
-const STREAM: &str = "conformance-doors-stream";
 const SCHEMA: &str = "conformance-doors-schema";
-const PRINCIPAL: &str = "conformance-doors-principal";
-/// The epoch the scenario draws at: the fence is one row of the shared database, so every draw
-/// against it states the same high epoch (see `store-mysql`'s slots tests).
-const EPOCH: u64 = 1 << 62;
-
 fn clear(url: &str) {
     use mysql::prelude::*;
     let mut conn = mysql::Conn::new(mysql::Opts::from_url(url).unwrap()).expect("connect");
@@ -216,11 +209,8 @@ fn clear(url: &str) {
         ("DELETE FROM plane_records WHERE ident = ?", TASK_ID),
         ("DELETE FROM plane_records WHERE parent = ?", PARENT),
         ("DELETE FROM plane_tokens WHERE token = ?", TOKEN),
-        ("DELETE FROM store_caps WHERE bucket = ?", BUCKET),
-        ("DELETE FROM store_slices WHERE bucket = ?", BUCKET),
-        ("DELETE FROM store_journal WHERE stream = ?", STREAM),
+        ("DELETE FROM usage_windows WHERE bucket_id = ?", BUCKET),
         ("DELETE FROM store_records WHERE schema_id = ?", SCHEMA),
-        ("DELETE FROM store_sessions WHERE principal = ?", PRINCIPAL),
     ] {
         conn.exec_drop(sql, (v,))
             .unwrap_or_else(|e| panic!("{sql}: {e}"));
@@ -350,57 +340,24 @@ fn transcript(load: impl Fn() -> Loaded, url: Option<&str>) -> Vec<String> {
         s.get_key(KEY_ID).map(|k| k.map(|k| k.enabled))
     ));
 
-    // The v3 slots.
-    let k = CellKey {
-        bucket: BUCKET,
-        pool: None,
-        dimension: Dimension::Requests,
-        window_start: 60,
-    };
-    let cells = [Cell { key: k, amount: 2 }, Cell { key: k, amount: 1 }];
+    // The store v3 slots.
     block(async {
+        let delta = UsageDelta {
+            requests: 2,
+            billable_requests: 1,
+            models: vec![],
+        };
+        let cells = [(BUCKET, 60, delta)];
+        let id = op(1);
         t.push(format!(
-            "reserve, no cap = {:?}",
-            StoreCalls::reserve(&s, op(1), EPOCH, &cells).await
-        ));
-        let caps = [Cap {
-            key: k,
-            cap: 3,
-            config_gen: 1,
-        }];
-        t.push(format!(
-            "window_caps = {:?}",
-            StoreCalls::window_caps(&s, op(2), &caps).await
-        ));
-        let id = op(3);
-        let grants = StoreCalls::reserve(&s, id, EPOCH, &cells).await;
-        t.push(format!(
-            "reserve = {:?}",
-            grants
-                .as_ref()
-                .map(|g| g.iter().map(|g| g.granted).collect::<Vec<_>>())
-        ));
-        let replay = StoreCalls::reserve(&s, id, EPOCH, &cells).await;
-        t.push(format!(
-            "replay answers the original grants = {}",
-            replay.as_ref().ok() == grants.as_ref().ok()
+            "add_usage_batch = {:?}",
+            StoreCalls::add_usage_batch(&s, id, &cells).await
         ));
         t.push(format!(
-            "reserve past the cap = {:?}",
-            StoreCalls::reserve(&s, op(4), EPOCH, &cells[1..]).await
+            "replay = {:?}",
+            StoreCalls::add_usage_batch(&s, id, &cells).await
         ));
-        if let Ok(g) = &grants {
-            let items = [(g[0].slice_id, 5)];
-            t.push(format!(
-                "release = {:?}",
-                StoreCalls::slice_release(&s, op(5), EPOCH, &items).await
-            ));
-        }
         let r = |b: &[u8]| RecordBytes::new(b.to_vec()).unwrap();
-        t.push(format!(
-            "append_batch = {:?}",
-            StoreCalls::append_batch(&s, op(6), STREAM, &[r(b"one"), r(b"two")]).await
-        ));
         t.push(format!(
             "record_put = {:?}",
             StoreCalls::record_put(&s, SCHEMA, b"k", &r(b"v")).await
@@ -410,18 +367,6 @@ fn transcript(load: impl Fn() -> Loaded, url: Option<&str>) -> Vec<String> {
             StoreCalls::record_get(&s, SCHEMA, b"k")
                 .await
                 .map(|v| v.map(|v| String::from_utf8_lossy(v.as_slice()).into_owned()))
-        ));
-        t.push(format!(
-            "session_put = {:?}",
-            StoreCalls::session_put(&s, 42_424_242, "node-a", PRINCIPAL).await
-        ));
-        t.push(format!(
-            "sessions_for = {:?}",
-            StoreCalls::sessions_for(&s, PRINCIPAL).await
-        ));
-        t.push(format!(
-            "session_remove = {:?}",
-            StoreCalls::session_remove(&s, 42_424_242).await
         ));
     });
     drop(s);
@@ -482,14 +427,9 @@ fn the_linked_and_the_dropped_in_mysql_store_are_one_store() {
             find("redeem").contains("Ok(true) then Ok(false)"),
             "{linked:#?}"
         );
-        assert!(find("reserve, no cap").contains("NoCap"), "{linked:#?}");
-        assert_eq!(find("reserve ="), "reserve = Ok([2, 1])");
-        assert!(find("replay").ends_with("true"), "{linked:#?}");
-        assert!(find("reserve past").contains("Exhausted"), "{linked:#?}");
-        assert_eq!(find("release"), "release = Ok([2])");
-        assert!(find("append_batch").contains("seq: 2"), "{linked:#?}");
+        assert_eq!(find("add_usage_batch"), "add_usage_batch = Ok(())");
+        assert_eq!(find("replay"), "replay = Ok(())");
         assert_eq!(find("record_get"), "record_get = Ok(Some(\"v\"))");
-        assert!(find("sessions_for").contains("node-a"), "{linked:#?}");
     }
     // The store's own words reach the host through either door.
     assert!(linked[1].contains("requires a \\\"url\\\""), "{linked:#?}");
