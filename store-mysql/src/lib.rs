@@ -1006,6 +1006,14 @@ impl MysqlStore {
         // (correctly, for every OTHER failure) treat as a hard failure.
         conn.query_drop(SCHEMA[0]).await.map_err(store_err)?;
         let prior_version = Self::read_prior_version(conn, "store_meta").await?;
+        // A database a LATER build stamped is refused before any DDL: this build's schema pass
+        // over it could re-run steps the newer build already migrated.
+        if prior_version > SCHEMA_VERSION {
+            return Err(store_err(format!(
+                "mysql store: database schema v{prior_version} is newer than this build \
+                 (v{SCHEMA_VERSION}); refusing to open"
+            )));
+        }
 
         for stmt in SCHEMA {
             // An index that is ALREADY THERE is skipped without issuing the DDL at all. A
@@ -2214,12 +2222,14 @@ impl MysqlStore {
         // The `bucket` column is CHAR(10) and BOTH the write path (`add_metering`) and the read path
         // (`list_metering`) zero-pad into it. Only this method compared the caller's string as given,
         // so the obvious caller (a u64 bucket rendered the obvious way) matched zero of its own rows
-        // and got a successful purge of nothing. Pad the same way when the input is numeric; a
-        // non-numeric value is passed through unchanged so an already-padded caller still works.
-        let padded = match bucket.trim().parse::<u64>() {
-            Ok(n) => format!("{n:010}"),
-            Err(_) => bucket.to_string(),
-        };
+        // and got a successful purge of nothing. Pad the same way; a bucket that is not an
+        // integer is refused (it would match nothing and report a successful purge).
+        let n: u64 = bucket.trim().parse().map_err(|_| {
+            store_err(format!(
+                "purge_metering_before: invalid bucket {bucket:?}, expected an integer"
+            ))
+        })?;
+        let padded = format!("{n:010}");
         let mut tx = conn.start_transaction().await.map_err(store_err)?;
         // The cells' open units go with them, in the same transaction.
         tx.exec_drop(
@@ -2906,14 +2916,23 @@ impl MysqlStore {
             serde_json::from_slice(settings)
                 .map_err(|e| format!("invalid mysql plugin config: {e}"))?
         };
-        let url = v
-            .get("url")
-            .and_then(|x| x.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                "mysql plugin config requires a \"url\" (a mysql:// connection string)".to_string()
-            })?;
+        if let Some(map) = v.as_object() {
+            if let Some(k) = map.keys().find(|k| k.as_str() != "url") {
+                return Err(format!(
+                    "invalid mysql plugin config: unknown setting `{k}` (accepted: url)"
+                ));
+            }
+        }
+        let url = match v.get("url") {
+            Some(serde_json::Value::String(s)) => Some(s.trim()).filter(|s| !s.is_empty()),
+            Some(_) => {
+                return Err("invalid mysql plugin config: `url` must be a string".to_string())
+            }
+            None => None,
+        }
+        .ok_or_else(|| {
+            "mysql plugin config requires a \"url\" (a mysql:// connection string)".to_string()
+        })?;
         Ok(url.to_owned())
     }
 
@@ -2923,7 +2942,8 @@ impl MysqlStore {
     /// # Errors
     /// A text naming why the settings do not open a store.
     pub fn from_settings(settings: &[u8]) -> Result<Self, String> {
-        MysqlStore::new(&Self::settings_url(settings)?).map_err(|e| e.0)
+        MysqlStore::new(&Self::settings_url(settings)?)
+            .map_err(|e| format!("invalid mysql plugin config: url: {}", e.0))
     }
 }
 

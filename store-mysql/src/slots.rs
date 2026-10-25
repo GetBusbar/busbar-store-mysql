@@ -919,7 +919,7 @@ impl StoreSlots for MysqlStore {
     fn connect(&self, cx: &mut Op<'_>) -> Step<Result<(), String>> {
         on_conn!(self, cx, text, |c| MysqlStore::connect_step(&mut c)
             .await
-            .map_err(|e| e.0))
+            .map_err(|e| c.scrub(e.0)))
     }
 
     fn add_usage_op(

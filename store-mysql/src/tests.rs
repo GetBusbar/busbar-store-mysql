@@ -4281,3 +4281,114 @@ fn migrate_over_the_1_5_5_rows_is_idempotent() {
     assert_1_5_5_rows_read_back(&store);
     assert_eq!(read_everything_1_5_5(&store), first);
 }
+
+// ── settings, redaction, newer schema, purge bucket: the alignment refusals ─────────────────────
+
+/// `open`/`validate` judge the settings the same way, and every refusal is in the plugin's words.
+#[test]
+fn settings_are_judged_strictly() {
+    let open = |s: &str| MysqlStore::open(s.as_bytes()).err();
+    assert_eq!(
+        open(r#"{"url":"mysql://u@h/d","bogus":1}"#).as_deref(),
+        Some("invalid mysql plugin config: unknown setting `bogus` (accepted: url)")
+    );
+    assert_eq!(
+        open(r#"{"url":5}"#).as_deref(),
+        Some("invalid mysql plugin config: `url` must be a string")
+    );
+    assert_eq!(
+        open(r#"{"url":null}"#).as_deref(),
+        Some("invalid mysql plugin config: `url` must be a string")
+    );
+    let e = open(r#"{"url":"mysql://u@h/d?pool_max=5"}"#).unwrap();
+    assert!(
+        e.starts_with("invalid mysql plugin config: url: mysql store: URL parameter `pool_max`"),
+        "{e}"
+    );
+    let e = open(r#"{"url":"postgres://u@h/d"}"#).unwrap();
+    assert!(e.starts_with("invalid mysql plugin config: url: "), "{e}");
+    assert!(open(r#"{"url":"mysql://u@h/d"}"#).is_none());
+    // validate and open agree.
+    assert_eq!(
+        <crate::MysqlStore as busbar_contract::abi::sdk::store::StoreSlots>::validate(
+            br#"{"url":"mysql://u@h/d","x":1}"#
+        )
+        .unwrap_err(),
+        "invalid mysql plugin config: unknown setting `x` (accepted: url)"
+    );
+}
+
+/// An unencoded `?` in the password makes the URL's tail a bogus parameter; neither `open` nor
+/// `validate` may echo any of the password, raw or percent-decoded.
+#[test]
+fn a_settings_refusal_never_carries_the_url_password() {
+    for url in [
+        "mysql://u:12?abc@h/db",
+        "mysql://u:p%40ss%3Fw0rd@h/db?bogus=1",
+        "mysql://u:s3cret@h/db?pool_max=5&bogus",
+    ] {
+        let settings = serde_json::json!({ "url": url }).to_string();
+        for e in [
+            MysqlStore::open(settings.as_bytes()).err().unwrap(),
+            <crate::MysqlStore as busbar_contract::abi::sdk::store::StoreSlots>::validate(
+                settings.as_bytes(),
+            )
+            .unwrap_err(),
+        ] {
+            for secret in ["12?abc", "abc@h", "p%40ss%3Fw0rd", "p@ss?w0rd", "s3cret"] {
+                assert!(!e.contains(secret), "{url}: {secret:?} leaked in {e:?}");
+            }
+        }
+    }
+}
+
+/// A database stamped ABOVE this build's schema is refused at open, before any DDL; the same
+/// version opens.
+#[test]
+fn a_newer_schema_is_refused_at_open() {
+    let _ddl_guard = lock_fresh_database_ddl();
+    let Some(db) = ScratchDb::new("newer") else {
+        return;
+    };
+    drop(MysqlStore::connect(&db.url).expect("a fresh database opens"));
+    assert_eq!(schema_version_of(&db), SCHEMA_VERSION.to_string());
+    drop(MysqlStore::connect(&db.url).expect("the same version opens"));
+    let newer = SCHEMA_VERSION + 1;
+    db.conn()
+        .query_drop(format!(
+            "UPDATE store_meta SET v = '{newer}' WHERE k = 'schema_version'"
+        ))
+        .unwrap();
+    // A marker table the open would have created had it run DDL.
+    db.conn().query_drop("DROP TABLE store_records").unwrap();
+    let e = MysqlStore::connect(&db.url)
+        .err()
+        .expect("a newer schema is refused");
+    assert!(
+        e.contains(&format!(
+            "mysql store: database schema v{newer} is newer than this build (v{SCHEMA_VERSION}); \
+             refusing to open"
+        )),
+        "{e}"
+    );
+    let recreated: Option<String> = db
+        .conn()
+        .query_first("SHOW TABLES LIKE 'store_records'")
+        .unwrap();
+    assert!(recreated.is_none(), "no DDL ran before the refusal");
+    assert_eq!(schema_version_of(&db), newer.to_string(), "not restamped");
+}
+
+#[test]
+fn purge_metering_before_refuses_a_bucket_that_is_not_an_integer() {
+    let Some(s) = fresh_store() else { return };
+    for bucket in ["abc", "", "12x", "-1", "1.5"] {
+        let e = s.purge_metering_before(bucket).unwrap_err().to_string();
+        assert!(
+            e.contains(&format!(
+                "purge_metering_before: invalid bucket {bucket:?}, expected an integer"
+            )),
+            "{bucket:?}: {e}"
+        );
+    }
+}
