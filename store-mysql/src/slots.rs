@@ -656,21 +656,6 @@ impl StoreSlots for MysqlStore {
         })
     }
 
-    fn purge_plane_records(
-        &self,
-        cx: &mut Op<'_>,
-        kind: &str,
-        before: u64,
-        retention: busbar_contract::records::Retention,
-    ) -> Step<RecordStoreResult<u64>> {
-        match retention {
-            busbar_contract::records::Retention::Age => {
-                StoreSlots::purge_plane_records_before(self, cx, kind, before)
-            }
-            busbar_contract::records::Retention::TerminalOnly => Step::Ready(Ok(0)),
-        }
-    }
-
     fn purge_plane_records_before(
         &self,
         cx: &mut Op<'_>,

@@ -36,6 +36,7 @@
 // connect as the server's root (a test-only account: `BUSBAR_TEST_MYSQL_ROOT_PASSWORD`, the service
 // container's `busbar` when unset) and grant the settings' user the fold's database. The store never
 // creates a database; nothing in its behaviour changes.
+mod common;
 #[path = "support/conformance_host.rs"]
 mod conformance_host;
 
@@ -93,6 +94,7 @@ fn drop_fold_database(namespace: &str, settings: &[u8]) {
     .expect("the fold's grant is revoked");
 }
 
+use common::{mint, node};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -215,32 +217,6 @@ fn clear(url: &str) {
         conn.exec_drop(sql, (v,))
             .unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
-}
-
-/// A node id no earlier run or instance used, for `LoadedStore::open`: its bridge mints each op id
-/// as `(node, counter from 0)`, and this store's dedupe is DURABLE, so two instances sharing a node
-/// would replay each other's op ids (the kernel draws the node from the OS CSPRNG per process).
-fn node() -> u64 {
-    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let t = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64;
-    (t ^ (u64::from(std::process::id()) << 32))
-        .wrapping_add(N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) << 48)
-        | 1
-}
-
-/// The node's one `op_id` allocator (`LoadedStore::open` mints the bridge's writes from it): a node
-/// half no earlier run used (the dedupe is durable) and one counter.
-fn mint() -> OpId {
-    static NODE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let node = *NODE.get_or_init(node);
-    OpId::from_parts(
-        node,
-        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
-    )
 }
 
 /// A fresh op id (the dedupe is durable: an op id from an earlier run would replay).

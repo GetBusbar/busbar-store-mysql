@@ -81,6 +81,21 @@ type MeteringRowTuple = (
 );
 type AuditRowTuple = (u64, u64, String, String, String, String, String, String);
 
+fn audit_from_row(
+    (seq, ts, action, resource, outcome, principal, prev_hash, hash): AuditRowTuple,
+) -> AuditRecord {
+    AuditRecord {
+        seq,
+        ts,
+        action,
+        resource,
+        outcome,
+        principal,
+        prev_hash,
+        hash,
+    }
+}
+
 /// `(id, parent, ts, terminal, body)` — the stored columns an append's fork check compares.
 type PlaneRowTuple = (String, Option<String>, u64, bool, Vec<u8>);
 
@@ -2166,21 +2181,7 @@ impl MysqlStore {
         let rows: Vec<AuditRowTuple> = conn
             .query("SELECT seq, ts, action, resource, outcome, principal, prev_hash, hash FROM audit_log ORDER BY seq").await
             .map_err(store_err)?;
-        Ok(rows
-            .into_iter()
-            .map(
-                |(seq, ts, action, resource, outcome, principal, prev_hash, hash)| AuditRecord {
-                    seq,
-                    ts,
-                    action,
-                    resource,
-                    outcome,
-                    principal,
-                    prev_hash,
-                    hash,
-                },
-            )
-            .collect())
+        Ok(rows.into_iter().map(audit_from_row).collect())
     }
 
     pub(crate) async fn list_audit_tail(
@@ -2194,21 +2195,7 @@ impl MysqlStore {
                 params! { "limit" => limit },
             ).await
             .map_err(store_err)?;
-        let mut out: Vec<AuditRecord> = rows
-            .into_iter()
-            .map(
-                |(seq, ts, action, resource, outcome, principal, prev_hash, hash)| AuditRecord {
-                    seq,
-                    ts,
-                    action,
-                    resource,
-                    outcome,
-                    principal,
-                    prev_hash,
-                    hash,
-                },
-            )
-            .collect();
+        let mut out: Vec<AuditRecord> = rows.into_iter().map(audit_from_row).collect();
         out.reverse(); // DESC LIMIT then reverse = the last N, oldest-first
         Ok(out)
     }
