@@ -68,8 +68,8 @@ Drop the built `.so`/`.dll`/`.dylib` into busbar's `plugins_dir`, or install it 
   byte-for-byte; single-use tokens (`redeem_plane_token`) live in `plane_tokens`. Retention for the
   `task` kind drops only terminal rows and takes their event chain with it.
 - Upgrades are IN PLACE on boot. A database written by the 1.5.x plugin (v1.0.x, schema v3) gains
-  four nullable `api_keys` columns (`allowed_scopes_ext`, `idp_subject`, `binding_mode`,
-  `minted_by`), `usage_metering.priced_from_ms` (default 0, and part of the metering key, so a
+  five nullable `api_keys` columns (`allowed_scopes_ext`, `idp_subject`, `binding_mode`,
+  `minted_by`, `idp_provider`), `usage_metering.priced_from_ms` (default 0, and part of the metering key, so a
   rate-card change inside a day opens a second cell), and the new tables. No existing row is
   dropped or rewritten.
 
