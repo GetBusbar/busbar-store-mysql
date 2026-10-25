@@ -304,7 +304,7 @@ fn the_v10_upgrade_drops_the_money_and_dead_slot_tables() {
         .query_first("SELECT v FROM store_meta WHERE k = 'schema_version'")
         .unwrap()
         .unwrap();
-    assert_eq!(version, "10");
+    assert_eq!(version, crate::SCHEMA_VERSION.to_string());
     let bodies: Vec<String> = c.query("SELECT CAST(body AS CHAR) FROM store_ops").unwrap();
     assert!(
         bodies.iter().all(|b| b.starts_with("add_usage_batch:")
