@@ -1100,6 +1100,21 @@ impl MysqlStore {
             )));
         }
 
+        // The money slots' transactions run READ COMMITTED (slots.rs, ISOLATION), which InnoDB
+        // refuses to log under STATEMENT-format binary logging (ERROR 1665) - every `reserve`
+        // would fail at runtime. Refuse at open instead.
+        let (binlog_format, log_bin): (String, u64) = conn
+            .query_first("SELECT @@binlog_format, @@log_bin")
+            .await
+            .map_err(store_err)?
+            .unwrap_or_default();
+        if log_bin != 0 && binlog_format.eq_ignore_ascii_case("STATEMENT") {
+            return Err(store_err(
+                "mysql store: binlog_format=STATEMENT cannot log the money slots' READ COMMITTED \
+                 transactions; set binlog_format=ROW",
+            ));
+        }
+
         // Session-private TEMPORARY table -- zero contention with real traffic or another node's
         // simultaneous boot probe (unlike probing the real, shared `store_sequence` singleton row,
         // which a concurrent live control-plane transaction, or another node probing at the same

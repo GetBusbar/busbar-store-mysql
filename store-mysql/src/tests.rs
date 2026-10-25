@@ -4392,3 +4392,36 @@ fn purge_metering_before_refuses_a_bucket_that_is_not_an_integer() {
         );
     }
 }
+
+/// A server logging in STATEMENT format cannot log the money slots' READ COMMITTED transactions
+/// (ERROR 1665); the open refuses it. The session is set by root; skipped where the binlog is off.
+#[test]
+fn statement_binlog_format_is_refused_at_open() {
+    let Some(url) = test_url() else { return };
+    let opts = std::sync::Arc::new(crate::mysqlwire::Opts::from_url(&root_url(&url)).unwrap());
+    let probe = |fmt: &str| {
+        let set = format!("SET SESSION binlog_format = '{fmt}'");
+        let mut c = harness::block_on(crate::mysqlwire::Conn::open_tcp(
+            &opts,
+            &[crate::INIT[0], set.as_str()],
+        ))
+        .expect("root connects");
+        let log_bin: Option<u64> = harness::block_on(c.query_first("SELECT @@log_bin")).unwrap();
+        (
+            log_bin.unwrap_or(0),
+            harness::block_on(crate::MysqlStore::probe_invariants(&mut c)),
+        )
+    };
+    let (log_bin, row) = probe("ROW");
+    assert!(row.is_ok(), "ROW passes: {row:?}");
+    if log_bin == 0 {
+        eprintln!("skip: the server's binary log is off");
+        return;
+    }
+    let (_, stmt) = probe("STATEMENT");
+    let e = stmt.expect_err("STATEMENT is refused").0;
+    assert!(
+        e.contains("binlog_format=STATEMENT cannot log the money slots' READ COMMITTED"),
+        "{e}"
+    );
+}

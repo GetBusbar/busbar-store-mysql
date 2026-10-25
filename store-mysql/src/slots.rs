@@ -26,9 +26,11 @@
 //! already went back at expiry). A slice that is no longer a row but whose id is at or below the
 //! slice-id high-water was granted and has closed (released whole, or expired): it answers 0; an id
 //! above it (or 0) was never granted and fails the release. Heads state epoch 0, as the reference
-//! store does. Do not run schema-v8 nodes against a v9 database (`SCHEMA_VERSION`).
+//! store does. Do not run schema-v8 nodes against a v9 database (`SCHEMA_VERSION`): a v9 build
+//! refuses a NEWER database at open, but a v8 build already shipped has no such check and cannot
+//! refuse a v9 one, so the operator must upgrade every node before any shared traffic.
 //!
-//! ISOLATION: `reserve` and `slice_release` run READ COMMITTED. Under InnoDB's default REPEATABLE
+//! ISOLATION: `reserve`, `slice_release` and `window_caps` run READ COMMITTED. Under InnoDB's default REPEATABLE
 //! READ a locking read takes gap locks: a reserve's reclaim scan of a slot's slices, or a lock of a
 //! cap row that is not there, would gap-lock ranges other reserves insert into, and two such
 //! transactions deadlock (ERROR 1213). READ COMMITTED locks only the rows that match, and lets the
@@ -793,7 +795,7 @@ async fn v3_window_caps(
     body: String,
     caps: Vec<(Slot, u64, u64)>,
 ) -> Result<(), CapsRefused> {
-    let _ = deduped!(conn, op, &body, CapsRefused, false, |tx| {
+    let _ = deduped!(conn, op, &body, CapsRefused, true, |tx| {
         // Atomic per push: every cap is checked (against the stored cap and the ones before it in
         // this push) before the push commits, and a conflict rolls it all back. Caps are taken in
         // SLOT order, like `reserve`'s locks, so two pushes (or a push and a draw) never wait on
