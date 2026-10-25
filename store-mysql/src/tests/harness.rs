@@ -262,6 +262,18 @@ impl MysqlStore {
         block_on(crate::MysqlStore::stamp_schema_version(&mut c, table))
     }
 
+    /// The connect step's schema pass on `conn`'s database, waiting at most `wait_secs` for
+    /// another connection's migration of it.
+    pub(crate) fn init_schema_waiting(
+        conn: &mut mysql::PooledConn,
+        wait_secs: u32,
+    ) -> RecordStoreResult<()> {
+        let mut c = own_client_like(conn);
+        block_on(crate::MysqlStore::try_init_schema_waiting(
+            &mut c, wait_secs,
+        ))
+    }
+
     pub(crate) fn probe_invariants(conn: &mut mysql::PooledConn) -> RecordStoreResult<()> {
         let mut c = own_client_like(conn);
         block_on(crate::MysqlStore::probe_invariants(&mut c))

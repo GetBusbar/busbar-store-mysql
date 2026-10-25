@@ -1219,11 +1219,11 @@ fn get_usage_ignores_usage_windows_rows_of_another_scope() {
     assert_eq!(back.models[0].tier(UNIT_INPUT), 10, "{back:?}");
 }
 
-/// `model`/`provider` in the metering tables use the database's case-insensitive default
-/// collation, so the two tables can keep different spellings of one cell; the units must still land
-/// on their cell.
+/// `model`/`provider` in the metering tables are byte-exact keys (v11, D19), as in every other
+/// store: `GPT-4o` and `gpt-4o` are two cells, and each cell's units land on it and only on it.
+/// (Before v11 the case-insensitive default collation folded them onto one cell.)
 #[test]
-fn list_metering_matches_units_to_cells_whatever_the_model_spelling() {
+fn list_metering_keeps_model_spellings_apart_and_units_on_their_cell() {
     let Some(s) = fresh_store() else { return };
     let key = "vk_meter_collation_unique";
     s.put_key(&sample_key(key, "g")).unwrap();
@@ -1265,8 +1265,20 @@ fn list_metering_matches_units_to_cells_whatever_the_model_spelling() {
         .filter(|r| r.key_id == key)
         .collect();
     clean(&mut conn);
-    assert_eq!(rows.len(), 1, "{rows:?}");
-    assert_eq!(rows[0].usage_units.get("tool_calls"), Some(&5), "{rows:?}");
+    assert_eq!(rows.len(), 2, "two spellings, two cells: {rows:?}");
+    let cell = |model: &str| {
+        rows.iter()
+            .find(|r| r.model == model)
+            .unwrap_or_else(|| panic!("no {model} cell: {rows:?}"))
+    };
+    assert_eq!(
+        cell("gpt-4o").usage_units.get("tool_calls"),
+        Some(&5),
+        "{rows:?}"
+    );
+    assert_eq!(cell("gpt-4o").requests, 1, "{rows:?}");
+    assert!(cell("GPT-4o").usage_units.is_empty(), "{rows:?}");
+    assert_eq!(cell("GPT-4o").requests, 1, "{rows:?}");
 }
 
 #[test]
@@ -4025,4 +4037,446 @@ fn a_newer_schema_is_refused_at_open() {
         .unwrap();
     assert!(recreated.is_none(), "no DDL ran before the refusal");
     assert_eq!(schema_version_of(&db), newer.to_string(), "not restamped");
+}
+
+// ── D19: store keys are EXACT ──────────────────────────────────────────────────────────────────
+
+/// D19, RED BEFORE GREEN: `'abc'` and `'abc '` are TWO keys, as they are in every other store
+/// (postgres, sqlite, valkey, memory). MySQL's `ascii_bin`/`utf8mb4_bin` collations are PAD SPACE,
+/// so under them the trailing space vanished from every comparison: a key minted as `'abc '`
+/// overwrote `'abc'`, a spent token's space-padded twin was refused as already spent, and a record
+/// schema read back another schema's rows. Each surface below writes both spellings and reads
+/// each back as itself.
+#[test]
+fn keys_differing_only_by_trailing_space_are_distinct() {
+    let _ddl_guard = lock_fresh_database_ddl();
+    let Some(db) = ScratchDb::new("exact") else {
+        return;
+    };
+    let store = MysqlStore::connect(&db.url).expect("a fresh database opens");
+
+    // Virtual keys (`api_keys.id`, ascii_bin before the fix).
+    store.put_key(&sample_key("abc", "gen-plain")).unwrap();
+    store.put_key(&sample_key("abc ", "gen-padded")).unwrap();
+    assert_eq!(
+        store.get_key("abc").unwrap().unwrap().generation_hash,
+        "gen-plain",
+        "'abc ' overwrote 'abc'"
+    );
+    let padded = store
+        .get_key("abc ")
+        .unwrap()
+        .expect("'abc ' is its own key");
+    assert_eq!(padded.id, "abc ");
+    assert_eq!(padded.generation_hash, "gen-padded");
+
+    // Plane records (`plane_records.ident`, utf8mb4_bin before the fix).
+    store
+        .upsert_plane_record(active_task("abc", "working", TASK_LIVE_TS + 1).view())
+        .unwrap();
+    store
+        .upsert_plane_record(active_task("abc ", "submitted", TASK_LIVE_TS + 2).view())
+        .unwrap();
+    assert_eq!(get_task(&store, "abc").unwrap()["state"], "working");
+    assert_eq!(get_task(&store, "abc ").unwrap()["state"], "submitted");
+
+    // The single-use ledger (`plane_tokens.token`): spending 'abc' does not spend 'abc '.
+    assert!(store
+        .redeem_plane_token("ask", "abc", TRUST_NOW + 900, TRUST_NOW)
+        .unwrap());
+    assert!(
+        store
+            .redeem_plane_token("ask", "abc ", TRUST_NOW + 900, TRUST_NOW)
+            .unwrap(),
+        "'abc ' was refused as already spent because 'abc' was"
+    );
+
+    // Kernel records (`store_records.schema_id`).
+    store.record_put("abc", b"k", b"plain").unwrap();
+    store.record_put("abc ", b"k", b"padded").unwrap();
+    assert_eq!(
+        store.record_get("abc", b"k").unwrap().unwrap().as_slice(),
+        b"plain"
+    );
+    assert_eq!(
+        store.record_get("abc ", b"k").unwrap().unwrap().as_slice(),
+        b"padded"
+    );
+}
+
+/// A database exactly as the v10 build (dev before D19) left it, holding one row keyed `'abc'` in
+/// every table v11 retypes.
+fn build_v10_database(db: &ScratchDb) {
+    let mut c = db.conn();
+    c.query_drop("SET SESSION sql_mode = CONCAT(@@sql_mode, ',STRICT_ALL_TABLES')")
+        .unwrap();
+    for stmt in schema_fixtures::V10_SCHEMA {
+        c.query_drop(*stmt).unwrap();
+    }
+    for stmt in V10_ABC_ROWS {
+        c.query_drop(*stmt).unwrap();
+    }
+}
+
+const V10_ABC_ROWS: &[&str] = &[
+    "INSERT INTO store_meta (k, v) VALUES ('schema_version', '10')",
+    "INSERT INTO store_sequence (id, revision) VALUES (1, 7)",
+    "INSERT INTO api_keys (id, name, key_group, allowed_pools, labels, enabled, generation_hash, \
+     created_at, updated_at, revision) VALUES ('abc', 'old', 'grp', NULL, '{}', 1, 'gen-abc', \
+     1000, 1000, 7)",
+    "INSERT INTO credentials (id, key_id, kind, slot, public_id, secret, secret_form, created_at, \
+     updated_at, revision) VALUES ('abc', 'abc', 'sigv4', 0, 'abc', 'v1:plain:abc', \
+     'recoverable', 1000, 1000, 7)",
+    "INSERT INTO denylist (sub, reason, revoked_at, expires_at, revision) \
+     VALUES ('abc', 'r', 2000, 9000000000, 7)",
+    "INSERT INTO usage_windows (window_start, bucket_scope, bucket_id, model, requests, \
+     billable_requests) VALUES (3000, 'key', 'abc', 'gpt-x', 9, 8)",
+    "INSERT INTO usage_metering (bucket, key_id, provider, model, key_group_at_use, \
+     pricing_version, requests, billable_requests) VALUES ('0020260731', 'abc', 'p', 'm', 'grp', \
+     'v1', 4, 3)",
+    "INSERT INTO plane_records (kind, ident, seq, id, parent, ts, terminal, body) \
+     VALUES ('task', 'abc', 0, 'abc', NULL, 2000000001, FALSE, '{\"state\":\"working\"}')",
+    "INSERT INTO plane_tokens (kind, token, expires_at) VALUES ('ask', 'abc', 9000000000)",
+    "INSERT INTO usage_window_units (window_start, bucket_scope, bucket_id, model, unit, count) \
+     VALUES (3000, 'key', 'abc', 'gpt-x', 'abc', 5)",
+    "INSERT INTO usage_metering_units (bucket, key_id, provider, model, priced_from_ms, unit, \
+     count) VALUES ('0020260731', 'abc', 'p', 'm', 0, 'abc', 2)",
+    "INSERT INTO store_records (schema_id, rkey, value) VALUES ('abc', 'k', 'v-abc')",
+];
+
+/// The same rows with `'abc '` where the v10 key held `'abc'`: one per table, each a different key
+/// under byte comparison, each the SAME key under v10's PAD SPACE collations.
+const V10_PADDED_TWINS: &[&str] = &[
+    "INSERT INTO api_keys (id, name, key_group, allowed_pools, labels, enabled, generation_hash, \
+     created_at, updated_at, revision) VALUES ('abc ', 'twin', 'grp', NULL, '{}', 1, 'gen-twin', \
+     1000, 1000, 8)",
+    "INSERT INTO credentials (id, key_id, kind, slot, public_id, secret, secret_form, created_at, \
+     updated_at, revision) VALUES ('abc ', 'abc', 'sigv4', 1, 'abc2', 'v1:plain:abc', \
+     'recoverable', 1000, 1000, 8)",
+    "INSERT INTO credentials (id, key_id, kind, slot, public_id, secret, secret_form, created_at, \
+     updated_at, revision) VALUES ('abc2', 'abc ', 'sigv4', 0, 'abc ', 'v1:plain:abc', \
+     'recoverable', 1000, 1000, 8)",
+    "INSERT INTO denylist (sub, reason, revoked_at, expires_at, revision) \
+     VALUES ('abc ', 'r', 2000, 9000000000, 8)",
+    "INSERT INTO usage_windows (window_start, bucket_scope, bucket_id, model, requests, \
+     billable_requests) VALUES (3000, 'key', 'abc ', 'gpt-x', 1, 1)",
+    "INSERT INTO usage_metering (bucket, key_id, provider, model, key_group_at_use, \
+     pricing_version, requests, billable_requests) VALUES ('0020260731', 'abc ', 'p', 'm', 'grp', \
+     'v1', 1, 1)",
+    "INSERT INTO plane_records (kind, ident, seq, id, parent, ts, terminal, body) \
+     VALUES ('task', 'abc ', 0, 'abc ', NULL, 2000000001, FALSE, '{}')",
+    "INSERT INTO plane_tokens (kind, token, expires_at) VALUES ('ask', 'abc ', 9000000000)",
+    "INSERT INTO usage_window_units (window_start, bucket_scope, bucket_id, model, unit, count) \
+     VALUES (3000, 'key', 'abc', 'gpt-x', 'abc ', 1)",
+    "INSERT INTO usage_metering_units (bucket, key_id, provider, model, priced_from_ms, unit, \
+     count) VALUES ('0020260731', 'abc', 'p', 'm', 0, 'abc ', 1)",
+    "INSERT INTO store_records (schema_id, rkey, value) VALUES ('abc ', 'k', 'v-twin')",
+];
+
+/// Every column, constraint and index of `db`'s tables, as `information_schema` reports them.
+fn schema_shape(db: &ScratchDb) -> Vec<String> {
+    let mut c = db.conn();
+    let mut out: Vec<String> = c
+        .exec_map(
+            "SELECT table_name, column_name, column_type, is_nullable, \
+             COALESCE(column_default, '<none>'), COALESCE(collation_name, '<none>') \
+             FROM information_schema.columns WHERE table_schema = DATABASE() \
+             ORDER BY table_name, ordinal_position",
+            (),
+            |(t, col, ty, null, def, coll): (String, String, String, String, String, String)| {
+                format!("column {t}.{col} {ty} null={null} default={def} collation={coll}")
+            },
+        )
+        .unwrap();
+    out.extend(
+        c.exec_map(
+            "SELECT table_name, constraint_name, constraint_type FROM \
+             information_schema.table_constraints WHERE table_schema = DATABASE() \
+             ORDER BY table_name, constraint_name",
+            (),
+            |(t, n, ty): (String, String, String)| format!("constraint {t}.{n} {ty}"),
+        )
+        .unwrap(),
+    );
+    out.extend(
+        c.exec_map(
+            "SELECT table_name, index_name, seq_in_index, column_name FROM \
+             information_schema.statistics WHERE table_schema = DATABASE() \
+             ORDER BY table_name, index_name, seq_in_index",
+            (),
+            |(t, i, n, col): (String, String, u64, String)| format!("index {t}.{i}[{n}] {col}"),
+        )
+        .unwrap(),
+    );
+    out
+}
+
+fn meta_row(db: &ScratchDb, k: &str) -> Option<String> {
+    db.conn()
+        .exec_first("SELECT v FROM store_meta WHERE k = ?", (k,))
+        .unwrap()
+}
+
+/// The shape a FRESH database gets from this build.
+fn fresh_schema_shape() -> Option<Vec<String>> {
+    let db = ScratchDb::new("shape")?;
+    drop(MysqlStore::connect(&db.url).expect("a fresh database opens"));
+    Some(schema_shape(&db))
+}
+
+/// The `'abc'` rows read back through this build's surface, unchanged by the migration.
+fn assert_abc_rows_read_back(store: &MysqlStore) {
+    let k = store.get_key("abc").unwrap().expect("the key survives");
+    assert_eq!(
+        (k.id.as_str(), k.generation_hash.as_str()),
+        ("abc", "gen-abc")
+    );
+    let cred = store
+        .lookup_credential_secret("sigv4", "abc")
+        .unwrap()
+        .expect("the credential survives");
+    assert_eq!(cred.meta.key_id, "abc");
+    assert_eq!(
+        store.get_plane_record("task", "abc").unwrap().as_deref(),
+        Some(&br#"{"state":"working"}"#[..])
+    );
+    assert!(
+        !store
+            .redeem_plane_token("ask", "abc", TRUST_NOW + 900, TRUST_NOW)
+            .unwrap(),
+        "the spent token is still spent"
+    );
+    assert_eq!(
+        store.record_get("abc", b"k").unwrap().unwrap().as_slice(),
+        b"v-abc"
+    );
+}
+
+/// D19's MIGRATION. A v10 database (every key `ascii_bin`/`utf8mb4_bin`, PAD SPACE) is converted
+/// in place on the first v11 open:
+/// - BEFORE: every `'abc '` twin is REFUSED as a duplicate of the `'abc'` row (ER_DUP_ENTRY), which
+///   is why no pair that collides under byte comparison can exist in a database to migrate;
+/// - AFTER: the database's shape is exactly a fresh v11 database's, every row reads back, the
+///   version is stamped, the migration marker is gone, and every twin is now its own row;
+/// - a second open changes nothing.
+#[test]
+fn v11_converts_a_v10_database_to_exact_keys_in_place() {
+    let _ddl_guard = lock_fresh_database_ddl();
+    let Some(fresh) = fresh_schema_shape() else {
+        return;
+    };
+    let Some(db) = ScratchDb::new("v11") else {
+        return;
+    };
+    build_v10_database(&db);
+    {
+        let mut c = db.conn();
+        for twin in V10_PADDED_TWINS {
+            match c.query_drop(*twin) {
+                Err(mysql::Error::MySqlError(e)) if e.code == 1062 => {}
+                other => panic!("v10 must merge the padded twin onto 'abc': {other:?}\n{twin}"),
+            }
+        }
+    }
+    assert_ne!(schema_shape(&db), fresh, "the fixture is the pre-D19 shape");
+
+    let store = MysqlStore::connect(&db.url).expect("this build opens and migrates a v10 database");
+    assert_eq!(schema_version_of(&db), SCHEMA_VERSION.to_string());
+    assert_eq!(meta_row(&db, "migrating_to"), None, "the marker is cleared");
+    assert_eq!(
+        schema_shape(&db),
+        fresh,
+        "a migrated database is a fresh one's shape"
+    );
+    assert_abc_rows_read_back(&store);
+
+    // Every twin is now a row of its own, beside the 'abc' row.
+    {
+        let mut c = db.conn();
+        for twin in V10_PADDED_TWINS {
+            c.query_drop(*twin)
+                .unwrap_or_else(|e| panic!("after v11 the padded twin is distinct: {e}\n{twin}"));
+        }
+    }
+    assert_eq!(
+        store.get_key("abc ").unwrap().unwrap().generation_hash,
+        "gen-twin"
+    );
+    assert_eq!(
+        store.get_key("abc").unwrap().unwrap().generation_hash,
+        "gen-abc"
+    );
+    drop(store);
+
+    let again = MysqlStore::connect(&db.url).expect("a second open");
+    assert_eq!(schema_version_of(&db), SCHEMA_VERSION.to_string());
+    assert_eq!(schema_shape(&db), fresh, "the second open changes nothing");
+    assert_abc_rows_read_back(&again);
+}
+
+/// A v11 migration that crashed part-way (MySQL DDL commits statement by statement) left its
+/// marker, both foreign keys onto `api_keys.id` dropped and one table converted. The next open
+/// holds the lock no one else does, RESUMES, and converges on the fresh shape.
+#[test]
+fn v11_resumes_a_migration_that_crashed_part_way() {
+    let _ddl_guard = lock_fresh_database_ddl();
+    let Some(fresh) = fresh_schema_shape() else {
+        return;
+    };
+    let Some(db) = ScratchDb::new("v11crash") else {
+        return;
+    };
+    build_v10_database(&db);
+    {
+        let mut c = db.conn();
+        for stmt in [
+            "INSERT INTO store_meta (k, v) VALUES ('migrating_to', '11')",
+            "ALTER TABLE credentials DROP FOREIGN KEY fk_cred_key",
+            "ALTER TABLE usage_metering DROP FOREIGN KEY fk_metering_key",
+            "ALTER TABLE api_keys MODIFY COLUMN id VARBINARY(64) NOT NULL, \
+             MODIFY COLUMN key_group VARBINARY(128) NOT NULL DEFAULT ''",
+        ] {
+            c.query_drop(stmt).unwrap();
+        }
+    }
+    let store = MysqlStore::connect(&db.url).expect("the crashed migration resumes");
+    assert_eq!(schema_version_of(&db), SCHEMA_VERSION.to_string());
+    assert_eq!(meta_row(&db, "migrating_to"), None);
+    assert_eq!(schema_shape(&db), fresh);
+    assert_abc_rows_read_back(&store);
+}
+
+/// While ANOTHER connection holds this database's migration lock (it is migrating right now), an
+/// open waits, then REFUSES with the reason and the holder rather than serve a schema half way
+/// between two shapes. It runs no DDL and stamps nothing; once the lock is free the same open
+/// migrates.
+#[test]
+fn an_open_during_another_connections_migration_is_refused() {
+    let _ddl_guard = lock_fresh_database_ddl();
+    let Some(db) = ScratchDb::new("v11busy") else {
+        return;
+    };
+    build_v10_database(&db);
+    let before = schema_shape(&db);
+    let mut migrator = db.conn();
+    let holder: u64 = migrator
+        .query_first("SELECT CONNECTION_ID()")
+        .unwrap()
+        .unwrap();
+    let got: Option<i64> = migrator
+        .query_first(format!("SELECT GET_LOCK({}, 0)", crate::MIGRATION_LOCK))
+        .unwrap();
+    assert_eq!(got, Some(1));
+
+    let e = MysqlStore::init_schema_waiting(&mut db.conn(), 1)
+        .expect_err("an open during another connection's migration is refused")
+        .0;
+    assert!(
+        e.contains(&format!(
+            "mysql store: database is mid-migration: connection {holder} holds its migration \
+             lock and is migrating it from schema v10 to v{SCHEMA_VERSION}; refusing to open"
+        )),
+        "{e}"
+    );
+    assert_eq!(schema_version_of(&db), "10", "not stamped");
+    assert_eq!(schema_shape(&db), before, "no DDL ran");
+
+    migrator
+        .query_drop(format!("DO RELEASE_LOCK({})", crate::MIGRATION_LOCK))
+        .unwrap();
+    MysqlStore::init_schema_waiting(&mut db.conn(), 1).expect("the lock is free: it migrates");
+    assert_eq!(schema_version_of(&db), SCHEMA_VERSION.to_string());
+}
+
+/// A database a NEWER build was part-way through migrating (its marker names a version past this
+/// build's) is refused at open, before any DDL, and the marker is left for that build.
+#[test]
+fn a_database_mid_migration_to_a_newer_schema_is_refused() {
+    let _ddl_guard = lock_fresh_database_ddl();
+    let Some(db) = ScratchDb::new("v11newer") else {
+        return;
+    };
+    drop(MysqlStore::connect(&db.url).expect("a fresh database opens"));
+    let newer = SCHEMA_VERSION + 1;
+    db.conn()
+        .query_drop(format!(
+            "INSERT INTO store_meta (k, v) VALUES ('migrating_to', '{newer}')"
+        ))
+        .unwrap();
+    db.conn().query_drop("DROP TABLE store_records").unwrap();
+    let e = MysqlStore::connect(&db.url)
+        .err()
+        .expect("a database mid-migration to a newer schema is refused");
+    assert!(
+        e.contains(&format!(
+            "mysql store: database is mid-migration from schema v{SCHEMA_VERSION} to v{newer}, \
+             which is newer than this build (v{SCHEMA_VERSION}); refusing to open"
+        )),
+        "{e}"
+    );
+    let recreated: Option<String> = db
+        .conn()
+        .query_first("SHOW TABLES LIKE 'store_records'")
+        .unwrap();
+    assert!(recreated.is_none(), "no DDL ran before the refusal");
+    assert_eq!(meta_row(&db, "migrating_to"), Some(newer.to_string()));
+}
+
+/// v11 never orphans a row its old collation let reach its parent under another spelling. In v10 a
+/// credential could name its key `'abc '` (PAD SPACE found `'abc'`), and a metering unit could be
+/// spelled `gpt-4o` under its cell's `GPT-4o` (case-insensitive). Byte-exact keys would orphan both
+/// (the foreign key could not be restored; the unit would drop out of `list_metering`): the
+/// migration gives each its parent's spelling first.
+#[test]
+fn v11_respells_children_onto_their_parents_keys() {
+    let _ddl_guard = lock_fresh_database_ddl();
+    let Some(db) = ScratchDb::new("v11spell") else {
+        return;
+    };
+    build_v10_database(&db);
+    {
+        let mut c = db.conn();
+        for stmt in [
+            "INSERT INTO credentials (id, key_id, kind, slot, public_id, secret, secret_form, \
+             created_at, updated_at, revision) VALUES ('cred_pad', 'abc ', 'sigv4', 1, 'pad', \
+             'v1:plain:pad', 'recoverable', 1000, 1000, 7)",
+            "INSERT INTO usage_metering (bucket, key_id, provider, model, key_group_at_use, \
+             pricing_version, requests, billable_requests) VALUES ('0020991231', 'abc', 'P', \
+             'GPT-4o', '', 'v1', 1, 1)",
+            "INSERT INTO usage_metering_units (bucket, key_id, provider, model, priced_from_ms, \
+             unit, count) VALUES ('0020991231', 'abc', 'p', 'gpt-4o', 0, 'tool_calls', 5)",
+        ] {
+            c.query_drop(stmt).unwrap();
+        }
+    }
+    let store = MysqlStore::connect(&db.url).expect("v11 migrates");
+    let pad = store
+        .lookup_credential_secret("sigv4", "pad")
+        .unwrap()
+        .expect("the credential survives");
+    assert_eq!(
+        pad.meta.key_id, "abc",
+        "the credential takes its key's spelling"
+    );
+    let rows = store.list_metering(20_991_231).unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        (rows[0].model.as_str(), rows[0].provider.as_str()),
+        ("GPT-4o", "P")
+    );
+    assert_eq!(
+        rows[0].usage_units.get("tool_calls"),
+        Some(&5),
+        "the unit is on its cell"
+    );
+    // The key's delete still cascades to the re-spelt credential: the foreign key is back.
+    let n: u64 = db
+        .conn()
+        .query_first(
+            "SELECT COUNT(*) FROM information_schema.table_constraints \
+             WHERE table_schema = DATABASE() AND constraint_type = 'FOREIGN KEY'",
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(n, 2, "both foreign keys onto api_keys.id are restored");
 }

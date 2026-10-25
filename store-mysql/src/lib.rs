@@ -16,10 +16,12 @@
 //!   transaction (mint/revoke/rotate/delete), before touching `api_keys`/`credentials`/`denylist`.
 //!   This fixed lock order (`store_sequence` -> `api_keys` -> `credentials` -> `denylist`) is what
 //!   makes deadlock across the admin plane structurally impossible.
-//! - `ascii_bin` collation on every opaque identifier column (`id`, `key_id`, `public_id`,
-//!   `key_group`, `bucket_id`): MySQL's default collation is case-INSENSITIVE + PAD SPACE, a real
-//!   security-relevant footgun for a credential lookup handle. Byte-exact comparison, matching
-//!   Postgres/SQLite's default behavior.
+//! - `VARBINARY` on every key and identity column (`id`, `key_id`, `public_id`, `key_group`,
+//!   `bucket_id`, `model`, `ident`, `token`, ...; schema v11, D19): MySQL's default collation is
+//!   case- and accent-INSENSITIVE, and its `_bin` collations (`ascii_bin`, `utf8mb4_bin`) are PAD
+//!   SPACE, so `'abc'` and `'abc '` were one key -- a real security-relevant footgun for a
+//!   credential lookup handle. A binary string compares byte for byte with no padding, matching
+//!   Postgres, SQLite, Valkey and the memory store, on MySQL and MariaDB alike.
 //! - `rows_affected()` reports "rows CHANGED", not "rows MATCHED" — an idempotent no-op UPDATE
 //!   (disabling an already-disabled key) returns 0, indistinguishable from "not found" by row count
 //!   alone. Every conditional mutation here does an explicit `SELECT ... FOR UPDATE` existence/state
@@ -142,7 +144,12 @@ fn store_err<E: std::fmt::Display>(e: E) -> RecordStoreError {
 /// fence epoch), `store_journal` (`append_batch`) and `store_sessions`. The dedupe rows of the
 /// deleted slots go with them; a row of a kept slot is untouched, so a retry across the upgrade
 /// still answers its original -- see `run_v10_drop_dead_slot_tables`.
-const SCHEMA_VERSION: u32 = 10;
+/// v11 (D19, store keys are EXACT): every key and identity column is `VARBINARY`, compared byte
+/// for byte. MySQL's `_bin` collations (`ascii_bin`, `utf8mb4_bin`) are PAD SPACE, so `'abc'` and
+/// `'abc '` were ONE key here while every other store holds two; the default
+/// `utf8mb4_0900_ai_ci` (on `model`/`provider`/...) also folded case and accents. No existing row
+/// is rewritten or lost -- see `run_v11_exact_keys`.
+const SCHEMA_VERSION: u32 = 11;
 
 /// The version each one-time migration step targets crossing INTO — named so a gate reads as "did
 /// this database predate step N" rather than a bare magic number, and so a future step can't be
@@ -153,10 +160,143 @@ const V2_BILLABLE_REQUESTS_BACKFILL: u32 = 2;
 const V3_KEY_GROUP_AT_USE_ASCII_BIN: u32 = 3;
 const V7_PLANE_RECORDS: u32 = 7;
 const V10_DEAD_SLOTS: u32 = 10;
+const V11_EXACT_KEYS: u32 = 11;
+
+/// Every key and identity column v11 makes byte-exact, per table, with the definition `SCHEMA`
+/// declares for it (a migrated database ends with exactly the columns a fresh one is created
+/// with). `VARBINARY` rather than a collation: it is the one comparison that is byte-exact AND
+/// NO PAD on every server this store supports. MySQL 8's `_bin` collations are PAD SPACE, there is
+/// no NO PAD collation for `ascii` at all, and the one NO PAD binary text collation
+/// (`utf8mb4_0900_bin`) does not exist on MariaDB. Widths are bytes: four per former `utf8mb4`
+/// character, one per former `ascii` one.
+const V11_EXACT_KEY_COLUMNS: &[(&str, &[(&str, &str)])] = &[
+    ("store_meta", &[("k", "VARBINARY(764) NOT NULL")]),
+    (
+        "api_keys",
+        &[
+            ("id", "VARBINARY(64) NOT NULL"),
+            ("key_group", "VARBINARY(128) NOT NULL DEFAULT ''"),
+        ],
+    ),
+    (
+        "credentials",
+        &[
+            ("id", "VARBINARY(64) NOT NULL"),
+            ("key_id", "VARBINARY(64) NOT NULL"),
+            ("kind", "VARBINARY(128) NOT NULL"),
+            ("public_id", "VARBINARY(256) NOT NULL"),
+        ],
+    ),
+    ("denylist", &[("sub", "VARBINARY(64) NOT NULL")]),
+    (
+        "usage_windows",
+        &[
+            ("bucket_scope", "VARBINARY(32) NOT NULL"),
+            ("bucket_id", "VARBINARY(128) NOT NULL"),
+            ("model", "VARBINARY(1024) NOT NULL"),
+        ],
+    ),
+    (
+        "usage_metering",
+        &[
+            ("bucket", "VARBINARY(40) NOT NULL"),
+            ("key_id", "VARBINARY(64) NOT NULL"),
+            ("provider", "VARBINARY(512) NOT NULL"),
+            ("model", "VARBINARY(1024) NOT NULL"),
+            ("key_group_at_use", "VARBINARY(128) NOT NULL DEFAULT ''"),
+        ],
+    ),
+    (
+        "plane_records",
+        &[
+            ("kind", "VARBINARY(256) NOT NULL"),
+            ("ident", "VARBINARY(764) NOT NULL"),
+            ("id", "VARBINARY(764) NOT NULL"),
+            ("parent", "VARBINARY(764) NULL"),
+        ],
+    ),
+    (
+        "plane_tokens",
+        &[
+            ("kind", "VARBINARY(256) NOT NULL"),
+            ("token", "VARBINARY(764) NOT NULL"),
+        ],
+    ),
+    (
+        "usage_window_units",
+        &[
+            ("bucket_scope", "VARBINARY(32) NOT NULL"),
+            ("bucket_id", "VARBINARY(128) NOT NULL"),
+            ("model", "VARBINARY(1024) NOT NULL"),
+            ("unit", "VARBINARY(512) NOT NULL"),
+        ],
+    ),
+    (
+        "usage_metering_units",
+        &[
+            ("bucket", "VARBINARY(40) NOT NULL"),
+            ("key_id", "VARBINARY(64) NOT NULL"),
+            ("provider", "VARBINARY(512) NOT NULL"),
+            ("model", "VARBINARY(1024) NOT NULL"),
+            ("unit", "VARBINARY(512) NOT NULL"),
+        ],
+    ),
+    ("store_records", &[("schema_id", "VARBINARY(764) NOT NULL")]),
+];
+
+/// The foreign keys onto `api_keys.id`, `(table, constraint, definition)` exactly as `SCHEMA`
+/// declares them: v11 drops them to retype the columns they join and puts them back.
+const V11_KEY_FOREIGN_KEYS: &[(&str, &str, &str)] = &[
+    (
+        "credentials",
+        "fk_cred_key",
+        "FOREIGN KEY (key_id) REFERENCES api_keys(id) ON DELETE CASCADE",
+    ),
+    (
+        "usage_metering",
+        "fk_metering_key",
+        "FOREIGN KEY (key_id) REFERENCES api_keys(id) ON DELETE RESTRICT",
+    ),
+];
+
+/// v11's child-to-parent re-spelling, run before any key is retyped (see `run_v11_exact_keys`):
+/// parents before children, so a metering unit takes its cell's spelling after the cell has taken
+/// its key's.
+const V11_RESPELL: &[&str] = &[
+    "UPDATE credentials c JOIN api_keys k ON k.id = c.key_id SET c.key_id = k.id \
+     WHERE BINARY c.key_id <> BINARY k.id",
+    "UPDATE usage_metering m JOIN api_keys k ON k.id = m.key_id SET m.key_id = k.id \
+     WHERE BINARY m.key_id <> BINARY k.id",
+    "UPDATE usage_metering_units u JOIN usage_metering m \
+     ON m.bucket = u.bucket AND m.key_id = u.key_id AND m.model = u.model \
+     AND m.provider = u.provider AND m.priced_from_ms = u.priced_from_ms \
+     SET u.key_id = m.key_id, u.model = m.model, u.provider = m.provider \
+     WHERE BINARY u.key_id <> BINARY m.key_id OR BINARY u.model <> BINARY m.model \
+     OR BINARY u.provider <> BINARY m.provider",
+    "UPDATE usage_window_units u JOIN usage_windows w \
+     ON w.window_start = u.window_start AND w.bucket_scope = u.bucket_scope \
+     AND w.bucket_id = u.bucket_id AND w.model = u.model \
+     SET u.bucket_scope = w.bucket_scope, u.bucket_id = w.bucket_id, u.model = w.model \
+     WHERE BINARY u.bucket_scope <> BINARY w.bucket_scope \
+     OR BINARY u.bucket_id <> BINARY w.bucket_id OR BINARY u.model <> BINARY w.model",
+];
+
+/// The `store_meta` row a migration writes BEFORE its first DDL and deletes after the version
+/// stamp: MySQL DDL is not transactional, so this row is how a later open knows the schema may be
+/// part-way between two shapes (and which version it was heading for).
+const MIGRATING_TO: &str = "migrating_to";
+
+/// The SQL naming this database's migration lock. `GET_LOCK` names are server-wide, so the name
+/// carries the database (hashed: a lock name is at most 64 characters).
+const MIGRATION_LOCK: &str = "CONCAT('busbar_store_migrate_', LEFT(SHA2(DATABASE(), 256), 40))";
+
+/// How long an open waits for another connection's migration of the same database to finish
+/// before refusing (a fleet booting together onto an old database waits for the one migrator).
+const MIGRATION_LOCK_WAIT_SECS: u32 = 30;
 
 const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS store_meta (
-        k VARCHAR(191) PRIMARY KEY,
+        k VARBINARY(764) PRIMARY KEY,
         v TEXT NOT NULL
     ) ENGINE=InnoDB",
     "CREATE TABLE IF NOT EXISTS store_sequence (
@@ -165,9 +305,9 @@ const SCHEMA: &[&str] = &[
         CONSTRAINT ck_seq_singleton CHECK (id = 1)
     ) ENGINE=InnoDB",
     "CREATE TABLE IF NOT EXISTS api_keys (
-        id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+        id VARBINARY(64) PRIMARY KEY,
         name VARCHAR(256) NOT NULL DEFAULT '',
-        key_group VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '',
+        key_group VARBINARY(128) NOT NULL DEFAULT '',
         allowed_pools JSON NULL,
         labels JSON NOT NULL,
         enabled BOOLEAN NOT NULL DEFAULT TRUE,
@@ -190,11 +330,11 @@ const SCHEMA: &[&str] = &[
     "CREATE INDEX idx_api_keys_revision ON api_keys (revision)",
     "CREATE INDEX idx_api_keys_group ON api_keys (key_group)",
     "CREATE TABLE IF NOT EXISTS credentials (
-        id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
-        key_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
-        kind VARCHAR(32) NOT NULL,
+        id VARBINARY(64) PRIMARY KEY,
+        key_id VARBINARY(64) NOT NULL,
+        kind VARBINARY(128) NOT NULL,
         slot TINYINT NOT NULL,
-        public_id VARCHAR(256) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+        public_id VARBINARY(256) NOT NULL,
         secret TEXT NULL,
         secret_form VARCHAR(16) NOT NULL,
         created_at BIGINT UNSIGNED NOT NULL,
@@ -214,7 +354,7 @@ const SCHEMA: &[&str] = &[
     ) ENGINE=InnoDB",
     "CREATE INDEX idx_cred_revision ON credentials (revision)",
     "CREATE TABLE IF NOT EXISTS denylist (
-        sub VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+        sub VARBINARY(64) PRIMARY KEY,
         reason VARCHAR(512) NOT NULL DEFAULT '',
         revoked_at BIGINT UNSIGNED NOT NULL,
         expires_at BIGINT UNSIGNED NOT NULL,
@@ -225,9 +365,9 @@ const SCHEMA: &[&str] = &[
     "CREATE INDEX idx_denylist_expires ON denylist (expires_at)",
     "CREATE TABLE IF NOT EXISTS usage_windows (
         window_start BIGINT UNSIGNED NOT NULL,
-        bucket_scope VARCHAR(8) NOT NULL,
-        bucket_id VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
-        model VARCHAR(256) NOT NULL,
+        bucket_scope VARBINARY(32) NOT NULL,
+        bucket_id VARBINARY(128) NOT NULL,
+        model VARBINARY(1024) NOT NULL,
         requests BIGINT UNSIGNED NOT NULL DEFAULT 0,
         billable_requests BIGINT UNSIGNED NOT NULL DEFAULT 0,
         tokens_input BIGINT UNSIGNED NOT NULL DEFAULT 0,
@@ -238,11 +378,11 @@ const SCHEMA: &[&str] = &[
         CONSTRAINT ck_uw_scope CHECK (bucket_scope IN ('key','group','global'))
     ) ENGINE=InnoDB",
     "CREATE TABLE IF NOT EXISTS usage_metering (
-        bucket CHAR(10) NOT NULL,
-        key_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
-        provider VARCHAR(128) NOT NULL,
-        model VARCHAR(256) NOT NULL,
-        key_group_at_use VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '',
+        bucket VARBINARY(40) NOT NULL,
+        key_id VARBINARY(64) NOT NULL,
+        provider VARBINARY(512) NOT NULL,
+        model VARBINARY(1024) NOT NULL,
+        key_group_at_use VARBINARY(128) NOT NULL DEFAULT '',
         pricing_version VARCHAR(64) NOT NULL DEFAULT '',
         requests BIGINT UNSIGNED NOT NULL DEFAULT 0,
         billable_requests BIGINT UNSIGNED NOT NULL DEFAULT 0,
@@ -280,15 +420,15 @@ const SCHEMA: &[&str] = &[
     // own `id` at seq 0. So an upsert kind is one row per id, and an append kind is one row per
     // chain position -- one primary key serves the point read, the upsert and the fork check.
     //
-    // COLLATE utf8mb4_bin on every key column, for the reason the v4..v6 tables carried it: this
-    // schema's default collation is utf8mb4_0900_ai_ci -- CASE- AND ACCENT-INSENSITIVE -- under which
+    // VARBINARY on every key column (v11; v7..v10 carried COLLATE utf8mb4_bin, which is PAD SPACE
+    // and so still folded `'abc '` onto `'abc'`): this schema's default collation is utf8mb4_0900_ai_ci -- CASE- AND ACCENT-INSENSITIVE -- under which
     // two task ids, two principals or two upstreams differing only in case COLLIDE ON THE PRIMARY
     // KEY: one silently upserts onto the other, a scoped read hands one caller another caller's
     // chain, and an append is reported as a "fork" of a chain it never wrote. Binary rather than
     // `CHARACTER SET ascii` because an id is an opaque protocol-supplied string that may be
-    // non-ASCII, and ascii would HARD-FAIL that write under STRICT_ALL_TABLES. VARCHAR(191) on the
-    // keyed columns is the utf8mb4 length that keeps a key inside the index limit on the older
-    // 3072-byte configurations this store still supports (the same reason store_meta.k is 191).
+    // non-ASCII, and ascii would HARD-FAIL that write under STRICT_ALL_TABLES. VARBINARY(764) on the
+    // keyed columns is the byte width of the former utf8mb4 VARCHAR(191), which keeps a key inside
+    // the 3072-byte index limit (the same width as store_meta.k).
     //
     // `terminal` is the envelope's `PlaneDisposition` as a typed column, because retention has to
     // read it: the `task` kind drops only TERMINAL rows older than the cutoff (an interrupted task
@@ -304,11 +444,11 @@ const SCHEMA: &[&str] = &[
     // one cascade this store owes (a purged task takes its event chain with it) lives in
     // `purge_plane_records_before`, in the same transaction as the parent delete.
     "CREATE TABLE IF NOT EXISTS plane_records (
-        kind VARCHAR(64) COLLATE utf8mb4_bin NOT NULL,
-        ident VARCHAR(191) COLLATE utf8mb4_bin NOT NULL,
+        kind VARBINARY(256) NOT NULL,
+        ident VARBINARY(764) NOT NULL,
         seq BIGINT UNSIGNED NOT NULL,
-        id VARCHAR(191) COLLATE utf8mb4_bin NOT NULL,
-        parent VARCHAR(191) COLLATE utf8mb4_bin NULL,
+        id VARBINARY(764) NOT NULL,
+        parent VARBINARY(764) NULL,
         ts BIGINT UNSIGNED NOT NULL,
         terminal BOOLEAN NOT NULL DEFAULT FALSE,
         body LONGBLOB NOT NULL,
@@ -325,13 +465,13 @@ const SCHEMA: &[&str] = &[
     // and is never shared with a second node. Keyed by `(kind, token)`, so the ledger is generic over
     // every single-use kind rather than hard-wiring one.
     //
-    // COLLATE utf8mb4_bin on the key is the SHARPEST instance of the collation hazard in this file:
+    // A byte-exact key is the SHARPEST instance of the collation hazard in this file:
     // under the schema default the primary key stops telling a token from its case variants, so a
     // genuinely fresh approval would be REFUSED while an attacker's near-miss variants fold onto one
     // row. Byte-exact is the only correct comparison for a random token.
     "CREATE TABLE IF NOT EXISTS plane_tokens (
-        kind VARCHAR(64) COLLATE utf8mb4_bin NOT NULL,
-        token VARCHAR(191) COLLATE utf8mb4_bin NOT NULL,
+        kind VARBINARY(256) NOT NULL,
+        token VARBINARY(764) NOT NULL,
         expires_at BIGINT UNSIGNED NOT NULL,
         PRIMARY KEY (kind, token)
     ) ENGINE=InnoDB",
@@ -345,13 +485,13 @@ const SCHEMA: &[&str] = &[
     // and every OTHER unit a plane declares (`tool_calls`, `bytes`, a rerank's search units, ...)
     // lands here, one row per (window, bucket, model, unit), so `add_usage` stays one atomic
     // `count = count + delta` upsert per unit rather than a read-modify-write of a JSON blob.
-    // `unit` is utf8mb4_bin: two unit names differing in case are two counters, never one.
+    // `unit` is binary: two unit names differing in case (or a trailing space) are two counters.
     "CREATE TABLE IF NOT EXISTS usage_window_units (
         window_start BIGINT UNSIGNED NOT NULL,
-        bucket_scope VARCHAR(8) NOT NULL,
-        bucket_id VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
-        model VARCHAR(256) NOT NULL,
-        unit VARCHAR(128) COLLATE utf8mb4_bin NOT NULL,
+        bucket_scope VARBINARY(32) NOT NULL,
+        bucket_id VARBINARY(128) NOT NULL,
+        model VARBINARY(1024) NOT NULL,
+        unit VARBINARY(512) NOT NULL,
         count BIGINT UNSIGNED NOT NULL DEFAULT 0,
         PRIMARY KEY (window_start, bucket_scope, bucket_id, model, unit)
     ) ENGINE=InnoDB",
@@ -360,12 +500,12 @@ const SCHEMA: &[&str] = &[
     // unit. No foreign key: the parent cell is written first in the same transaction, and
     // a delete of the cell removes both.
     "CREATE TABLE IF NOT EXISTS usage_metering_units (
-        bucket CHAR(10) NOT NULL,
-        key_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
-        provider VARCHAR(128) NOT NULL,
-        model VARCHAR(256) NOT NULL,
+        bucket VARBINARY(40) NOT NULL,
+        key_id VARBINARY(64) NOT NULL,
+        provider VARBINARY(512) NOT NULL,
+        model VARBINARY(1024) NOT NULL,
         priced_from_ms BIGINT UNSIGNED NOT NULL DEFAULT 0,
-        unit VARCHAR(128) COLLATE utf8mb4_bin NOT NULL,
+        unit VARBINARY(512) NOT NULL,
         count BIGINT UNSIGNED NOT NULL DEFAULT 0,
         PRIMARY KEY (key_id, bucket, model, provider, priced_from_ms, unit)
     ) ENGINE=InnoDB",
@@ -388,7 +528,7 @@ const SCHEMA: &[&str] = &[
     // THE KERNEL'S DURABLE RECORDS (`record_put`/`record_get`/`record_scan`): `(schema, key) ->
     // value`, read back in KEY ORDER under a prefix. VARBINARY keys compare byte for byte.
     "CREATE TABLE IF NOT EXISTS store_records (
-        schema_id VARCHAR(191) COLLATE utf8mb4_bin NOT NULL,
+        schema_id VARBINARY(764) NOT NULL,
         rkey VARBINARY(2048) NOT NULL,
         value VARBINARY(512) NOT NULL,
         PRIMARY KEY (schema_id, rkey)
@@ -846,6 +986,211 @@ impl MysqlStore {
         Ok(())
     }
 
+    /// v11 SCHEMA upgrade (D19, see `SCHEMA_VERSION`): every key and identity column becomes
+    /// `VARBINARY`, so it compares byte for byte with no trailing-space padding.
+    ///
+    /// Gated on what the database HAS (`information_schema.columns.DATA_TYPE`), not on the version,
+    /// so it converges from wherever a crash left it: a column already `varbinary` is skipped, a
+    /// table with nothing left to convert is not touched, and a foreign key onto `api_keys.id` that
+    /// a crashed run dropped is put back. A fresh database (created `VARBINARY` by `SCHEMA`) is a
+    /// no-op.
+    ///
+    /// NO EXISTING ROW CAN COLLIDE. The old collations (`ascii_bin`, `utf8mb4_bin`: PAD SPACE;
+    /// `utf8mb4_0900_ai_ci`: case- and accent-insensitive) all treat byte-equal strings as equal,
+    /// so their equality is COARSER than byte equality: two rows distinct under the old key are
+    /// distinct under the new one. (The rows that would collide, `'abc'` beside `'abc '`, could
+    /// never be written: the old primary key merged or refused them.) Each table converts in ONE
+    /// `ALTER TABLE`, which MySQL 8 applies atomically, so even an impossible duplicate would fail
+    /// that statement and leave the table as it was rather than lose a row.
+    ///
+    /// The conversion copies each value's stored bytes: an `ascii` or `utf8mb4` value becomes the
+    /// same bytes as `VARBINARY`, and reads back as the same `String`. Widths are in bytes, four
+    /// per `utf8mb4` character, so no value that fitted before is too long after.
+    ///
+    /// MySQL refuses to change the type of a column a foreign key joins (`ER_FK_INCOMPATIBLE_COLUMNS`),
+    /// so the two foreign keys onto `api_keys.id` are dropped first and re-added after; the re-add
+    /// re-checks every row, which the unchanged bytes pass.
+    pub(crate) async fn run_v11_exact_keys(conn: &mut Conn) -> RecordStoreResult<()> {
+        let mut pending: Vec<(&str, Vec<(&str, &str)>)> = Vec::new();
+        for (table, columns) in V11_EXACT_KEY_COLUMNS {
+            if !Self::table_exists(conn, table).await? {
+                continue;
+            }
+            let mut todo = Vec::new();
+            for (column, definition) in *columns {
+                let ty: Option<String> = conn
+                    .exec_first(
+                        "SELECT DATA_TYPE FROM information_schema.columns \
+                         WHERE table_schema = DATABASE() AND table_name = :t AND column_name = :c",
+                        params! { "t" => *table, "c" => *column },
+                    )
+                    .await
+                    .map_err(store_err)?;
+                if ty.is_some_and(|t| !t.eq_ignore_ascii_case("varbinary")) {
+                    todo.push((*column, *definition));
+                }
+            }
+            if !todo.is_empty() {
+                pending.push((table, todo));
+            }
+        }
+        if !pending.is_empty() {
+            // FIRST, while every key still compares under its old collation: a row that reaches its
+            // parent through a key the old collation folded (`credentials.key_id = 'abc '` onto
+            // `api_keys.id = 'abc'`, a metering unit spelled `gpt-4o` under its cell's `GPT-4o`)
+            // takes its parent's spelling, or the byte-exact key would orphan it. Matching rows
+            // already shared one old key, so no re-spelt row can collide; a re-run matches nothing.
+            for stmt in V11_RESPELL {
+                conn.query_drop(*stmt).await.map_err(|e| {
+                    store_err(format!(
+                        "schema upgrade v11 failed re-spelling a child key: {e}"
+                    ))
+                })?;
+            }
+            for (table, constraint, _) in V11_KEY_FOREIGN_KEYS {
+                if Self::foreign_key_exists(conn, table, constraint).await? {
+                    conn.query_drop(format!("ALTER TABLE {table} DROP FOREIGN KEY {constraint}"))
+                        .await
+                        .map_err(|e| {
+                            store_err(format!(
+                                "schema upgrade v11 failed dropping {table}.{constraint}: {e}"
+                            ))
+                        })?;
+                }
+            }
+            for (table, columns) in &pending {
+                let modify = columns
+                    .iter()
+                    .map(|(c, d)| format!("MODIFY COLUMN {c} {d}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                conn.query_drop(format!("ALTER TABLE {table} {modify}"))
+                    .await
+                    .map_err(|e| {
+                        store_err(format!(
+                            "schema upgrade v11 failed making {table}'s keys exact: {e}"
+                        ))
+                    })?;
+            }
+        }
+        for (table, constraint, definition) in V11_KEY_FOREIGN_KEYS {
+            if Self::table_exists(conn, table).await?
+                && !Self::foreign_key_exists(conn, table, constraint).await?
+            {
+                conn.query_drop(format!(
+                    "ALTER TABLE {table} ADD CONSTRAINT {constraint} {definition}"
+                ))
+                .await
+                .map_err(|e| {
+                    store_err(format!(
+                        "schema upgrade v11 failed restoring {table}.{constraint}: {e}"
+                    ))
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether foreign key `constraint` exists on `table` in the connected database.
+    async fn foreign_key_exists(
+        conn: &mut Conn,
+        table: &str,
+        constraint: &str,
+    ) -> RecordStoreResult<bool> {
+        let n: Option<u64> = conn
+            .exec_first(
+                "SELECT COUNT(*) FROM information_schema.table_constraints \
+                 WHERE table_schema = DATABASE() AND table_name = :t \
+                 AND constraint_name = :c AND constraint_type = 'FOREIGN KEY'",
+                params! { "t" => table, "c" => constraint },
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(n.unwrap_or(0) > 0)
+    }
+
+    /// A `u32` value of `store_meta` (`table` for test isolation, like `read_prior_version`), or
+    /// `None` when the row is absent; a value that is not a number is a hard error.
+    async fn read_meta_u32(
+        conn: &mut Conn,
+        table: &str,
+        key: &str,
+    ) -> RecordStoreResult<Option<u32>> {
+        let v: Option<String> = conn
+            .exec_first(
+                format!("SELECT v FROM {table} WHERE k = :k"),
+                params! { "k" => key },
+            )
+            .await
+            .map_err(store_err)?;
+        v.map(|v| {
+            v.parse().map_err(|e| {
+                store_err(format!(
+                    "{table}.{key} is corrupt (not a version number): {v:?} ({e})"
+                ))
+            })
+        })
+        .transpose()
+    }
+
+    /// Refuse a database this build must not touch: stamped by a newer build, or left part-way
+    /// through a newer build's migration (its marker names a version this build does not know the
+    /// steps of, and its tables may be half way to a shape this build cannot read).
+    fn refuse_unknown_schema(
+        prior_version: u32,
+        migrating_to: Option<u32>,
+    ) -> RecordStoreResult<()> {
+        if prior_version > SCHEMA_VERSION {
+            return Err(store_err(format!(
+                "mysql store: database schema v{prior_version} is newer than this build \
+                 (v{SCHEMA_VERSION}); refusing to open"
+            )));
+        }
+        if let Some(to) = migrating_to.filter(|to| *to > SCHEMA_VERSION) {
+            return Err(store_err(format!(
+                "mysql store: database is mid-migration from schema v{prior_version} to v{to}, \
+                 which is newer than this build (v{SCHEMA_VERSION}); refusing to open. Finish the \
+                 migration by opening it with a build at v{to} or later"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Take the database's migration lock (a server-wide `GET_LOCK` named for this database, so two
+    /// stores on two databases of one server never wait on each other), waiting up to `wait_secs`.
+    /// A lock still held after the wait means another connection is migrating this database right
+    /// now, and a half-migrated schema is not one this store may serve: refused, naming the holder.
+    async fn acquire_migration_lock(
+        conn: &mut Conn,
+        prior_version: u32,
+        wait_secs: u32,
+    ) -> RecordStoreResult<()> {
+        let got: Option<Option<i64>> = conn
+            .query_first(format!("SELECT GET_LOCK({MIGRATION_LOCK}, {wait_secs})"))
+            .await
+            .map_err(store_err)?;
+        if got.flatten() == Some(1) {
+            return Ok(());
+        }
+        let holder: Option<Option<u64>> = conn
+            .query_first(format!("SELECT IS_USED_LOCK({MIGRATION_LOCK})"))
+            .await
+            .map_err(store_err)?;
+        let holder = holder.flatten().map_or_else(
+            || "another connection".to_owned(),
+            |id| format!("connection {id}"),
+        );
+        let what = if prior_version == 0 {
+            format!("creating schema v{SCHEMA_VERSION}")
+        } else {
+            format!("migrating it from schema v{prior_version} to v{SCHEMA_VERSION}")
+        };
+        Err(store_err(format!(
+            "mysql store: database is mid-migration: {holder} holds its migration lock and is \
+             {what}; refusing to open after waiting {wait_secs}s (retry once that migration ends)"
+        )))
+    }
+
     /// Read the version this database was AT before this boot from `store_meta`, tolerating "no row
     /// yet" (a genuinely fresh database, or one already at v2 that never needed a marker written
     /// pre-v2) as version 0, but propagating any OTHER query failure (a connection blip, a lock
@@ -894,6 +1239,23 @@ impl MysqlStore {
     }
 
     async fn try_init_schema(conn: &mut Conn) -> RecordStoreResult<()> {
+        Self::try_init_schema_waiting(conn, MIGRATION_LOCK_WAIT_SECS).await
+    }
+
+    /// `try_init_schema`, waiting at most `wait_secs` for another connection's migration of this
+    /// database (a parameter only so a test can see the refusal without waiting the full term).
+    ///
+    /// A database at this build's version with no migration marker is the steady state and boots
+    /// as it always did. Anything else -- a fresh database, an older one, or one a crashed
+    /// migration left marked -- is created or migrated under the database's migration lock, so
+    /// exactly one connection does it and every other open either waits for it to finish or is
+    /// refused with the reason. (Postgres and SQLite get the same guarantee from transactional
+    /// DDL under one lock; MySQL DDL commits statement by statement, so the lock and the marker
+    /// stand in for that transaction.)
+    pub(crate) async fn try_init_schema_waiting(
+        conn: &mut Conn,
+        wait_secs: u32,
+    ) -> RecordStoreResult<()> {
         // `read_prior_version` needs `store_meta` to already exist -- create it FIRST (SCHEMA[0],
         // `IF NOT EXISTS` so harmless to re-run when the full loop below reaches it again) so a
         // genuinely fresh database's read is a real "no row" (Ok(None) -> version 0), not a
@@ -901,15 +1263,57 @@ impl MysqlStore {
         // (correctly, for every OTHER failure) treat as a hard failure.
         conn.query_drop(SCHEMA[0]).await.map_err(store_err)?;
         let prior_version = Self::read_prior_version(conn, "store_meta").await?;
-        // A database a LATER build stamped is refused before any DDL: this build's schema pass
-        // over it could re-run steps the newer build already migrated.
-        if prior_version > SCHEMA_VERSION {
-            return Err(store_err(format!(
-                "mysql store: database schema v{prior_version} is newer than this build \
-                 (v{SCHEMA_VERSION}); refusing to open"
-            )));
+        let migrating_to = Self::read_meta_u32(conn, "store_meta", MIGRATING_TO).await?;
+        // A database a LATER build stamped, or is part-way through migrating, is refused before
+        // any DDL: this build's schema pass over it could re-run steps the newer build already
+        // migrated, or serve tables half way to a shape this build cannot read.
+        Self::refuse_unknown_schema(prior_version, migrating_to)?;
+        if prior_version == SCHEMA_VERSION && migrating_to.is_none() {
+            return Self::apply_schema(conn, prior_version).await;
         }
+        Self::acquire_migration_lock(conn, prior_version, wait_secs).await?;
+        let result = Self::migrate_locked(conn).await;
+        let released = conn
+            .query_drop(format!("DO RELEASE_LOCK({MIGRATION_LOCK})"))
+            .await;
+        // A migration failure is the one to report. A successful migration whose lock release
+        // failed is not swallowed: the lock would hold every other open of this database waiting.
+        match (result, released) {
+            (Ok(()), Err(e)) => Err(store_err(format!(
+                "schema migration succeeded but releasing its lock failed: {e}"
+            ))),
+            (result, _) => result,
+        }
+    }
 
+    /// The migration, under the database's migration lock. The version and marker are read again:
+    /// the connection that held the lock while this one waited may have finished the work, or been
+    /// a newer build.
+    ///
+    /// The marker goes in before the first DDL on an existing database and comes out after the
+    /// version stamp. A crash in between leaves it; the next open takes the lock (no one else holds
+    /// it: the crashed session's lock died with it) and RESUMES, which is safe because every step is
+    /// idempotent and gated on what the database has (or on the version, stamped last).
+    async fn migrate_locked(conn: &mut Conn) -> RecordStoreResult<()> {
+        let prior_version = Self::read_prior_version(conn, "store_meta").await?;
+        let migrating_to = Self::read_meta_u32(conn, "store_meta", MIGRATING_TO).await?;
+        Self::refuse_unknown_schema(prior_version, migrating_to)?;
+        if prior_version > 0 && prior_version < SCHEMA_VERSION {
+            conn.query_drop(format!(
+                "INSERT INTO store_meta (k, v) VALUES ('{MIGRATING_TO}', '{SCHEMA_VERSION}') \
+                 ON DUPLICATE KEY UPDATE v = VALUES(v)"
+            ))
+            .await
+            .map_err(store_err)?;
+        }
+        Self::apply_schema(conn, prior_version).await?;
+        conn.query_drop(format!("DELETE FROM store_meta WHERE k = '{MIGRATING_TO}'"))
+            .await
+            .map_err(store_err)
+    }
+
+    /// Create what is missing, run every migration step `prior_version` has not crossed, stamp.
+    async fn apply_schema(conn: &mut Conn, prior_version: u32) -> RecordStoreResult<()> {
         for stmt in SCHEMA {
             // An index that is ALREADY THERE is skipped without issuing the DDL at all. A
             // `CREATE INDEX` that is going to fail as a duplicate still takes an exclusive
@@ -942,6 +1346,9 @@ impl MysqlStore {
         Self::run_v7_schema_upgrade(conn, "api_keys", "usage_metering").await?;
         Self::run_v7_plane_record_copy_if_needed(conn, prior_version).await?;
         Self::run_v10_drop_dead_slot_tables(conn, prior_version).await?;
+        if prior_version < V11_EXACT_KEYS {
+            Self::run_v11_exact_keys(conn).await?;
+        }
 
         Self::stamp_schema_version(conn, "store_meta").await?;
         conn.query_drop(
@@ -1877,8 +2284,8 @@ impl MysqlStore {
             .map_err(store_err)?;
         let units: Vec<(String, String, String, u64, String, u64)> = conn
             .exec(
-                // Joined to the cell in SQL: both tables fold model/provider case-insensitively and
-                // may hold different spellings, so a byte-exact match here would drop units.
+                // Joined to the cell in SQL. Both tables' keys are byte-exact (v11, which re-spelt
+                // any unit a pre-v11 case-insensitive key had let differ from its cell).
                 "SELECT m.key_id, m.model, m.provider, m.priced_from_ms, u.unit, u.count \
                  FROM usage_metering_units u JOIN usage_metering m \
                  ON m.bucket = u.bucket AND m.key_id = u.key_id AND m.model = u.model \
