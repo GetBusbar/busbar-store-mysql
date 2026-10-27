@@ -604,16 +604,6 @@ enum Meta {
     Rows(Arc<[Column]>),
 }
 
-/// What an `exec_iter` answered: the rows it affected.
-pub struct Affected(u64);
-
-impl Affected {
-    #[must_use]
-    pub fn affected_rows(&self) -> u64 {
-        self.0
-    }
-}
-
 /// ONE CONNECTION TO THE SERVER over the op's transport. It is KEPT for the instance's next op
 /// only when [`Conn::release`] resets it cleanly; dropped any other way (an early return, a
 /// protocol failure), it is discarded and the next op dials fresh.
@@ -1463,16 +1453,6 @@ impl Conn {
         let params = params.into();
         let meta = self.execute(query.as_ref(), params).await?;
         self.rows(meta, true).await.map(drop)
-    }
-
-    /// A prepared statement; what it affected.
-    pub async fn exec_iter(
-        &mut self,
-        query: impl AsRef<str>,
-        params: impl Into<Params>,
-    ) -> Result<Affected> {
-        self.exec_drop(query, params).await?;
-        Ok(Affected(self.affected_rows()))
     }
 
     /// `COM_PING`.
