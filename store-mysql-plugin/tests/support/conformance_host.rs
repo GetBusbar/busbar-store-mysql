@@ -6,7 +6,7 @@
 // `tcp`); a hand edit is overwritten by the next sync.
 
 //! **THE SUITE'S HOST CONNECTOR, IN THIS PLUGIN'S OWN TEST** (ARCHITECT Q-P4-9 (d)). busbar keeps
-//! only the neutral seam (`busbar_plugin_loader::conformance::Host`, the suite's `host:` and `tls:`
+//! only the neutral seam (`busbar_test_kit::conformance::Host`, the suite's `host:` and `tls:`
 //! arguments); this adapter implements it the way busbar's composition root composes the process's
 //! one connector — carrier -> [TLS] -> framer (`BUSBAR-1.6.0.md` THE DESIGN §5):
 //!
@@ -31,7 +31,7 @@
 //! #[path = "support/conformance_host.rs"]
 //! mod conformance_host;
 //!
-//! busbar_plugin_loader::conformance_suite! {
+//! busbar_test_kit::conformance_suite! {
 //!     door: …, cdylib: …, inputs: include_str!("conformance.json"),
 //!     host: conformance_host::host,
 //!     tls: conformance_host::anchors(),
@@ -97,7 +97,7 @@ pub fn anchors() -> &'static str {
     &ca().ca_pem
 }
 
-/// THE HOST CONNECTOR (`busbar_plugin_loader::conformance::Host`): one per leg.
+/// THE HOST CONNECTOR (`busbar_test_kit::conformance::Host`): one per leg.
 ///
 /// # Panics
 /// The anchors do not parse, a transport door does not load or open, or the view does not compose.

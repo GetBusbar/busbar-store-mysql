@@ -31,7 +31,8 @@ busbar-contract = { workspace = true }
 # The conformance and end-to-end tests load the built cdylib over the REAL loader (sign, pack, scan,
 # open) and the linked row through the same registry — dev-only, never in the shipped artifact. Same
 # pinned rev as the logic crate's busbar-contract, so one busbar source resolves.
-busbar-plugin-loader = { workspace = true, features = ["test-support", "conformance"] }
+busbar-plugin-loader = { workspace = true, features = ["test-support"] }
+busbar-test-kit = { workspace = true }
 serde_json = { workspace = true }
 # Drives the store v3 slots (`StoreCalls`, async) to completion on a current-thread runtime.
 tokio = { workspace = true, features = ["rt"] }

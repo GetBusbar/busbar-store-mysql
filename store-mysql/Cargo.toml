@@ -51,4 +51,5 @@ ulid = { workspace = true }
 # (`TcpConns`, `test-support`). The 1.5.5 `mysql` driver verifies what landed INDEPENDENTLY of the
 # store (tests only; never in the shipped image).
 busbar-plugin-loader = { workspace = true, features = ["test-support"] }
+busbar-test-kit = { workspace = true }
 mysql = { workspace = true }
