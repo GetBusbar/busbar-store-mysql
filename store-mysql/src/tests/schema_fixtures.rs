@@ -172,3 +172,171 @@ pub const V6_PLANE_TABLES: &[&str] = &[
     ) ENGINE=InnoDB",
     "CREATE INDEX idx_spent_ask_states_expires ON spent_ask_states (expires_at)",
 ];
+
+/// `store-mysql/src/lib.rs` `SCHEMA` at dev a64e93c — schema v10, the last schema before D19 made
+/// every key column byte-exact (v11). Comments stripped; statements verbatim.
+pub const V10_SCHEMA: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS store_meta (
+        k VARCHAR(191) PRIMARY KEY,
+        v TEXT NOT NULL
+    ) ENGINE=InnoDB",
+    "CREATE TABLE IF NOT EXISTS store_sequence (
+        id INT PRIMARY KEY,
+        revision BIGINT NOT NULL DEFAULT 0,
+        CONSTRAINT ck_seq_singleton CHECK (id = 1)
+    ) ENGINE=InnoDB",
+    "CREATE TABLE IF NOT EXISTS api_keys (
+        id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+        name VARCHAR(256) NOT NULL DEFAULT '',
+        key_group VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '',
+        allowed_pools JSON NULL,
+        labels JSON NOT NULL,
+        enabled BOOLEAN NOT NULL DEFAULT TRUE,
+        generation_hash VARCHAR(128) NOT NULL DEFAULT '',
+        created_at BIGINT UNSIGNED NOT NULL,
+        updated_at BIGINT UNSIGNED NOT NULL,
+        expires_at BIGINT UNSIGNED NULL,
+        deleted_at BIGINT UNSIGNED NULL,
+        revision BIGINT NOT NULL DEFAULT 0,
+        allowed_scopes_ext JSON NULL,
+        idp_subject TEXT NULL,
+        binding_mode TEXT NULL,
+        minted_by TEXT NULL,
+        idp_provider TEXT NULL,
+        CONSTRAINT ck_api_keys_tombstone CHECK (deleted_at IS NULL OR enabled = FALSE),
+        CONSTRAINT ck_api_keys_expiry CHECK (expires_at IS NULL OR expires_at > created_at),
+        CONSTRAINT ck_api_keys_labels_json CHECK (JSON_VALID(labels)),
+        CONSTRAINT ck_api_keys_pools_json CHECK (allowed_pools IS NULL OR JSON_VALID(allowed_pools))
+    ) ENGINE=InnoDB",
+    "CREATE INDEX idx_api_keys_revision ON api_keys (revision)",
+    "CREATE INDEX idx_api_keys_group ON api_keys (key_group)",
+    "CREATE TABLE IF NOT EXISTS credentials (
+        id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+        key_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+        kind VARCHAR(32) NOT NULL,
+        slot TINYINT NOT NULL,
+        public_id VARCHAR(256) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+        secret TEXT NULL,
+        secret_form VARCHAR(16) NOT NULL,
+        created_at BIGINT UNSIGNED NOT NULL,
+        updated_at BIGINT UNSIGNED NOT NULL,
+        expires_at BIGINT UNSIGNED NULL,
+        revoked_at BIGINT UNSIGNED NULL,
+        revoke_reason VARCHAR(512) NULL,
+        revision BIGINT NOT NULL DEFAULT 0,
+        CONSTRAINT ck_cred_kind CHECK (kind IN ('sigv4')),
+        CONSTRAINT ck_cred_slot CHECK (slot IN (0,1)),
+        CONSTRAINT ck_cred_form CHECK (secret_form IN ('none','recoverable','digest')),
+        CONSTRAINT ck_cred_form_null CHECK ((secret_form = 'none') = (secret IS NULL)),
+        CONSTRAINT ck_cred_sigv4_recov CHECK (kind <> 'sigv4' OR secret_form = 'recoverable'),
+        CONSTRAINT uq_cred_public UNIQUE (kind, public_id),
+        CONSTRAINT uq_cred_slot UNIQUE (key_id, kind, slot),
+        CONSTRAINT fk_cred_key FOREIGN KEY (key_id) REFERENCES api_keys(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB",
+    "CREATE INDEX idx_cred_revision ON credentials (revision)",
+    "CREATE TABLE IF NOT EXISTS denylist (
+        sub VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+        reason VARCHAR(512) NOT NULL DEFAULT '',
+        revoked_at BIGINT UNSIGNED NOT NULL,
+        expires_at BIGINT UNSIGNED NOT NULL,
+        revoked_generation VARCHAR(128) NULL,
+        revision BIGINT NOT NULL DEFAULT 0
+    ) ENGINE=InnoDB",
+    "CREATE INDEX idx_denylist_revision ON denylist (revision)",
+    "CREATE INDEX idx_denylist_expires ON denylist (expires_at)",
+    "CREATE TABLE IF NOT EXISTS usage_windows (
+        window_start BIGINT UNSIGNED NOT NULL,
+        bucket_scope VARCHAR(8) NOT NULL,
+        bucket_id VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+        model VARCHAR(256) NOT NULL,
+        requests BIGINT UNSIGNED NOT NULL DEFAULT 0,
+        billable_requests BIGINT UNSIGNED NOT NULL DEFAULT 0,
+        tokens_input BIGINT UNSIGNED NOT NULL DEFAULT 0,
+        tokens_output BIGINT UNSIGNED NOT NULL DEFAULT 0,
+        tokens_cache_read BIGINT UNSIGNED NOT NULL DEFAULT 0,
+        tokens_cache_write BIGINT UNSIGNED NOT NULL DEFAULT 0,
+        PRIMARY KEY (window_start, bucket_scope, bucket_id, model),
+        CONSTRAINT ck_uw_scope CHECK (bucket_scope IN ('key','group','global'))
+    ) ENGINE=InnoDB",
+    "CREATE TABLE IF NOT EXISTS usage_metering (
+        bucket CHAR(10) NOT NULL,
+        key_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+        provider VARCHAR(128) NOT NULL,
+        model VARCHAR(256) NOT NULL,
+        key_group_at_use VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT '',
+        pricing_version VARCHAR(64) NOT NULL DEFAULT '',
+        requests BIGINT UNSIGNED NOT NULL DEFAULT 0,
+        billable_requests BIGINT UNSIGNED NOT NULL DEFAULT 0,
+        tokens_input BIGINT UNSIGNED NOT NULL DEFAULT 0,
+        tokens_output BIGINT UNSIGNED NOT NULL DEFAULT 0,
+        tokens_cache_read BIGINT UNSIGNED NOT NULL DEFAULT 0,
+        tokens_cache_write BIGINT UNSIGNED NOT NULL DEFAULT 0,
+        priced_from_ms BIGINT UNSIGNED NOT NULL DEFAULT 0,
+        PRIMARY KEY (key_id, bucket, model, provider, priced_from_ms),
+        CONSTRAINT fk_metering_key FOREIGN KEY (key_id) REFERENCES api_keys(id) ON DELETE RESTRICT
+    ) ENGINE=InnoDB",
+    "CREATE INDEX idx_metering_bucket ON usage_metering (bucket)",
+    "CREATE TABLE IF NOT EXISTS audit_log (
+        seq BIGINT PRIMARY KEY,
+        ts BIGINT UNSIGNED NOT NULL,
+        action VARCHAR(64) NOT NULL,
+        resource VARCHAR(255) NOT NULL DEFAULT '',
+        outcome VARCHAR(32) NOT NULL,
+        principal VARCHAR(255) NOT NULL DEFAULT '',
+        prev_hash CHAR(64) NOT NULL DEFAULT '',
+        hash CHAR(64) NOT NULL DEFAULT ''
+    ) ENGINE=InnoDB",
+    "CREATE INDEX idx_audit_resource_seq ON audit_log (resource, seq)",
+    "CREATE TABLE IF NOT EXISTS plane_records (
+        kind VARCHAR(64) COLLATE utf8mb4_bin NOT NULL,
+        ident VARCHAR(191) COLLATE utf8mb4_bin NOT NULL,
+        seq BIGINT UNSIGNED NOT NULL,
+        id VARCHAR(191) COLLATE utf8mb4_bin NOT NULL,
+        parent VARCHAR(191) COLLATE utf8mb4_bin NULL,
+        ts BIGINT UNSIGNED NOT NULL,
+        terminal BOOLEAN NOT NULL DEFAULT FALSE,
+        body LONGBLOB NOT NULL,
+        PRIMARY KEY (kind, ident, seq)
+    ) ENGINE=InnoDB",
+    "CREATE INDEX idx_plane_records_kind_ts ON plane_records (kind, ts)",
+    "CREATE TABLE IF NOT EXISTS plane_tokens (
+        kind VARCHAR(64) COLLATE utf8mb4_bin NOT NULL,
+        token VARCHAR(191) COLLATE utf8mb4_bin NOT NULL,
+        expires_at BIGINT UNSIGNED NOT NULL,
+        PRIMARY KEY (kind, token)
+    ) ENGINE=InnoDB",
+    "CREATE INDEX idx_plane_tokens_expires ON plane_tokens (expires_at)",
+    "CREATE TABLE IF NOT EXISTS usage_window_units (
+        window_start BIGINT UNSIGNED NOT NULL,
+        bucket_scope VARCHAR(8) NOT NULL,
+        bucket_id VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+        model VARCHAR(256) NOT NULL,
+        unit VARCHAR(128) COLLATE utf8mb4_bin NOT NULL,
+        count BIGINT UNSIGNED NOT NULL DEFAULT 0,
+        PRIMARY KEY (window_start, bucket_scope, bucket_id, model, unit)
+    ) ENGINE=InnoDB",
+    "CREATE TABLE IF NOT EXISTS usage_metering_units (
+        bucket CHAR(10) NOT NULL,
+        key_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+        provider VARCHAR(128) NOT NULL,
+        model VARCHAR(256) NOT NULL,
+        priced_from_ms BIGINT UNSIGNED NOT NULL DEFAULT 0,
+        unit VARCHAR(128) COLLATE utf8mb4_bin NOT NULL,
+        count BIGINT UNSIGNED NOT NULL DEFAULT 0,
+        PRIMARY KEY (key_id, bucket, model, provider, priced_from_ms, unit)
+    ) ENGINE=InnoDB",
+    "CREATE INDEX idx_metering_units_bucket ON usage_metering_units (bucket)",
+    "CREATE TABLE IF NOT EXISTS store_ops (
+        op_id BINARY(16) PRIMARY KEY,
+        recorded_at BIGINT UNSIGNED NOT NULL,
+        body LONGBLOB NOT NULL,
+        answer LONGBLOB NOT NULL
+    ) ENGINE=InnoDB",
+    "CREATE INDEX idx_store_ops_recorded ON store_ops (recorded_at)",
+    "CREATE TABLE IF NOT EXISTS store_records (
+        schema_id VARCHAR(191) COLLATE utf8mb4_bin NOT NULL,
+        rkey VARBINARY(2048) NOT NULL,
+        value VARBINARY(512) NOT NULL,
+        PRIMARY KEY (schema_id, rkey)
+    ) ENGINE=InnoDB",
+];

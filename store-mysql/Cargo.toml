@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 [package]
 name = "busbar-store-mysql"
-version = "1.0.0"
-publish = false            # internal workspace crate; never goes to crates.io
-edition = "2021"
-rust-version = "1.97"
+version = "1.6.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 description = "The MySQL/MariaDB backend for busbar's durable governance store — the shared, multi-node db plugin. Serves the store v3 door over the host's connector (no socket of its own): the MySQL client protocol over kept connections."
-license = "Apache-2.0"
+license.workspace = true
+
+[lints]
+workspace = true
 
 [lib]
 # rlib: THE LOGIC, and the store's door (`store_door!` over its `StoreSlots`: `door`, the row a
@@ -32,6 +35,9 @@ bytes = { workspace = true }
 url = { workspace = true }
 percent-encoding = { workspace = true }
 serde_json = { workspace = true }
+# `reserve`'s `Unavailable` carries no text across the ABI: its reason is logged (the door captures
+# tracing into the plugin's own log).
+tracing = { workspace = true }
 [dev-dependencies]
 # The `Store` contract conformance suite used to arrive here as `busbar-plugin-testkit`; the owner
 # ruled that crate DELETED on 2026-09-22 and #2/#31 forbid a shared test util between plugins, so

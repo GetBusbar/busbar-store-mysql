@@ -5,8 +5,8 @@
 //! dispatcher, every connection over the host's connection path (the loader's test connection
 //! table, `tcp_conns::TcpConns`), opened with `open`'s connect step. [`MysqlStore`] (this module's,
 //! which the tests name as they always did) answers the 1.5.5 op set through the loader's
-//! synchronous bridge (`RecordStore`, by deref) and the store v3 slots through `StoreCalls`, in the
-//! slots' own result types.
+//! synchronous bridge (`RecordStore`, by deref) and the `op_id` and record slots through
+//! `StoreCalls`, in the slots' own result types.
 //!
 //! RAW SQL: [`MysqlStore::pool`] / [`MysqlStore::conn`] are an INDEPENDENT connection of the 1.5.5
 //! `mysql` driver's own (a dev-dependency; never in the shipped image), for what a test sets up or
@@ -18,12 +18,10 @@ use std::future::Future;
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll, Wake, Waker};
 
-use busbar_contract::abi::sdk::store::{
-    Cap, CapsRefused, Cell, Grant, OpRefused, ReserveRefused, StoreSlots, Tail,
-};
+use busbar_contract::abi::sdk::store::{OpRefused, StoreSlots, Tail};
 use busbar_contract::abi::store::OpId;
-use busbar_contract::kinds::{Head, RecordBytes};
-use busbar_contract::records::{AuditRecord, PlaneRecordRef, RecordStoreResult, UsageDelta};
+use busbar_contract::kinds::RecordBytes;
+use busbar_contract::records::{PlaneRecordRef, RecordStoreResult, UsageDelta};
 use busbar_contract::store_calls::{StoreCalls, StoreFailure};
 use busbar_plugin_loader::dispatch::kinds::store::Store;
 use busbar_plugin_loader::dispatch::{
@@ -256,6 +254,26 @@ impl MysqlStore {
         block_on(crate::MysqlStore::read_prior_version(&mut c, table))
     }
 
+    pub(crate) fn stamp_schema_version(
+        conn: &mut mysql::PooledConn,
+        table: &str,
+    ) -> RecordStoreResult<()> {
+        let mut c = own_client_like(conn);
+        block_on(crate::MysqlStore::stamp_schema_version(&mut c, table))
+    }
+
+    /// The connect step's schema pass on `conn`'s database, waiting at most `wait_secs` for
+    /// another connection's migration of it.
+    pub(crate) fn init_schema_waiting(
+        conn: &mut mysql::PooledConn,
+        wait_secs: u32,
+    ) -> RecordStoreResult<()> {
+        let mut c = own_client_like(conn);
+        block_on(crate::MysqlStore::try_init_schema_waiting(
+            &mut c, wait_secs,
+        ))
+    }
+
     pub(crate) fn probe_invariants(conn: &mut mysql::PooledConn) -> RecordStoreResult<()> {
         let mut c = own_client_like(conn);
         block_on(crate::MysqlStore::probe_invariants(&mut c))
@@ -287,97 +305,12 @@ impl MysqlStore {
         block_on(StoreCalls::add_usage_batch(&self.store, op, &cells)).map_err(op_refused)
     }
 
-    pub(crate) fn append_audit_batch(
-        &self,
-        op: OpId,
-        entries: &[AuditRecord],
-    ) -> Result<(), OpRefused> {
-        block_on(StoreCalls::append_audit_batch(&self.store, op, entries)).map_err(op_refused)
-    }
-
     pub(crate) fn append_plane_record_op(
         &self,
         op: OpId,
         record: PlaneRecordRef<'_>,
     ) -> Result<(), OpRefused> {
         block_on(StoreCalls::append_plane_record(&self.store, op, record)).map_err(op_refused)
-    }
-
-    pub(crate) fn reserve<'c>(
-        &self,
-        op: OpId,
-        epoch: u64,
-        cells: impl Iterator<Item = Cell<'c>>,
-        grants: &mut impl Extend<Grant>,
-    ) -> Result<(), ReserveRefused> {
-        let cells: Vec<Cell<'c>> = cells.collect();
-        match block_on(StoreCalls::reserve(&self.store, op, epoch, &cells)) {
-            Ok(g) => {
-                grants.extend(g);
-                Ok(())
-            }
-            Err(StoreFailure::Reserve(r)) => Err(r),
-            Err(StoreFailure::Conflict) => Err(ReserveRefused::Conflict),
-            Err(_) => Err(ReserveRefused::Unavailable),
-        }
-    }
-
-    pub(crate) fn slice_release(
-        &self,
-        op: OpId,
-        epoch: u64,
-        items: impl Iterator<Item = (u64, u64)>,
-        released: &mut impl Extend<u64>,
-    ) -> Result<(), OpRefused> {
-        let items: Vec<(u64, u64)> = items.collect();
-        let back = block_on(StoreCalls::slice_release(&self.store, op, epoch, &items))
-            .map_err(op_refused)?;
-        released.extend(back);
-        Ok(())
-    }
-
-    pub(crate) fn window_caps(&self, op: OpId, caps: &[Cap<'_>]) -> Result<(), CapsRefused> {
-        block_on(StoreCalls::window_caps(&self.store, op, caps)).map_err(|f| match f {
-            StoreFailure::CapConflict(index) => CapsRefused::CapConflict { index },
-            StoreFailure::Conflict => CapsRefused::Conflict,
-            other => CapsRefused::Failed(text(other)),
-        })
-    }
-
-    pub(crate) fn append_batch(
-        &self,
-        op: OpId,
-        stream: &str,
-        records: &[RecordBytes],
-    ) -> Result<Head, OpRefused> {
-        block_on(StoreCalls::append_batch(&self.store, op, stream, records)).map_err(op_refused)
-    }
-
-    pub(crate) fn heads(&self) -> Result<Vec<(String, Head)>, String> {
-        block_on(StoreCalls::heads(&self.store)).map_err(text)
-    }
-
-    pub(crate) fn session_put(
-        &self,
-        session: u64,
-        node: &str,
-        principal: &str,
-    ) -> Result<(), String> {
-        block_on(StoreCalls::session_put(
-            &self.store,
-            session,
-            node,
-            principal,
-        ))
-        .map_err(text)
-    }
-
-    pub(crate) fn session_remove(&self, session: u64) -> Result<(), String> {
-        block_on(StoreCalls::session_remove(&self.store, session)).map_err(text)
-    }
-
-    pub(crate) fn sessions_for(&self, principal: &str) -> Result<Vec<(u64, String)>, String> {
-        block_on(StoreCalls::sessions_for(&self.store, principal)).map_err(text)
     }
 
     pub(crate) fn record_put(&self, schema: &str, key: &[u8], value: &[u8]) -> Result<(), String> {

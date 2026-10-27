@@ -67,15 +67,32 @@ Drop the built `.so`/`.dll`/`.dylib` into busbar's `plugins_dir`, or install it 
   `plane_records` table keyed by `(kind, identity, seq)`, with the record body stored opaquely and
   byte-for-byte; single-use tokens (`redeem_plane_token`) live in `plane_tokens`. Retention for the
   `task` kind drops only terminal rows and takes their event chain with it.
+- The store v3 tables are `store_ops` (the durable op-id dedupe log) and `store_records` (the
+  kernel's records). The store keeps ledger counts, not money: busbar derives money from the counts
+  and its rate card. Schema v10 drops the tables a pre-release v8/v9 build created for the deleted
+  store slots (`store_caps`, `store_slices`, `store_epoch`, `store_journal`, `store_sessions`) and
+  their op-id dedupe rows.
 - Upgrades are IN PLACE on boot. A database written by the 1.5.x plugin (v1.0.x, schema v3) gains
-  four nullable `api_keys` columns (`allowed_scopes_ext`, `idp_subject`, `binding_mode`,
-  `minted_by`), `usage_metering.priced_from_ms` (default 0, and part of the metering key, so a
+  five nullable `api_keys` columns (`allowed_scopes_ext`, `idp_subject`, `binding_mode`,
+  `minted_by`, `idp_provider`), `usage_metering.priced_from_ms` (default 0, and part of the metering key, so a
   rate-card change inside a day opens a second cell), and the new tables. No existing row is
   dropped or rewritten.
 
 ## Config
 
-Configured under the `mysql` module name.
+Configured under the `mysql` module name. The only setting is `url`; any other key is refused
+(`invalid mysql plugin config: unknown setting ... (accepted: url)`), as is a non-string `url`.
+
+URL parameters honoured: `user`, `password`, `host`, `port`, `socket`, `db_name`, `compress`,
+`secure_auth`, `enable_cleartext_plugin`, `tcp_connect_timeout_ms`, `max_allowed_packet`.
+
+URL parameters REFUSED (never silently ignored), each with a "not supported by this store" message:
+`pool_min`, `pool_max` (the store keeps 8 connections over the host's connector), `prefer_socket`,
+`reset_connection`, `check_health`, `tcp_keepalive_time_ms`, `tcp_keepalive_probe_interval_secs`,
+`tcp_keepalive_probe_count`, `tcp_user_timeout_ms`, `stmt_cache_size`, and every TLS parameter
+(`ssl*`, `tls*`, `require_ssl`, `verify_ca`, `verify_identity`): TLS is not supported by this store.
+A URL error never echoes the password; a database stamped with a newer schema than this build is
+refused at open.
 
 ## Build
 

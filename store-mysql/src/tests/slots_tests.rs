@@ -1,22 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! The store v3 slots ([`StoreSlots`]) against a live MySQL: the durable `op_id` dedupe (S1-S4),
-//! the money slots and window caps, the journal, sessions and the kernel's records.
+//! The store v3 slots ([`StoreSlots`]) against a live MySQL: the durable `op_id` dedupe (S1-S4) and
+//! the kernel's records. The store keeps ledger counts and records; money is not its business.
 //!
-//! Every test names its own slots, streams, sessions and keys from a fresh ULID, so the suite runs
-//! in parallel against the one shared database and leaves nothing another test reads.
+//! Every test names its own buckets, schemas and keys from a fresh ULID, so the suite runs in
+//! parallel against the one shared database and leaves nothing another test reads.
 
 use super::{fresh_store, sample_key, test_url, MysqlStore};
-use busbar_contract::abi::sdk::store::{
-    Cap, CapsRefused, Cell, CellKey, Dimension, Grant, OpRefused, ReserveRefused,
-};
+use busbar_contract::abi::sdk::store::OpRefused;
 use busbar_contract::abi::store::OpId;
-use busbar_contract::kinds::{Head, RecordBytes};
-use busbar_contract::records::{AuditRecord, RecordStore, UsageDelta};
-
-/// The epoch every draw here states (fixed at 0 until WIRE-STORE adds the advance).
-const EPOCH: u64 = 0;
+use busbar_contract::records::{RecordStore, UsageDelta};
+use mysql::prelude::Queryable;
 
 /// A name no other test (or earlier run) uses.
 fn fresh(tag: &str) -> String {
@@ -27,32 +22,6 @@ fn fresh(tag: &str) -> String {
 /// op triggers a sweep).
 fn op(counter: u64) -> OpId {
     OpId::from_parts(ulid::Ulid::new().random() as u64 | 1, counter * 2 + 1)
-}
-
-fn key(bucket: &str, window_start: u64) -> CellKey<'_> {
-    CellKey {
-        bucket,
-        pool: None,
-        dimension: Dimension::Requests,
-        window_start,
-    }
-}
-
-fn reserve(
-    s: &MysqlStore,
-    op: OpId,
-    epoch: u64,
-    cells: &[Cell<'_>],
-) -> Result<Vec<Grant>, ReserveRefused> {
-    let mut grants = Vec::new();
-    s.reserve(op, epoch, cells.iter().copied(), &mut grants)?;
-    Ok(grants)
-}
-
-fn release(s: &MysqlStore, op: OpId, items: &[(u64, u64)]) -> Result<Vec<u64>, OpRefused> {
-    let mut back = Vec::new();
-    s.slice_release(op, EPOCH, items.iter().copied(), &mut back)?;
-    Ok(back)
 }
 
 #[test]
@@ -109,255 +78,37 @@ fn an_op_id_write_applies_once_durably_and_a_different_body_conflicts() {
     assert_eq!(ledger.billable_requests, 2, "{ledger:?}");
 }
 
-/// S3: a refused op records nothing, so a retry under the same `op_id` is judged afresh; a fork
-/// anywhere in an audit batch rolls back the whole batch.
+/// S3: a refused op records nothing, so a retry under the same `op_id` is judged afresh, not as a
+/// conflict with the op that failed.
 #[test]
-fn a_failed_batch_applies_nothing_and_records_nothing() {
+fn a_refused_op_applies_nothing_and_records_nothing() {
+    use busbar_contract::records::{PlaneDisposition, PlaneRecord, PlaneSelector};
     let Some(s) = fresh_store() else { return };
-    let base = 9_000_000_000 + (ulid::Ulid::new().random() as u64 % 1_000_000_000);
-    let rec = |seq: u64, action: &str| AuditRecord {
+    let parent = fresh("refused");
+    let rec = |seq: u64, body: &[u8]| PlaneRecord {
+        kind: "slots_test".into(),
+        id: format!("{parent}-{seq}"),
+        parent: Some(parent.clone()),
         seq,
-        ts: 1_700_000_000,
-        action: action.into(),
-        resource: "slots-test".into(),
-        outcome: "ok".into(),
-        principal: "tester".into(),
-        prev_hash: String::new(),
-        hash: format!("h{seq}"),
+        ts: 1,
+        disposition: PlaneDisposition::Active,
+        body: body.to_vec(),
     };
-    s.append_audit(&rec(base, "first")).expect("seed");
-    let id = op(2);
-    let forked = [rec(base + 1, "new"), rec(base, "forked")];
+    s.append_plane_record_op(op(2), rec(1, b"first").view())
+        .expect("seed");
+    // The same position with another body is a fork: refused, nothing stored.
+    let id = op(3);
     assert!(matches!(
-        s.append_audit_batch(id, &forked),
+        s.append_plane_record_op(id, rec(1, b"forked").view()),
         Err(OpRefused::Failed(_))
     ));
-    let stored: Vec<u64> = s
-        .list_audit()
-        .expect("list_audit")
-        .into_iter()
-        .map(|r| r.seq)
-        .filter(|q| *q == base || *q == base + 1)
-        .collect();
-    assert_eq!(
-        stored,
-        vec![base],
-        "the batch's first record was rolled back"
-    );
     // Not recorded: the same op id with a DIFFERENT (good) body is judged afresh, not a conflict.
-    s.append_audit_batch(id, &[rec(base + 1, "new")])
+    s.append_plane_record_op(id, rec(2, b"second").view())
         .expect("a retry after a failure is new");
-}
-
-#[test]
-fn reserve_needs_a_cap_grants_whole_cells_and_refuses_past_the_cap() {
-    let Some(s) = fresh_store() else { return };
-    let bucket = fresh("reserve");
-    let k = key(&bucket, 60);
-    let cell = |amount| Cell { key: k, amount };
-    assert_eq!(
-        reserve(&s, op(3), EPOCH, &[cell(1)]),
-        Err(ReserveRefused::NoCap { cell: 0 })
-    );
-    s.window_caps(
-        op(4),
-        &[Cap {
-            key: k,
-            cap: 5,
-            config_gen: 1,
-        }],
-    )
-    .expect("cap");
-    let id = op(5);
-    let g = reserve(&s, id, EPOCH, &[cell(2), cell(3)]).expect("2 + 3 fits 5");
-    assert_eq!(g.iter().map(|g| g.granted).collect::<Vec<_>>(), vec![2, 3]);
-    assert_ne!(g[0].slice_id, g[1].slice_id);
-    // S1: the replay answers the ORIGINAL grants and draws nothing more.
-    assert_eq!(reserve(&s, id, EPOCH, &[cell(2), cell(3)]), Ok(g.clone()));
-    assert_eq!(
-        reserve(&s, id, EPOCH, &[cell(1)]),
-        Err(ReserveRefused::Conflict)
-    );
-    assert_eq!(
-        reserve(&s, op(6), EPOCH, &[cell(1)]),
-        Err(ReserveRefused::Exhausted { cell: 0 })
-    );
-    // A release clamps to what the slice holds and frees that much.
-    let back = release(&s, op(7), &[(g[1].slice_id, 10), (g[1].slice_id, 1)]).expect("release");
-    assert_eq!(
-        back,
-        vec![3, 0],
-        "clamped, and the emptied slice gives back 0"
-    );
-    assert_eq!(
-        release(&s, op(8), &[(g[1].slice_id, 1)]),
-        Ok(vec![0]),
-        "a closed slice answers 0"
-    );
-    assert_eq!(
-        release(&s, op(12), &[(u64::MAX, 1)]),
-        Err(OpRefused::Failed(format!(
-            "slice_release: slice {} is not held",
-            u64::MAX
-        ))),
-        "a slice never granted fails the release"
-    );
-    reserve(&s, op(9), EPOCH, &[cell(3)]).expect("the released 3 can be drawn again");
-}
-
-/// A RELEASE ON WINDOW 0 IS FINAL (`abi::store::money` slice life (e)): the release takes back
-/// the unspent it names, the slice closes (another release answers 0), and the spent rest stays
-/// counted against the cap. A rolling window keeps the partial-release rule.
-#[test]
-fn a_release_on_window_zero_is_final() {
-    let Some(s) = fresh_store() else { return };
-    let bucket = fresh("window-0");
-    let zero = CellKey {
-        bucket: &bucket,
-        pool: None,
-        dimension: Dimension::NanoUnits,
-        window_start: 0,
-    };
-    s.window_caps(
-        op(30),
-        &[Cap {
-            key: zero,
-            cap: 10,
-            config_gen: 1,
-        }],
-    )
-    .expect("cap");
-    let draw = |amount| [Cell { key: zero, amount }];
-    let g = reserve(&s, op(31), EPOCH, &draw(6)).expect("6 of 10");
-    let id = g[0].slice_id;
-    assert_eq!(release(&s, op(32), &[(id, 2)]), Ok(vec![2]));
-    assert_eq!(
-        release(&s, op(33), &[(id, 4)]),
-        Ok(vec![0]),
-        "a window-0 slice stayed open after its release"
-    );
-    reserve(&s, op(34), EPOCH, &draw(6)).expect("the returned 2 are drawable");
-    assert_eq!(
-        reserve(&s, op(35), EPOCH, &draw(1)),
-        Err(ReserveRefused::Exhausted { cell: 0 }),
-        "the spent 4 stay counted"
-    );
-
-    // The control: on a rolling window a partial release leaves the rest open.
-    let rolling = fresh("rolling");
-    let k = key(&rolling, 60);
-    s.window_caps(
-        op(36),
-        &[Cap {
-            key: k,
-            cap: 10,
-            config_gen: 1,
-        }],
-    )
-    .expect("cap");
-    let g = reserve(&s, op(37), EPOCH, &[Cell { key: k, amount: 6 }]).expect("draw");
-    assert_eq!(release(&s, op(38), &[(g[0].slice_id, 2)]), Ok(vec![2]));
-    assert_eq!(release(&s, op(39), &[(g[0].slice_id, 4)]), Ok(vec![4]));
-}
-
-/// Epoch 0 until WIRE-STORE adds the advance: no epoch a caller states is refused, and a grant,
-/// which `reserve` gives no lifetime, never expires.
-#[test]
-fn no_epoch_is_stale_and_a_grant_never_expires() {
-    let Some(s) = fresh_store() else { return };
-    let bucket = fresh("epoch");
-    let k = key(&bucket, 0);
-    s.window_caps(
-        op(10),
-        &[Cap {
-            key: k,
-            cap: 100,
-            config_gen: 1,
-        }],
-    )
-    .expect("cap");
-    for (i, epoch) in [7, 0, u64::MAX].into_iter().enumerate() {
-        let g = reserve(&s, op(11 + i as u64), epoch, &[Cell { key: k, amount: 1 }])
-            .expect("never stale");
-        assert_eq!(g[0].valid_until_ms, u64::MAX);
-    }
-}
-
-#[test]
-fn window_caps_newest_generation_wins_and_an_equal_generation_must_agree() {
-    let Some(s) = fresh_store() else { return };
-    let bucket = fresh("caps");
-    let k = key(&bucket, 120);
-    let cap = |cap, config_gen| Cap {
-        key: k,
-        cap,
-        config_gen,
-    };
-    s.window_caps(op(13), &[cap(1, 2)]).expect("first push");
-    s.window_caps(op(14), &[cap(9, 1)])
-        .expect("an older generation is ignored");
-    assert_eq!(
-        s.window_caps(op(15), &[cap(1, 2), cap(7, 2)]),
-        Err(CapsRefused::CapConflict { index: 1 })
-    );
-    let cell = Cell { key: k, amount: 1 };
-    reserve(&s, op(16), EPOCH, &[cell]).expect("cap 1 holds one");
-    assert_eq!(
-        reserve(&s, op(17), EPOCH, &[cell]),
-        Err(ReserveRefused::Exhausted { cell: 0 })
-    );
-    s.window_caps(op(18), &[cap(2, 3)])
-        .expect("a newer generation raises it");
-    reserve(&s, op(19), EPOCH, &[cell]).expect("cap 2 holds a second");
-}
-
-#[test]
-fn the_journal_appends_in_order_and_states_its_heads() {
-    let Some(s) = fresh_store() else { return };
-    let stream = fresh("journal");
-    let r = |b: &[u8]| RecordBytes::new(b.to_vec()).unwrap();
-    let id = op(20);
-    let h = s
-        .append_batch(id, &stream, &[r(b"a"), r(b"b")])
-        .expect("append");
-    assert_eq!(h, Head { seq: 2, epoch: 0 });
-    assert_eq!(
-        s.append_batch(id, &stream, &[r(b"a"), r(b"b")]),
-        Ok(h),
-        "a replay answers the original head"
-    );
-    let h = s.append_batch(op(21), &stream, &[r(b"c")]).expect("append");
-    assert_eq!(h.seq, 3);
-    let heads = s.heads().expect("heads");
-    assert!(
-        heads.contains(&(stream.clone(), Head { seq: 3, epoch: 0 })),
-        "{heads:?}"
-    );
-}
-
-#[test]
-fn sessions_upsert_list_by_principal_and_remove() {
-    let Some(s) = fresh_store() else { return };
-    let principal = fresh("principal");
-    let base = ulid::Ulid::new().random() as u64 >> 1;
-    s.session_put(base + 2, "node-b", &principal).expect("put");
-    s.session_put(base + 1, "node-a", &principal).expect("put");
-    s.session_put(base + 1, "node-c", &principal)
-        .expect("upsert");
-    assert_eq!(
-        s.sessions_for(&principal).expect("list"),
-        vec![
-            (base + 1, "node-c".to_string()),
-            (base + 2, "node-b".to_string())
-        ]
-    );
-    s.session_remove(base + 1).expect("remove");
-    s.session_remove(base + 1)
-        .expect("an absent session removes Ok");
-    assert_eq!(
-        s.sessions_for(&principal).expect("list"),
-        vec![(base + 2, "node-b".to_string())]
-    );
+    let chain = s
+        .list_plane_records("slots_test", &PlaneSelector::Parent(parent.as_str().into()))
+        .expect("list");
+    assert_eq!(chain, vec![b"first".to_vec(), b"second".to_vec()]);
 }
 
 #[test]
@@ -390,7 +141,6 @@ fn records_upsert_read_back_and_scan_a_prefix_in_key_order() {
 /// row that is not there is `Ok`.
 #[test]
 fn an_empty_put_removes_the_row() {
-    use mysql::prelude::Queryable;
     let Some(s) = fresh_store() else { return };
     let schema = fresh("schema");
     let held = || -> i64 {
@@ -464,4 +214,185 @@ fn an_op_id_plane_append_dedupes_and_still_refuses_a_fork() {
         .list_plane_records("slots_test", &PlaneSelector::Parent(parent.as_str().into()))
         .expect("list");
     assert_eq!(chain, vec![b"one".to_vec()]);
+}
+
+// ── THE v10 UPGRADE ────────────────────────────────────────────────────────────────────────────
+
+/// A store in a DATABASE of its own, for a test that rewrites the schema. The database is dropped
+/// with the guard.
+struct Iso {
+    db: super::ScratchDb,
+    store: Option<MysqlStore>,
+}
+
+impl Iso {
+    fn new(tag: &str) -> Option<Self> {
+        let db = super::ScratchDb::new(&format!("iso_{tag}"))?;
+        // Building a whole schema is a DDL burst; one at a time (see `lock_fresh_database_ddl`).
+        let store = {
+            let _ddl = super::lock_fresh_database_ddl();
+            MysqlStore::connect(&db.url).expect("connect the isolated store")
+        };
+        Some(Iso {
+            db,
+            store: Some(store),
+        })
+    }
+
+    fn s(&self) -> &MysqlStore {
+        self.store.as_ref().expect("open")
+    }
+
+    /// A RESTART: the instance goes away and a fresh one opens over the same state.
+    fn restart(&mut self) {
+        self.store = None;
+        self.store = Some(MysqlStore::connect(&self.db.url).expect("reopen"));
+    }
+}
+
+/// The v9 -> v10 step: the tables of the deleted slots are dropped, the dedupe rows of the deleted
+/// slots go with them, and a kept slot's op replays across the upgrade, applying nothing.
+#[test]
+fn the_v10_upgrade_drops_the_money_and_dead_slot_tables() {
+    use busbar_contract::records::{PlaneDisposition, PlaneRecord, PlaneSelector};
+    let Some(mut iso) = Iso::new("v10") else {
+        return;
+    };
+    let bucket = fresh("v10");
+    let delta = UsageDelta {
+        requests: 3,
+        billable_requests: 2,
+        models: Vec::new(),
+    };
+    let usage_op = op(1);
+    iso.s()
+        .add_usage_op(usage_op, &bucket, 60, &delta)
+        .expect("applies");
+    let parent = fresh("v10-chain");
+    let rec = PlaneRecord {
+        kind: "slots_test".into(),
+        id: parent.clone(),
+        parent: Some(parent.clone()),
+        seq: 1,
+        ts: 1,
+        disposition: PlaneDisposition::Active,
+        body: b"one".to_vec(),
+    };
+    let plane_op = op(2);
+    iso.s()
+        .append_plane_record_op(plane_op, rec.view())
+        .expect("applies");
+    let dead_op = op(3);
+    let mut c = iso.db.conn();
+    // Put the database back to what a v9 build left: the dead slots' tables with rows in them, and
+    // their dedupe rows next to the kept ones.
+    for stmt in [
+        "CREATE TABLE store_caps (bucket VARCHAR(191) NOT NULL PRIMARY KEY, cap BIGINT UNSIGNED NOT NULL)",
+        "CREATE TABLE store_slices (slice_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, \
+         remaining BIGINT UNSIGNED NOT NULL, valid_until_ms BIGINT UNSIGNED NOT NULL DEFAULT 0)",
+        "CREATE TABLE store_epoch (one TINYINT UNSIGNED PRIMARY KEY, epoch BIGINT UNSIGNED NOT NULL)",
+        "CREATE TABLE store_journal (stream VARCHAR(191) NOT NULL, seq BIGINT UNSIGNED NOT NULL, \
+         record VARBINARY(512) NOT NULL, PRIMARY KEY (stream, seq))",
+        "CREATE TABLE store_sessions (session BIGINT UNSIGNED PRIMARY KEY, node TEXT NOT NULL, \
+         principal VARCHAR(191) NOT NULL)",
+        "INSERT INTO store_caps VALUES ('b', 5)",
+        "INSERT INTO store_slices (remaining) VALUES (5)",
+        "INSERT INTO store_epoch VALUES (1, 7)",
+        "INSERT INTO store_journal VALUES ('s', 1, 'r')",
+        "INSERT INTO store_sessions VALUES (1, 'n', 'p')",
+        "UPDATE store_meta SET v = '9' WHERE k = 'schema_version'",
+    ] {
+        c.query_drop(stmt).unwrap();
+    }
+    for body in [
+        "reserve:1:[]",
+        "slice_release:1:[]",
+        "window_caps:[]",
+        "append_batch:\"s\":[]",
+        "append_audit:AuditRecord",
+        "session_put:1",
+    ] {
+        c.exec_drop(
+            "INSERT INTO store_ops (op_id, recorded_at, body, answer) VALUES (?, ?, ?, '')",
+            (&op(40).0[..], 1u64, body),
+        )
+        .unwrap();
+    }
+    c.exec_drop(
+        "INSERT INTO store_ops (op_id, recorded_at, body, answer) VALUES (?, ?, 'reserve:1:[]', '')",
+        (&dead_op.0[..], 1u64),
+    )
+    .unwrap();
+    let ops_before: u64 = c
+        .query_first("SELECT COUNT(*) FROM store_ops")
+        .unwrap()
+        .unwrap();
+    drop(c);
+
+    iso.restart();
+
+    let mut c = iso.db.conn();
+    for table in [
+        "store_caps",
+        "store_slices",
+        "store_epoch",
+        "store_journal",
+        "store_sessions",
+    ] {
+        let n: u64 = c
+            .exec_first(
+                "SELECT COUNT(*) FROM information_schema.tables \
+                 WHERE table_schema = DATABASE() AND table_name = ?",
+                (table,),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(n, 0, "{table} is gone");
+    }
+    let version: String = c
+        .query_first("SELECT v FROM store_meta WHERE k = 'schema_version'")
+        .unwrap()
+        .unwrap();
+    assert_eq!(version, crate::SCHEMA_VERSION.to_string());
+    let bodies: Vec<String> = c.query("SELECT CAST(body AS CHAR) FROM store_ops").unwrap();
+    assert!(
+        bodies.iter().all(|b| b.starts_with("add_usage_batch:")
+            || b.starts_with("add_metering_batch:")
+            || b.starts_with("append_plane_record:")),
+        "only the kept ops' dedupe rows remain: {bodies:?}"
+    );
+    assert_eq!(
+        bodies.len(),
+        2,
+        "the two kept ops' rows survive of {ops_before}: {bodies:?}"
+    );
+    drop(c);
+
+    // A retry across the upgrade answers its original and applies nothing.
+    iso.s()
+        .add_usage_op(usage_op, &bucket, 60, &delta)
+        .expect("the usage op replays across the upgrade");
+    iso.s()
+        .append_plane_record_op(plane_op, rec.view())
+        .expect("the plane op replays across the upgrade");
+    assert_eq!(
+        iso.s().add_usage_op(
+            usage_op,
+            &bucket,
+            60,
+            &UsageDelta {
+                requests: 4,
+                ..delta.clone()
+            }
+        ),
+        Err(OpRefused::Conflict),
+        "a different body under the kept op id is still a conflict"
+    );
+    let ledger = iso.s().get_usage(&bucket, 60).expect("get_usage");
+    assert_eq!(ledger.requests, 3, "applied exactly once: {ledger:?}");
+    let chain = iso
+        .s()
+        .list_plane_records("slots_test", &PlaneSelector::Parent(parent.as_str().into()))
+        .expect("list");
+    assert_eq!(chain, vec![b"one".to_vec()], "appended exactly once");
 }

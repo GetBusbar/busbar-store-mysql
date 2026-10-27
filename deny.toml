@@ -1,5 +1,5 @@
 # RENDERED by `busbar-release plugin heal` from GetBusbar/busbar-release template/ and busbar's
-# `.github/fleet/deps.toml` at 565f24f25e42370f3f8b5d8b2d91d56950eb4866; a hand edit is overwritten by the next sync. CI runs
+# `.github/fleet/deps.toml` at e2fc6c458aaf1c3406954a65a942a4c7acae88ce; a hand edit is overwritten by the next sync. CI runs
 # `cargo deny check` on it (busbar's plugin-ci.yml at the pin). The license allowlist is busbar's own;
 # the one reviewed git source is busbar itself, at the pin.
 [graph]
@@ -105,6 +105,8 @@ deny = [
     { crate = "hyper:>=2.0.0", reason = "busbar resolves hyper to 1.11.1; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "hyper-util:<0.1.0", reason = "busbar resolves hyper-util to 0.1.20; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "hyper-util:>=0.2.0", reason = "busbar resolves hyper-util to 0.1.20; a plugin may not pull a second version (OWNER 2026-10-02)" },
+    { crate = "idna:<1.0.0", reason = "busbar resolves idna to 1.1.0; a plugin may not pull a second version (OWNER 2026-10-02)" },
+    { crate = "idna:>=2.0.0", reason = "busbar resolves idna to 1.1.0; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "idna_adapter:<1.0.0", reason = "busbar resolves idna_adapter to 1.1.0; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "idna_adapter:>=2.0.0", reason = "busbar resolves idna_adapter to 1.1.0; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "indexmap:<2.0.0", reason = "busbar resolves indexmap to 2.14.2; a plugin may not pull a second version (OWNER 2026-10-02)" },
@@ -133,10 +135,10 @@ deny = [
     { crate = "opentelemetry-proto:>=0.33.0", reason = "busbar resolves opentelemetry-proto to 0.32.0; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "proc-macro2:<1.0.0", reason = "busbar resolves proc-macro2 to 1.0.106; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "proc-macro2:>=2.0.0", reason = "busbar resolves proc-macro2 to 1.0.106; a plugin may not pull a second version (OWNER 2026-10-02)" },
-    { crate = "proptest:<1.0.0", reason = "busbar resolves proptest to 1.11.0; a plugin may not pull a second version (OWNER 2026-10-02)" },
-    { crate = "proptest:>=2.0.0", reason = "busbar resolves proptest to 1.11.0; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "prost:<0.14.0", reason = "busbar resolves prost to 0.14.3; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "prost:>=0.15.0", reason = "busbar resolves prost to 0.14.3; a plugin may not pull a second version (OWNER 2026-10-02)" },
+    { crate = "psl:<2.0.0", reason = "busbar resolves psl to 2.1.244; a plugin may not pull a second version (OWNER 2026-10-02)" },
+    { crate = "psl:>=3.0.0", reason = "busbar resolves psl to 2.1.244; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "rcgen:<0.14.0", reason = "busbar resolves rcgen to 0.14.10; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "rcgen:>=0.15.0", reason = "busbar resolves rcgen to 0.14.10; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "reqwest:<0.12.0", reason = "busbar resolves reqwest to 0.12.28; a plugin may not pull a second version (OWNER 2026-10-02)" },
@@ -173,8 +175,8 @@ deny = [
     { crate = "tikv-jemalloc-ctl:>=0.7.0", reason = "busbar resolves tikv-jemalloc-ctl to 0.6.1; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "tikv-jemallocator:<0.6.0", reason = "busbar resolves tikv-jemallocator to 0.6.1; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "tikv-jemallocator:>=0.7.0", reason = "busbar resolves tikv-jemallocator to 0.6.1; a plugin may not pull a second version (OWNER 2026-10-02)" },
-    { crate = "tokio:<1.0.0", reason = "busbar resolves tokio to 1.53.1; a plugin may not pull a second version (OWNER 2026-10-02)" },
-    { crate = "tokio:>=2.0.0", reason = "busbar resolves tokio to 1.53.1; a plugin may not pull a second version (OWNER 2026-10-02)" },
+    { crate = "tokio:<1.0.0", reason = "busbar resolves tokio to 1.53.3; a plugin may not pull a second version (OWNER 2026-10-02)" },
+    { crate = "tokio:>=2.0.0", reason = "busbar resolves tokio to 1.53.3; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "tokio-rustls:<0.26.0", reason = "busbar resolves tokio-rustls to 0.26.5; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "tokio-rustls:>=0.27.0", reason = "busbar resolves tokio-rustls to 0.26.5; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "tokio-tungstenite:<0.29.0", reason = "busbar resolves tokio-tungstenite to 0.29.0; a plugin may not pull a second version (OWNER 2026-10-02)" },
@@ -195,10 +197,10 @@ deny = [
     { crate = "tungstenite:>=0.30.0", reason = "busbar resolves tungstenite to 0.29.0; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "url:<2.0.0", reason = "busbar resolves url to 2.5.8; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "url:>=3.0.0", reason = "busbar resolves url to 2.5.8; a plugin may not pull a second version (OWNER 2026-10-02)" },
-    { crate = "rustls-webpki:<0.103.0", reason = "busbar resolves rustls-webpki to 0.103.15; a plugin may not pull a second version (OWNER 2026-10-02)" },
-    { crate = "rustls-webpki:>=0.104.0", reason = "busbar resolves rustls-webpki to 0.103.15; a plugin may not pull a second version (OWNER 2026-10-02)" },
-    { crate = "webpki-roots:<1.0.0", reason = "busbar resolves webpki-roots to 1.0.7; a plugin may not pull a second version (OWNER 2026-10-02)" },
-    { crate = "webpki-roots:>=2.0.0", reason = "busbar resolves webpki-roots to 1.0.7; a plugin may not pull a second version (OWNER 2026-10-02)" },
+    { crate = "rustls-webpki:<0.103.0", reason = "busbar resolves rustls-webpki to 0.103.16; a plugin may not pull a second version (OWNER 2026-10-02)" },
+    { crate = "rustls-webpki:>=0.104.0", reason = "busbar resolves rustls-webpki to 0.103.16; a plugin may not pull a second version (OWNER 2026-10-02)" },
+    { crate = "webpki-roots:<1.0.0", reason = "busbar resolves webpki-roots to 1.0.10; a plugin may not pull a second version (OWNER 2026-10-02)" },
+    { crate = "webpki-roots:>=2.0.0", reason = "busbar resolves webpki-roots to 1.0.10; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "zeroize:<1.0.0", reason = "busbar resolves zeroize to 1.9.0; a plugin may not pull a second version (OWNER 2026-10-02)" },
     { crate = "zeroize:>=2.0.0", reason = "busbar resolves zeroize to 1.9.0; a plugin may not pull a second version (OWNER 2026-10-02)" },
 ]
