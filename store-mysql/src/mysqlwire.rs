@@ -1,27 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! THE MYSQL CLIENT PROTOCOL OVER THE HOST'S CONNECTOR: the 1.5.5 `mysql` driver's connection logic
-//! (`mysql` 26, the `minimal` build the store shipped with), every byte through the op's one
-//! connection ([`Wire`], the store SDK's `wire`), so this store opens no socket of its own (busbar
-//! THE DESIGN, the connections section; ARCHITECT rulings 2026-10-03 on Q-L14-1 / Q-L16-2).
+//! The MySQL client protocol over the host's connector: the `mysql` driver's connection logic
+//! (`mysql` 26, the `minimal` build), every byte through the op's one connection ([`Wire`], the
+//! store SDK's `wire`), so this store opens no socket of its own.
 //!
 //! The protocol itself is `mysql_common` 0.35.5, the sans-IO core that driver is built on: the
 //! packet codec (plain and compressed), the v10 handshake, `mysql_native_password` and
 //! `caching_sha2_password` (its RSA full authentication included), `COM_QUERY` (text rows),
-//! `COM_STMT_PREPARE`/`COM_STMT_EXECUTE` (binary rows), and `Value`/`Row`/`FromRow`/`params!`. So
-//! every parameter and column converts exactly as it did over the driver.
+//! `COM_STMT_PREPARE`/`COM_STMT_EXECUTE` (binary rows), and `Value`/`Row`/`FromRow`/`params!`.
 //!
 //! The surface mirrors the driver's (`Opts::from_url`, `query*`/`exec*`, `Transaction`,
-//! `affected_rows`, `Error` with its `Display`) with every call `async`, so the
-//! store's SQL bodies are the 1.5.5 bodies with `.await`. What the driver's pool did around each
-//! checkout is kept too (`MysqlStore`'s kept set): a kept connection is pinged before it is used
-//! (`check_health`) and reset when it comes back (`COM_RESET_CONNECTION` and the store's `init`
-//! statements again, `reset_connection`), and a `Transaction` dropped without `commit` is rolled
-//! back before the connection's next statement, as the driver's was.
+//! `affected_rows`, `Error` with its `Display`) with every call `async`. What the driver's pool
+//! does around each checkout is kept too (`MysqlStore`'s kept set): a kept connection is pinged
+//! before it is used (`check_health`) and reset when it comes back (`COM_RESET_CONNECTION` and the
+//! store's `init` statements again, `reset_connection`), and a `Transaction` dropped without
+//! `commit` is rolled back before the connection's next statement.
 //!
-//! TLS: the 1.5.5 build had none (its `minimal` features compile no TLS stack, and its URL names no
-//! TLS parameter), so neither does this; a URL naming one is refused as it was.
+//! TLS: there is none (the `minimal` features compile no TLS stack, and the URL names no TLS
+//! parameter); a URL naming one is refused.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -53,8 +50,6 @@ pub use mysql_common::row::Row;
 pub use mysql_common::value::Value;
 
 use busbar_contract::abi::sdk::store::wire::Wire;
-
-// ── errors (the driver's, in its words) ─────────────────────────────────────────────────────────
 
 /// A server-side failure (an ERR packet).
 #[derive(Eq, PartialEq, Clone)]
@@ -257,8 +252,6 @@ impl From<DriverError> for Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
-
-// ── the connection URL (the driver's `Opts::from_url`) ──────────────────────────────────────────
 
 /// The driver's per-connection prepared-statement cache.
 const STMT_CACHE_DEFAULT: usize = 32;
@@ -515,8 +508,6 @@ impl Opts {
     }
 }
 
-// ── the transport ───────────────────────────────────────────────────────────────────────────────
-
 /// Where a connection's bytes go: the op's wire (the host's connector), or, in this crate's own
 /// tests only, a plain TCP stream to the live server (the internals' tests drive the client
 /// directly; nothing here is in the shipped image).
@@ -565,12 +556,17 @@ impl Io {
     }
 }
 
-// ── the connection ──────────────────────────────────────────────────────────────────────────────
-
 /// A prepared statement, as the connection's cache keeps it.
 struct Stmt {
     id: u32,
     num_params: u16,
+}
+
+/// A query text parsed once: the positional text sent to the server and, for a named query, the
+/// order its parameters were named in.
+struct ParsedQuery {
+    positional: Vec<u8>,
+    named: Option<Vec<Vec<u8>>>,
 }
 
 /// What a connection carries across the ops that reuse it (the store SDK's kept set keeps it with
@@ -588,6 +584,9 @@ struct State {
     auth_plugin: AuthPlugin<'static>,
     /// Prepared statements by their (positional) query text.
     stmts: HashMap<Vec<u8>, Arc<Stmt>>,
+    /// Each query text's parse into (positional text, named-parameter order), so a repeated query
+    /// is not re-parsed per execute. Bounded by `stmt_cache_size` like `stmts`.
+    parsed: HashMap<String, Arc<ParsedQuery>>,
     /// The last OK packet (affected rows, last insert id).
     ok: Option<OkPacket<'static>>,
     has_results: bool,
@@ -602,16 +601,6 @@ type Kept = Arc<Mutex<Option<State>>>;
 enum Meta {
     Empty,
     Rows(Arc<[Column]>),
-}
-
-/// What an `exec_iter` answered: the rows it affected.
-pub struct Affected(u64);
-
-impl Affected {
-    #[must_use]
-    pub fn affected_rows(&self) -> u64 {
-        self.0
-    }
 }
 
 /// ONE CONNECTION TO THE SERVER over the op's transport. It is KEPT for the instance's next op
@@ -646,7 +635,7 @@ impl fmt::Debug for Conn {
     }
 }
 
-/// The connect attributes the 1.5.5 driver sent (`performance_schema.session_connect_attrs`).
+/// The connect attributes the driver sends (`performance_schema.session_connect_attrs`).
 fn connect_attrs() -> HashMap<String, String> {
     let program_name = std::env::args_os()
         .next()
@@ -681,6 +670,7 @@ impl State {
             nonce: Vec::new(),
             auth_plugin: AuthPlugin::MysqlNativePassword,
             stmts: HashMap::new(),
+            parsed: HashMap::new(),
             ok: None,
             has_results: false,
             socket,
@@ -817,8 +807,6 @@ impl Conn {
         Ok(())
     }
 
-    // ── packets ────────────────────────────────────────────────────────────────────────────────
-
     async fn raw_read(&mut self, buf: &mut Vec<u8>) -> Result<()> {
         loop {
             match self.st.codec.decode(&mut self.st.inbuf, buf) {
@@ -938,8 +926,6 @@ impl Conn {
     fn has_capability(&self, flag: CapabilityFlags) -> bool {
         self.st.caps.contains(flag)
     }
-
-    // ── the handshake ──────────────────────────────────────────────────────────────────────────
 
     fn client_flags(&self) -> CapabilityFlags {
         let mut flags = CapabilityFlags::CLIENT_PROTOCOL_41
@@ -1208,8 +1194,6 @@ impl Conn {
         self.continue_auth(true).await
     }
 
-    // ── result sets ────────────────────────────────────────────────────────────────────────────
-
     async fn handle_result_set(&mut self) -> Result<Meta> {
         if self.more_results_exists() {
             self.st.codec.sync_seq_id();
@@ -1312,8 +1296,6 @@ impl Conn {
         self.rows(meta, false).await
     }
 
-    // ── prepared statements ────────────────────────────────────────────────────────────────────
-
     async fn prepare(&mut self, query: &[u8]) -> Result<Arc<Stmt>> {
         if let Some(s) = self.st.stmts.get(query) {
             return Ok(s.clone());
@@ -1368,18 +1350,34 @@ impl Conn {
 
     async fn execute(&mut self, query: &str, params: Params) -> Result<Meta> {
         self.settle().await?;
-        let parsed = ParsedNamedParams::parse(query.as_bytes())
-            .map_err(|_| Error::DriverError(DriverError::MixedParams))?;
-        let named: Option<Vec<Vec<u8>>> = if parsed.params().is_empty() {
-            None
-        } else {
-            Some(parsed.params().iter().map(|p| p.to_vec()).collect())
+        let parsed = match self.st.parsed.get(query) {
+            Some(p) => p.clone(),
+            None => {
+                let p = ParsedNamedParams::parse(query.as_bytes())
+                    .map_err(|_| Error::DriverError(DriverError::MixedParams))?;
+                let named = if p.params().is_empty() {
+                    None
+                } else {
+                    Some(p.params().iter().map(|p| p.to_vec()).collect())
+                };
+                let parsed = Arc::new(ParsedQuery {
+                    positional: p.query().to_vec(),
+                    named,
+                });
+                let cap = self.st.opts.stmt_cache_size;
+                if cap > 0 {
+                    if self.st.parsed.len() >= cap {
+                        self.st.parsed.clear();
+                    }
+                    self.st.parsed.insert(query.to_owned(), parsed.clone());
+                }
+                parsed
+            }
         };
-        let positional = parsed.query().to_vec();
-        drop(parsed);
-        let stmt = self.prepare(&positional).await?;
+        let (positional, named) = (&parsed.positional, &parsed.named);
+        let stmt = self.prepare(positional).await?;
         let params = match params {
-            Params::Named(_) => match &named {
+            Params::Named(_) => match named {
                 Some(n) => params.into_positional(n).map_err(|e| {
                     Error::DriverError(DriverError::MissingNamedParameter(
                         String::from_utf8_lossy(&e.0).into_owned(),
@@ -1407,8 +1405,6 @@ impl Conn {
         self.write_packet(&buf).await?;
         self.handle_result_set().await
     }
-
-    // ── the driver's `Queryable` ───────────────────────────────────────────────────────────────
 
     /// `COM_QUERY`, every row (text protocol), as `T`.
     pub async fn query<T: FromRow>(&mut self, query: impl AsRef<str>) -> Result<Vec<T>> {
@@ -1463,16 +1459,6 @@ impl Conn {
         let params = params.into();
         let meta = self.execute(query.as_ref(), params).await?;
         self.rows(meta, true).await.map(drop)
-    }
-
-    /// A prepared statement; what it affected.
-    pub async fn exec_iter(
-        &mut self,
-        query: impl AsRef<str>,
-        params: impl Into<Params>,
-    ) -> Result<Affected> {
-        self.exec_drop(query, params).await?;
-        Ok(Affected(self.affected_rows()))
     }
 
     /// `COM_PING`.

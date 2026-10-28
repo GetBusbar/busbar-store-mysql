@@ -220,32 +220,6 @@ impl MysqlStore {
 
     // ── the store's internals, on its own client ───────────────────────────────────────────
 
-    pub(crate) fn run_v2_backfill_if_needed(
-        conn: &mut mysql::PooledConn,
-        prior_version: u32,
-        table: &str,
-    ) -> RecordStoreResult<()> {
-        let mut c = own_client_like(conn);
-        block_on(crate::MysqlStore::run_v2_backfill_if_needed(
-            &mut c,
-            prior_version,
-            table,
-        ))
-    }
-
-    pub(crate) fn run_v3_ascii_bin_fix_if_needed(
-        conn: &mut mysql::PooledConn,
-        prior_version: u32,
-        table: &str,
-    ) -> RecordStoreResult<()> {
-        let mut c = own_client_like(conn);
-        block_on(crate::MysqlStore::run_v3_ascii_bin_fix_if_needed(
-            &mut c,
-            prior_version,
-            table,
-        ))
-    }
-
     pub(crate) fn read_prior_version(
         conn: &mut mysql::PooledConn,
         table: &str,

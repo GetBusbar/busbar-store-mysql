@@ -135,6 +135,55 @@ fn records_upsert_read_back_and_scan_a_prefix_in_key_order() {
     assert!(keys(b"", 0).is_empty());
 }
 
+/// AN EMPTY PUT REMOVES THE ROW (slot 40's rule, ARCHITECT 2026-10-21): the host writes every
+/// strike as an empty `record_put` and reads empty as absent, so the row LEAVES the table:
+/// `record_get` answers `None`, `record_scan` never returns it, and the table shrinks. Removing a
+/// row that is not there is `Ok`.
+#[test]
+fn an_empty_put_removes_the_row() {
+    let Some(s) = fresh_store() else { return };
+    let schema = fresh("schema");
+    let held = || -> i64 {
+        s.conn()
+            .expect("a raw connection")
+            .exec_first(
+                "SELECT COUNT(*) FROM store_records WHERE schema_id = ?",
+                (schema.as_str(),),
+            )
+            .expect("count")
+            .unwrap_or_default()
+    };
+    s.record_put(&schema, b"a/1", b"one").expect("put");
+    s.record_put(&schema, b"a/2", b"two").expect("put");
+    assert_eq!(held(), 2);
+
+    s.record_put(&schema, b"a/1", b"").expect("strike");
+    assert_eq!(held(), 1, "the struck row left the table");
+    assert_eq!(s.record_get(&schema, b"a/1").expect("get"), None);
+    let scan: Vec<(Vec<u8>, Vec<u8>)> = s
+        .record_scan(&schema, b"a/", 10)
+        .expect("scan")
+        .into_iter()
+        .map(|(k, v)| (k, v.as_slice().to_vec()))
+        .collect();
+    assert_eq!(
+        scan,
+        vec![(b"a/2".to_vec(), b"two".to_vec())],
+        "a scan never returns a struck row"
+    );
+
+    s.record_put(&schema, b"a/9", b"")
+        .expect("a strike of nothing is Ok");
+    assert_eq!(held(), 1);
+    s.record_put(&schema, b"a/1", b"again").expect("put again");
+    assert_eq!(
+        s.record_get(&schema, b"a/1")
+            .expect("get")
+            .map(|r| r.as_slice().to_vec()),
+        Some(b"again".to_vec())
+    );
+}
+
 /// The plane-record `op_id` write and the key path still share the store's one schema.
 #[test]
 fn an_op_id_plane_append_dedupes_and_still_refuses_a_fork() {

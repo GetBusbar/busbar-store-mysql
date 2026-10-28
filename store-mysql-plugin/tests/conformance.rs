@@ -43,9 +43,57 @@ mod conformance_host;
 busbar_test_kit::conformance_suite! {
     door: busbar_store_mysql::door,
     cdylib: "busbar_store_mysql_plugin",
-    inputs: include_str!("conformance.json"),
+    inputs: inputs(),
     host: conformance_host::host,
     namespace: (create_fold_database, drop_fold_database),
+}
+
+/// `conformance.json`, with its settings' url pointed at the live MySQL this run was given: the
+/// scheme, credentials, host and port of `BUSBAR_TEST_MYSQL_URL` (CI starts the service on a free
+/// port and names it there), the database left as the per-fold `{fold}`. With the variable unset
+/// the file's own local default stands.
+fn inputs() -> &'static str {
+    static INPUTS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    INPUTS.get_or_init(|| {
+        let file = include_str!("conformance.json");
+        match std::env::var("BUSBAR_TEST_MYSQL_URL") {
+            Ok(url) => with_server(file, &url),
+            Err(_) => file.to_owned(),
+        }
+    })
+}
+
+/// `file` (conformance.json) with the server its settings' url names replaced by `server`'s.
+fn with_server(file: &str, server: &str) -> String {
+    let mut v: serde_json::Value = serde_json::from_str(file).expect("conformance.json is JSON");
+    let (scheme, rest) = server
+        .split_once("://")
+        .unwrap_or_else(|| panic!("BUSBAR_TEST_MYSQL_URL is not a url: {server}"));
+    let (authority, tail) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let query = tail.find('?').map_or("", |q| &tail[q..]);
+    v["settings"]["url"] =
+        serde_json::Value::String(format!("{scheme}://{authority}/{{fold}}{query}"));
+    v.to_string()
+}
+
+/// How long the suite waits for the live server to take the test client as root.
+const ROOT_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// A connection of the `mysql` driver's own as the server's root, retried until `wait` is up (a
+/// service container's port can answer before the server serves). PANICS naming the address and the
+/// last error when the server never takes it.
+fn connect_root(opts: mysql::Opts, wait: std::time::Duration) -> mysql::Conn {
+    let address = format!("{}:{}", opts.get_ip_or_hostname(), opts.get_tcp_port());
+    let until = std::time::Instant::now() + wait;
+    loop {
+        match mysql::Conn::new(opts.clone()) {
+            Ok(conn) => return conn,
+            Err(e) if std::time::Instant::now() >= until => panic!(
+                "the live MySQL at {address} did not accept the test client as root within {wait:?}: {e}"
+            ),
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(500)),
+        }
+    }
 }
 
 /// The live server a fold's filled settings name, as the server's root on a connection of the
@@ -64,8 +112,37 @@ fn fold_root(settings: &[u8]) -> (mysql::Conn, String) {
         .user(Some("root"))
         .pass(Some(password))
         .db_name(None::<String>);
-    let conn = mysql::Conn::new(root).expect("the live MySQL accepts the test client as root");
-    (conn, user)
+    (connect_root(root.into(), ROOT_WAIT), user)
+}
+
+/// RED: a closed port is refused at the deadline, and the panic names the address and the error.
+#[test]
+fn red_a_closed_port_is_named_at_the_deadline() {
+    let closed = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("a local port");
+        l.local_addr().expect("its address").port()
+    };
+    let opts: mysql::Opts = mysql::OptsBuilder::new()
+        .ip_or_hostname(Some("127.0.0.1"))
+        .tcp_port(closed)
+        .user(Some("root"))
+        .into();
+    let caught = std::panic::catch_unwind(|| {
+        connect_root(opts, std::time::Duration::from_millis(600));
+    })
+    .expect_err("a closed port must not connect");
+    let said = caught
+        .downcast_ref::<String>()
+        .cloned()
+        .expect("the panic carries a message");
+    assert!(
+        said.contains(&format!("127.0.0.1:{closed}")),
+        "the address is not named: {said}"
+    );
+    assert!(
+        said.contains("did not accept the test client as root") && said.contains("onnect"),
+        "the error is not named: {said}"
+    );
 }
 
 /// The suite's namespace hook: the fold's database, made before its open, its whole use granted to

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! THE STORE V3 DOOR over [`MysqlStore`]: `store_door!` and the slots the store v3 table adds to
-//! the 1.5.5 op set ([`StoreSlots`]): the `op_id`-carrying writes, the kernel's records, and the
-//! 1.5.5 op set itself, every slot one body on the op's connection. The store keeps ledger counts
+//! The store v3 door over [`MysqlStore`]: `store_door!` and the slots the store v3 table adds to
+//! the base op set ([`StoreSlots`]): the `op_id`-carrying writes, the kernel's records, and the
+//! base op set itself, every slot one body on the op's connection. The store keeps ledger counts
 //! and records; money is a view on the ledger and the rate card, computed in core.
 //!
 //! DEDUPE (`abi::store` S1-S4), DURABLE: every `op_id` write runs in ONE transaction that first
@@ -14,8 +14,8 @@
 //! so nothing is recorded (S3). Rows older than [`OP_ID_RETENTION_SECS`] are swept (S4).
 //!
 //! CONNECTIONS: every slot runs on one of the instance's kept connections over the host's
-//! connector, as straight-line async code driven by the store SDK's `wire::drive_kept` (busbar THE
-//! DESIGN: every call Ready or Pending(wake), no socket of the plugin's own). The door declares one
+//! connector, as straight-line async code driven by the store SDK's `wire::drive_kept` (every call
+//! Ready or Pending(wake), no socket of the plugin's own). The door declares one
 //! outbound `tcp` need ([`NEEDS`], `operator-infrastructure`); `open` parses the settings and its
 //! connect step reaches the server, creates the schema and runs the probes, so an unreachable or
 //! refusing server still fails the load at open, in the driver's words.
@@ -34,11 +34,11 @@ use busbar_contract::abi::sdk::store::{Op, OpRefused, OpResult, Scanned, Step, S
 use busbar_contract::abi::store::{OpId, OP_ID_RETENTION_SECS};
 use busbar_contract::kinds::RecordBytes;
 use busbar_contract::records::{
-    AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, PlaneRecordRef,
-    PlaneSelector, RecordStoreResult, UsageDelta, UsageLedger, VirtualKey,
+    AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, PlaneRecord,
+    PlaneRecordRef, PlaneSelector, RecordStoreResult, UsageDelta, UsageLedger, VirtualKey,
 };
 
-use crate::mysqlwire::{Conn, Error, Transaction};
+use crate::mysqlwire::{Conn, Error};
 use crate::{crate_now, store_err, MysqlStore, INIT, NAME};
 
 const NO_TEXT: AbiStr = AbiStr {
@@ -46,10 +46,10 @@ const NO_TEXT: AbiStr = AbiStr {
     len: 0,
 };
 
-/// THE STORE'S ONE NEED: the server, dialled over `tcp` at the URL's `host:port` (or its
+/// The store's one need: the server, dialled over `tcp` at the URL's `host:port` (or its
 /// `socket=` path as `unix:<path>`; the store names the target per connection), in the
 /// `operator-infrastructure` egress class (private, loopback and plaintext allowed; pinned; cloud
-/// metadata hosts refused). Its timeout is the host's default (1.5.5 set none; a URL's
+/// metadata hosts refused). Its timeout is the host's default (a URL's
 /// `tcp_connect_timeout_ms` bounds the dial).
 pub const NEEDS: &[Need] = &[Need {
     direction: DIRECTION_OUTBOUND,
@@ -84,18 +84,17 @@ busbar_contract::store_door!(
     needs: NEEDS
 );
 
-/// RUN ONE OP on one of the instance's kept connections (a fresh one when none is idle): open the
-/// connection (a failure is `$fail` of the driver's words, as 1.5.5's `get_conn` failure was), run
+/// Run one op on one of the instance's kept connections (a fresh one when none is idle): open the
+/// connection (a failure is `$fail` of the driver's words), run
 /// `$body` on it as `$c`, and reset it for the next op. Every argument the body names is owned
 /// (the body runs across the op's entries).
 macro_rules! on_conn {
     ($self:ident, $cx:ident, $fail:expr, |$c:ident| $body:expr) => {{
-        let shared = $self.shared();
-        let pool = shared.pool.clone();
+        let (opts, pool) = ($self.opts.clone(), $self.pool.clone());
         drive_kept($cx, &pool, move |wire| -> Body<_> {
             Box::pin(async move {
                 #[allow(unused_mut)]
-                let mut $c = match Conn::open(wire, &shared.opts, NEED, INIT).await {
+                let mut $c = match Conn::open(wire, &opts, NEED, INIT).await {
                     Ok(c) => c,
                     Err(e) => return Err(($fail)(e)),
                 };
@@ -107,177 +106,117 @@ macro_rules! on_conn {
     }};
 }
 
-/// One `op_id`-carrying write (module doc, DEDUPE) on `$conn`: a replay answers the original
-/// answer, a conflict applies nothing, and a new op runs `$apply` in the op's transaction (its
-/// answer, or an `$E`) and is recorded only if it applied, at the server's isolation level.
-/// Evaluates to the answer; returns the refusal from the enclosing fn.
-macro_rules! deduped {
-    ($conn:expr, $op:expr, $body:expr, $E:ty, |$tx:ident| $apply:block) => {{
-        let conn: &mut Conn = $conn;
-        let op: OpId = $op;
-        let body: &str = $body;
-        let mut attempts = 0;
-        // The claim can find a row a concurrent sweep or rollback removes before it is read; the
-        // op is then new again, so the claim is retried (bounded).
-        loop {
-            attempts += 1;
-            if attempts > 3 {
-                return Err(<$E as Refusal>::backend(
-                    "store_ops: the op's row kept vanishing between its claim and its read".into(),
-                ));
-            }
-            let mut tx = conn
-                .start_transaction()
-                .await
-                .map_err(backend::<$E, _>)?;
-            match tx
-                .exec_drop(
-                    "INSERT INTO store_ops (op_id, recorded_at, body, answer) \
-                     VALUES (:op, :at, :body, '')",
-                    params! { "op" => &op.0[..], "at" => crate_now(), "body" => body.as_bytes() },
-                )
-                .await
-            {
-                Ok(()) => {
-                    let answer: Value = {
-                        let $tx: &mut Transaction<'_> = &mut tx;
-                        applied::<$E, _>(async { $apply }).await?
-                    };
-                    tx.exec_drop(
-                        "UPDATE store_ops SET answer = :answer WHERE op_id = :op",
-                        params! { "answer" => answer.to_string(), "op" => &op.0[..] },
-                    )
-                    .await
-                    .map_err(backend::<$E, _>)?;
-                    tx.commit().await.map_err(backend::<$E, _>)?;
-                    if op.counter().is_multiple_of(OPS_SWEEP_EVERY) {
-                        // Best effort: a sweep that fails is retried by the next one.
-                        let _ = conn
-                            .exec_drop(
-                                "DELETE FROM store_ops WHERE recorded_at < :cut LIMIT 1000",
-                                params! { "cut" => crate_now().saturating_sub(OP_ID_RETENTION_SECS) },
-                            )
-                            .await;
-                    }
-                    break answer;
-                }
-                // ER_DUP_ENTRY: the op is recorded (the insert waited for its writer to commit).
-                Err(Error::MySqlError(e)) if e.code == 1062 => {
-                    tx.rollback().await.map_err(backend::<$E, _>)?;
-                    let row: Option<(Vec<u8>, Vec<u8>)> = conn
-                        .exec_first(
-                            "SELECT body, answer FROM store_ops WHERE op_id = :op",
-                            params! { "op" => &op.0[..] },
-                        )
-                        .await
-                        .map_err(backend::<$E, _>)?;
-                    match row {
-                        Some((b, _)) if b != body.as_bytes() => {
-                            return Err(<$E as Refusal>::conflict())
-                        }
-                        Some((_, a)) => {
-                            break serde_json::from_slice(&a).map_err(backend::<$E, _>)?
-                        }
-                        None => continue,
-                    }
-                }
-                Err(e) => return Err(backend(e)),
-            }
-        }
-    }};
+/// One base op: `MysqlStore::$f(&mut conn, args..)` on the op's connection.
+macro_rules! op {
+    ($self:ident, $cx:ident, $f:ident($($a:expr),*)) => {
+        on_conn!($self, $cx, store_err, |c| MysqlStore::$f(&mut c, $($a),*).await)
+    };
 }
 
-/// Pin an apply block's answer and refusal types.
-fn applied<E, F: std::future::Future<Output = Result<Value, E>>>(f: F) -> F {
-    f
+/// The effect of one `op_id`-carrying write.
+enum Write {
+    Usage(Vec<(String, u64, UsageDelta)>),
+    Metering(Vec<MeteringDelta>),
+    Append(PlaneRecord),
+}
+
+impl Write {
+    async fn apply(&self, tx: &mut Conn) -> RecordStoreResult<()> {
+        match self {
+            Write::Usage(cells) => {
+                for (bucket, window, delta) in cells {
+                    MysqlStore::add_usage_on(tx, bucket, *window, delta).await?;
+                }
+            }
+            Write::Metering(deltas) => {
+                for d in deltas {
+                    MysqlStore::add_metering_on(tx, d).await?;
+                }
+            }
+            Write::Append(record) => MysqlStore::append_plane_record_on(tx, record).await?,
+        }
+        Ok(())
+    }
+}
+
+/// One `op_id`-carrying write (module doc, DEDUPE) on `conn`: a replay answers the original
+/// answer, a conflict applies nothing, and a new op applies `write` in the op's transaction and is
+/// recorded only if it applied, at the server's isolation level.
+async fn deduped(conn: &mut Conn, op: OpId, body: String, write: Write) -> OpResult<()> {
+    // The claim can find a row a concurrent sweep or rollback removes before it is read; the op is
+    // then new again, so the claim is retried (bounded).
+    for _ in 0..3 {
+        let mut tx = conn.start_transaction().await.map_err(backend)?;
+        match tx
+            .exec_drop(
+                "INSERT INTO store_ops (op_id, recorded_at, body, answer) \
+                 VALUES (:op, :at, :body, '')",
+                params! { "op" => &op.0[..], "at" => crate_now(), "body" => body.as_bytes() },
+            )
+            .await
+        {
+            Ok(()) => {
+                write
+                    .apply(&mut tx)
+                    .await
+                    .map_err(|e| OpRefused::Failed(e.0))?;
+                tx.exec_drop(
+                    "UPDATE store_ops SET answer = :answer WHERE op_id = :op",
+                    params! { "answer" => Value::Null.to_string(), "op" => &op.0[..] },
+                )
+                .await
+                .map_err(backend)?;
+                tx.commit().await.map_err(backend)?;
+                if op.counter().is_multiple_of(OPS_SWEEP_EVERY) {
+                    // Best effort: a sweep that fails is retried by the next one.
+                    let _ = conn
+                        .exec_drop(
+                            "DELETE FROM store_ops WHERE recorded_at < :cut LIMIT 1000",
+                            params! { "cut" => crate_now().saturating_sub(OP_ID_RETENTION_SECS) },
+                        )
+                        .await;
+                }
+                return Ok(());
+            }
+            // ER_DUP_ENTRY: the op is recorded (the insert waited for its writer to commit).
+            Err(Error::MySqlError(e)) if e.code == 1062 => {
+                tx.rollback().await.map_err(backend)?;
+                let row: Option<(Vec<u8>, Vec<u8>)> = conn
+                    .exec_first(
+                        "SELECT body, answer FROM store_ops WHERE op_id = :op",
+                        params! { "op" => &op.0[..] },
+                    )
+                    .await
+                    .map_err(backend)?;
+                match row {
+                    Some((b, _)) if b != body.as_bytes() => return Err(OpRefused::Conflict),
+                    Some((_, a)) => {
+                        return serde_json::from_slice::<Value>(&a)
+                            .map(drop)
+                            .map_err(backend)
+                    }
+                    None => continue,
+                }
+            }
+            Err(e) => return Err(backend(e)),
+        }
+    }
+    Err(OpRefused::Failed(
+        "store_ops: the op's row kept vanishing between its claim and its read".into(),
+    ))
 }
 
 /// One op in `OPS_SWEEP_EVERY` (by the minting node's counter) sweeps expired dedupe rows.
 const OPS_SWEEP_EVERY: u64 = 256;
 
-/// How an `op_id` write's refusal type spells the two refusals the dedupe itself answers.
-trait Refusal {
-    /// The same `op_id` with different value fields.
-    fn conflict() -> Self;
-    /// The backend could not run the op; nothing applied.
-    fn backend(text: String) -> Self;
-}
-
-impl Refusal for OpRefused {
-    fn conflict() -> Self {
-        OpRefused::Conflict
-    }
-    fn backend(text: String) -> Self {
-        OpRefused::Failed(text)
-    }
-}
-
-fn backend<E: Refusal, D: std::fmt::Display>(e: D) -> E {
-    E::backend(e.to_string())
-}
-
-fn failed(e: busbar_contract::records::RecordStoreError) -> OpRefused {
-    OpRefused::Failed(e.0)
+/// The backend could not run the op; nothing applied.
+fn backend<D: std::fmt::Display>(e: D) -> OpRefused {
+    OpRefused::Failed(e.to_string())
 }
 
 /// A backend text (the slots that answer `Result<_, String>`).
 fn text(e: Error) -> String {
     e.to_string()
-}
-
-// ── the v3 bodies (each on the op's connection) ─────────────────────────────────────────────────
-
-/// A deduped write whose answer is "done": `apply` is the effect's body.
-macro_rules! done_op {
-    ($conn:expr, $op:expr, $body:expr, |$tx:ident| $apply:block) => {{
-        let answer = deduped!($conn, $op, $body, OpRefused, |$tx| {
-            $apply;
-            Ok(Value::Null)
-        });
-        let _ = answer;
-        Ok(())
-    }};
-}
-
-async fn v3_add_usage_batch(
-    conn: &mut Conn,
-    op: OpId,
-    body: String,
-    cells: Vec<(String, u64, UsageDelta)>,
-) -> OpResult<()> {
-    done_op!(conn, op, &body, |tx| {
-        for (bucket, window, delta) in &cells {
-            MysqlStore::add_usage_on(tx, bucket, *window, delta)
-                .await
-                .map_err(failed)?;
-        }
-    })
-}
-
-async fn v3_add_metering_batch(
-    conn: &mut Conn,
-    op: OpId,
-    body: String,
-    deltas: Vec<MeteringDelta>,
-) -> OpResult<()> {
-    done_op!(conn, op, &body, |tx| {
-        for d in &deltas {
-            MysqlStore::add_metering_on(tx, d).await.map_err(failed)?;
-        }
-    })
-}
-
-async fn v3_append_plane_record(
-    conn: &mut Conn,
-    op: OpId,
-    body: String,
-    record: busbar_contract::records::PlaneRecord,
-) -> OpResult<()> {
-    done_op!(conn, op, &body, |tx| {
-        MysqlStore::append_plane_record_on(tx, &record)
-            .await
-            .map_err(failed)?;
-    })
 }
 
 async fn v3_record_scan(
@@ -331,8 +270,8 @@ impl StoreSlots for MysqlStore {
         Self::from_settings(settings)
     }
 
-    /// Reach the server, create the schema and run the probes (1.5.5's connect, at the same
-    /// moment: the load), in the driver's words when it cannot.
+    /// Reach the server, create the schema and run the probes (at the load), in the driver's words
+    /// when it cannot.
     fn connect(&self, cx: &mut Op<'_>) -> Step<Result<(), String>> {
         on_conn!(self, cx, text, |c| MysqlStore::connect_step(&mut c)
             .await
@@ -347,11 +286,18 @@ impl StoreSlots for MysqlStore {
     ) -> Step<OpResult<()>> {
         let body = format!("append_plane_record:{record:?}");
         let record = record.to_record();
-        on_conn!(self, cx, backend::<OpRefused, _>, |c| {
-            v3_append_plane_record(&mut c, op, body, record).await
-        })
+        on_conn!(self, cx, backend, |c| deduped(
+            &mut c,
+            op,
+            body,
+            Write::Append(record)
+        )
+        .await)
     }
 
+    /// `record_put` (slot 40): an upsert on `(schema, key)`. An EMPTY value removes the row:
+    /// it is the host's strike, so `record_get` then answers `None` and
+    /// `record_scan` never returns it. Removing a row that is not there is `Ok`.
     fn record_put(
         &self,
         cx: &mut Op<'_>,
@@ -360,6 +306,16 @@ impl StoreSlots for MysqlStore {
         value: &[u8],
     ) -> Step<Result<(), String>> {
         let (schema, key, value) = (schema.to_owned(), key.to_vec(), value.to_vec());
+        if value.is_empty() {
+            return on_conn!(self, cx, text, |c| {
+                c.exec_drop(
+                    "DELETE FROM store_records WHERE schema_id = :schema AND rkey = :rkey",
+                    params! { "schema" => &schema, "rkey" => &key },
+                )
+                .await
+                .map_err(|e| e.to_string())
+            });
+        }
         on_conn!(self, cx, text, |c| {
             // AN EMPTY VALUE REMOVES THE ROW (abi/store slot 26 `record_put`).
             if value.is_empty() {
@@ -425,8 +381,11 @@ impl StoreSlots for MysqlStore {
             .iter()
             .map(|(b, w, d)| ((*b).to_owned(), *w, d.clone()))
             .collect();
-        on_conn!(self, cx, backend::<OpRefused, _>, |c| v3_add_usage_batch(
-            &mut c, op, body, cells
+        on_conn!(self, cx, backend, |c| deduped(
+            &mut c,
+            op,
+            body,
+            Write::Usage(cells)
         )
         .await)
     }
@@ -439,33 +398,34 @@ impl StoreSlots for MysqlStore {
     ) -> Step<OpResult<()>> {
         let body = format!("add_metering_batch:{deltas:?}");
         let deltas = deltas.to_vec();
-        on_conn!(self, cx, backend::<OpRefused, _>, |c| {
-            v3_add_metering_batch(&mut c, op, body, deltas).await
-        })
+        on_conn!(self, cx, backend, |c| deduped(
+            &mut c,
+            op,
+            body,
+            Write::Metering(deltas)
+        )
+        .await)
     }
 
-    // ── the 1.5.5 op set (slots 0-32), each one body on the op's connection ──────────────────
+    // The base op set (slots 0-32), each one body on the op's connection.
 
     fn put_key(&self, cx: &mut Op<'_>, key: &VirtualKey) -> Step<RecordStoreResult<()>> {
         let key = key.clone();
-        on_conn!(self, cx, store_err, |c| MysqlStore::put_key(&mut c, &key)
-            .await)
+        op!(self, cx, put_key(&key))
     }
 
     fn get_key(&self, cx: &mut Op<'_>, id: &str) -> Step<RecordStoreResult<Option<VirtualKey>>> {
         let id = id.to_owned();
-        on_conn!(self, cx, store_err, |c| MysqlStore::get_key(&mut c, &id)
-            .await)
+        op!(self, cx, get_key(&id))
     }
 
     fn list_keys(&self, cx: &mut Op<'_>) -> Step<RecordStoreResult<Vec<VirtualKey>>> {
-        on_conn!(self, cx, store_err, |c| MysqlStore::list_keys(&mut c).await)
+        op!(self, cx, list_keys())
     }
 
     fn delete_key(&self, cx: &mut Op<'_>, id: &str) -> Step<RecordStoreResult<()>> {
         let id = id.to_owned();
-        on_conn!(self, cx, store_err, |c| MysqlStore::delete_key(&mut c, &id)
-            .await)
+        op!(self, cx, delete_key(&id))
     }
 
     fn list_keys_since(
@@ -473,10 +433,7 @@ impl StoreSlots for MysqlStore {
         cx: &mut Op<'_>,
         since: u64,
     ) -> Step<RecordStoreResult<Vec<VirtualKey>>> {
-        on_conn!(self, cx, store_err, |c| MysqlStore::list_keys_since(
-            &mut c, since
-        )
-        .await)
+        op!(self, cx, list_keys_since(since))
     }
 
     fn get_usage(
@@ -486,12 +443,7 @@ impl StoreSlots for MysqlStore {
         window_start: u64,
     ) -> Step<RecordStoreResult<UsageLedger>> {
         let bucket_id = bucket_id.to_owned();
-        on_conn!(self, cx, store_err, |c| MysqlStore::get_usage(
-            &mut c,
-            &bucket_id,
-            window_start
-        )
-        .await)
+        op!(self, cx, get_usage(&bucket_id, window_start))
     }
 
     fn put_usage(
@@ -502,13 +454,7 @@ impl StoreSlots for MysqlStore {
         ledger: &UsageLedger,
     ) -> Step<RecordStoreResult<()>> {
         let (bucket_id, ledger) = (bucket_id.to_owned(), ledger.clone());
-        on_conn!(self, cx, store_err, |c| MysqlStore::put_usage(
-            &mut c,
-            &bucket_id,
-            window_start,
-            &ledger
-        )
-        .await)
+        op!(self, cx, put_usage(&bucket_id, window_start, &ledger))
     }
 
     fn list_metering(
@@ -516,10 +462,7 @@ impl StoreSlots for MysqlStore {
         cx: &mut Op<'_>,
         bucket: u64,
     ) -> Step<RecordStoreResult<Vec<MeteringRow>>> {
-        on_conn!(self, cx, store_err, |c| MysqlStore::list_metering(
-            &mut c, bucket
-        )
-        .await)
+        op!(self, cx, list_metering(bucket))
     }
 
     fn put_credential(
@@ -528,10 +471,7 @@ impl StoreSlots for MysqlStore {
         secret: &CredentialSecret,
     ) -> Step<RecordStoreResult<()>> {
         let secret = secret.clone();
-        on_conn!(self, cx, store_err, |c| MysqlStore::put_credential(
-            &mut c, &secret
-        )
-        .await)
+        op!(self, cx, put_credential(&secret))
     }
 
     fn put_key_with_credential(
@@ -541,9 +481,7 @@ impl StoreSlots for MysqlStore {
         secret: &CredentialSecret,
     ) -> Step<RecordStoreResult<()>> {
         let (key, secret) = (key.clone(), secret.clone());
-        on_conn!(self, cx, store_err, |c| {
-            MysqlStore::put_key_with_credential(&mut c, &key, &secret).await
-        })
+        op!(self, cx, put_key_with_credential(&key, &secret))
     }
 
     fn list_credentials(
@@ -552,10 +490,7 @@ impl StoreSlots for MysqlStore {
         key_id: &str,
     ) -> Step<RecordStoreResult<Vec<CredentialMeta>>> {
         let key_id = key_id.to_owned();
-        on_conn!(self, cx, store_err, |c| MysqlStore::list_credentials(
-            &mut c, &key_id
-        )
-        .await)
+        op!(self, cx, list_credentials(&key_id))
     }
 
     fn revoke_credential(
@@ -565,10 +500,7 @@ impl StoreSlots for MysqlStore {
         reason: &str,
     ) -> Step<RecordStoreResult<()>> {
         let (id, reason) = (id.to_owned(), reason.to_owned());
-        on_conn!(self, cx, store_err, |c| MysqlStore::revoke_credential(
-            &mut c, &id, &reason
-        )
-        .await)
+        op!(self, cx, revoke_credential(&id, &reason))
     }
 
     fn list_credentials_since(
@@ -576,15 +508,11 @@ impl StoreSlots for MysqlStore {
         cx: &mut Op<'_>,
         since: u64,
     ) -> Step<RecordStoreResult<Vec<CredentialSecret>>> {
-        on_conn!(self, cx, store_err, |c| MysqlStore::list_credentials_since(
-            &mut c, since
-        )
-        .await)
+        op!(self, cx, list_credentials_since(since))
     }
 
     fn list_audit(&self, cx: &mut Op<'_>) -> Step<RecordStoreResult<Vec<AuditRecord>>> {
-        on_conn!(self, cx, store_err, |c| MysqlStore::list_audit(&mut c)
-            .await)
+        op!(self, cx, list_audit())
     }
 
     fn add_denylist(
@@ -594,15 +522,11 @@ impl StoreSlots for MysqlStore {
         reason: &str,
     ) -> Step<RecordStoreResult<()>> {
         let (sub, reason) = (sub.to_owned(), reason.to_owned());
-        on_conn!(self, cx, store_err, |c| MysqlStore::add_denylist(
-            &mut c, &sub, &reason
-        )
-        .await)
+        op!(self, cx, add_denylist(&sub, &reason))
     }
 
     fn list_denylist(&self, cx: &mut Op<'_>) -> Step<RecordStoreResult<Vec<String>>> {
-        on_conn!(self, cx, store_err, |c| MysqlStore::list_denylist(&mut c)
-            .await)
+        op!(self, cx, list_denylist())
     }
 
     fn list_audit_tail(
@@ -610,10 +534,7 @@ impl StoreSlots for MysqlStore {
         cx: &mut Op<'_>,
         limit: u64,
     ) -> Step<RecordStoreResult<Vec<AuditRecord>>> {
-        on_conn!(self, cx, store_err, |c| MysqlStore::list_audit_tail(
-            &mut c, limit
-        )
-        .await)
+        op!(self, cx, list_audit_tail(limit))
     }
 
     fn upsert_plane_record(
@@ -622,10 +543,7 @@ impl StoreSlots for MysqlStore {
         record: PlaneRecordRef<'_>,
     ) -> Step<RecordStoreResult<()>> {
         let record = record.to_record();
-        on_conn!(self, cx, store_err, |c| MysqlStore::upsert_plane_record(
-            &mut c, &record
-        )
-        .await)
+        op!(self, cx, upsert_plane_record(&record))
     }
 
     fn get_plane_record(
@@ -635,10 +553,7 @@ impl StoreSlots for MysqlStore {
         id: &str,
     ) -> Step<RecordStoreResult<Option<Vec<u8>>>> {
         let (kind, id) = (kind.to_owned(), id.to_owned());
-        on_conn!(self, cx, store_err, |c| MysqlStore::get_plane_record(
-            &mut c, &kind, &id
-        )
-        .await)
+        op!(self, cx, get_plane_record(&kind, &id))
     }
 
     fn list_plane_records(
@@ -648,10 +563,7 @@ impl StoreSlots for MysqlStore {
         selector: &PlaneSelector<'_>,
     ) -> Step<RecordStoreResult<Vec<Vec<u8>>>> {
         let (kind, selector) = (kind.to_owned(), selector.to_static());
-        on_conn!(self, cx, store_err, |c| MysqlStore::list_plane_records(
-            &mut c, &kind, &selector
-        )
-        .await)
+        op!(self, cx, list_plane_records(&kind, &selector))
     }
 
     fn list_plane_record_parents(
@@ -660,9 +572,7 @@ impl StoreSlots for MysqlStore {
         kind: &str,
     ) -> Step<RecordStoreResult<Vec<String>>> {
         let kind = kind.to_owned();
-        on_conn!(self, cx, store_err, |c| {
-            MysqlStore::list_plane_record_parents(&mut c, &kind).await
-        })
+        op!(self, cx, list_plane_record_parents(&kind))
     }
 
     fn purge_plane_records(
@@ -685,9 +595,7 @@ impl StoreSlots for MysqlStore {
         before: u64,
     ) -> Step<RecordStoreResult<u64>> {
         let kind = kind.to_owned();
-        on_conn!(self, cx, store_err, |c| {
-            MysqlStore::purge_plane_records_before(&mut c, &kind, before).await
-        })
+        op!(self, cx, purge_plane_records_before(&kind, before))
     }
 
     fn delete_plane_record(
@@ -697,10 +605,7 @@ impl StoreSlots for MysqlStore {
         id: &str,
     ) -> Step<RecordStoreResult<()>> {
         let (kind, id) = (kind.to_owned(), id.to_owned());
-        on_conn!(self, cx, store_err, |c| MysqlStore::delete_plane_record(
-            &mut c, &kind, &id
-        )
-        .await)
+        op!(self, cx, delete_plane_record(&kind, &id))
     }
 
     fn redeem_plane_token(
@@ -712,10 +617,7 @@ impl StoreSlots for MysqlStore {
         now: u64,
     ) -> Step<RecordStoreResult<bool>> {
         let (kind, token) = (kind.to_owned(), token.to_owned());
-        on_conn!(self, cx, store_err, |c| MysqlStore::redeem_plane_token(
-            &mut c, &kind, &token, expires_at, now
-        )
-        .await)
+        op!(self, cx, redeem_plane_token(&kind, &token, expires_at, now))
     }
 
     fn plane_token_live(
@@ -726,15 +628,12 @@ impl StoreSlots for MysqlStore {
         expires_at: u64,
         now: u64,
     ) -> Step<RecordStoreResult<bool>> {
-        // Answered without the server when the deadline has passed, as 1.5.5 did (no connection).
+        // Answered without the server (no connection) when the deadline has passed.
         if now > expires_at {
             return Step::Ready(Ok(false));
         }
         let (kind, token) = (kind.to_owned(), token.to_owned());
-        on_conn!(self, cx, store_err, |c| MysqlStore::plane_token_live(
-            &mut c, &kind, &token, expires_at, now
-        )
-        .await)
+        op!(self, cx, plane_token_live(&kind, &token, expires_at, now))
     }
 }
 
