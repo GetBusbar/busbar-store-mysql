@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! THE STORE V3 DOOR over [`MysqlStore`]: `store_door!` and the slots the store v3 table adds to
-//! the 1.5.5 op set ([`StoreSlots`]): the `op_id`-carrying writes, the kernel's records, and the
-//! 1.5.5 op set itself, every slot one body on the op's connection. The store keeps ledger counts
+//! The store v3 door over [`MysqlStore`]: `store_door!` and the slots the store v3 table adds to
+//! the base op set ([`StoreSlots`]): the `op_id`-carrying writes, the kernel's records, and the
+//! base op set itself, every slot one body on the op's connection. The store keeps ledger counts
 //! and records; money is a view on the ledger and the rate card, computed in core.
 //!
 //! DEDUPE (`abi::store` S1-S4), DURABLE: every `op_id` write runs in ONE transaction that first
@@ -14,8 +14,8 @@
 //! so nothing is recorded (S3). Rows older than [`OP_ID_RETENTION_SECS`] are swept (S4).
 //!
 //! CONNECTIONS: every slot runs on one of the instance's kept connections over the host's
-//! connector, as straight-line async code driven by the store SDK's `wire::drive_kept` (busbar THE
-//! DESIGN: every call Ready or Pending(wake), no socket of the plugin's own). The door declares one
+//! connector, as straight-line async code driven by the store SDK's `wire::drive_kept` (every call
+//! Ready or Pending(wake), no socket of the plugin's own). The door declares one
 //! outbound `tcp` need ([`NEEDS`], `operator-infrastructure`); `open` parses the settings and its
 //! connect step reaches the server, creates the schema and runs the probes, so an unreachable or
 //! refusing server still fails the load at open, in the driver's words.
@@ -46,10 +46,10 @@ const NO_TEXT: AbiStr = AbiStr {
     len: 0,
 };
 
-/// THE STORE'S ONE NEED: the server, dialled over `tcp` at the URL's `host:port` (or its
+/// The store's one need: the server, dialled over `tcp` at the URL's `host:port` (or its
 /// `socket=` path as `unix:<path>`; the store names the target per connection), in the
 /// `operator-infrastructure` egress class (private, loopback and plaintext allowed; pinned; cloud
-/// metadata hosts refused). Its timeout is the host's default (1.5.5 set none; a URL's
+/// metadata hosts refused). Its timeout is the host's default (a URL's
 /// `tcp_connect_timeout_ms` bounds the dial).
 pub const NEEDS: &[Need] = &[Need {
     direction: DIRECTION_OUTBOUND,
@@ -84,8 +84,8 @@ busbar_contract::store_door!(
     needs: NEEDS
 );
 
-/// RUN ONE OP on one of the instance's kept connections (a fresh one when none is idle): open the
-/// connection (a failure is `$fail` of the driver's words, as 1.5.5's `get_conn` failure was), run
+/// Run one op on one of the instance's kept connections (a fresh one when none is idle): open the
+/// connection (a failure is `$fail` of the driver's words), run
 /// `$body` on it as `$c`, and reset it for the next op. Every argument the body names is owned
 /// (the body runs across the op's entries).
 macro_rules! on_conn {
@@ -106,7 +106,7 @@ macro_rules! on_conn {
     }};
 }
 
-/// One 1.5.5 op: `MysqlStore::$f(&mut conn, args..)` on the op's connection.
+/// One base op: `MysqlStore::$f(&mut conn, args..)` on the op's connection.
 macro_rules! op {
     ($self:ident, $cx:ident, $f:ident($($a:expr),*)) => {
         on_conn!($self, $cx, store_err, |c| MysqlStore::$f(&mut c, $($a),*).await)
@@ -270,8 +270,8 @@ impl StoreSlots for MysqlStore {
         Self::from_settings(settings)
     }
 
-    /// Reach the server, create the schema and run the probes (1.5.5's connect, at the same
-    /// moment: the load), in the driver's words when it cannot.
+    /// Reach the server, create the schema and run the probes (at the load), in the driver's words
+    /// when it cannot.
     fn connect(&self, cx: &mut Op<'_>) -> Step<Result<(), String>> {
         on_conn!(self, cx, text, |c| MysqlStore::connect_step(&mut c)
             .await
@@ -295,6 +295,9 @@ impl StoreSlots for MysqlStore {
         .await)
     }
 
+    /// `record_put` (slot 40): an upsert on `(schema, key)`. An EMPTY value removes the row:
+    /// it is the host's strike, so `record_get` then answers `None` and
+    /// `record_scan` never returns it. Removing a row that is not there is `Ok`.
     fn record_put(
         &self,
         cx: &mut Op<'_>,
@@ -303,6 +306,16 @@ impl StoreSlots for MysqlStore {
         value: &[u8],
     ) -> Step<Result<(), String>> {
         let (schema, key, value) = (schema.to_owned(), key.to_vec(), value.to_vec());
+        if value.is_empty() {
+            return on_conn!(self, cx, text, |c| {
+                c.exec_drop(
+                    "DELETE FROM store_records WHERE schema_id = :schema AND rkey = :rkey",
+                    params! { "schema" => &schema, "rkey" => &key },
+                )
+                .await
+                .map_err(|e| e.to_string())
+            });
+        }
         on_conn!(self, cx, text, |c| {
             c
             .exec_drop(
@@ -385,7 +398,7 @@ impl StoreSlots for MysqlStore {
         .await)
     }
 
-    // ── the 1.5.5 op set (slots 0-32), each one body on the op's connection ──────────────────
+    // The base op set (slots 0-32), each one body on the op's connection.
 
     fn put_key(&self, cx: &mut Op<'_>, key: &VirtualKey) -> Step<RecordStoreResult<()>> {
         let key = key.clone();
@@ -593,7 +606,7 @@ impl StoreSlots for MysqlStore {
         expires_at: u64,
         now: u64,
     ) -> Step<RecordStoreResult<bool>> {
-        // Answered without the server when the deadline has passed, as 1.5.5 did (no connection).
+        // Answered without the server (no connection) when the deadline has passed.
         if now > expires_at {
             return Step::Ready(Ok(false));
         }
