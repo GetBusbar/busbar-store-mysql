@@ -4258,3 +4258,56 @@ fn v11_respells_children_onto_their_parents_keys() {
         .unwrap();
     assert_eq!(n, 2, "both foreign keys onto api_keys.id are restored");
 }
+
+/// UPSERT IS BY `(kind, id)` (the contract's `RecordStore::upsert_plane_record` /
+/// `get_plane_record`), with or without a parent: an upserted record that names a parent reads back
+/// by its own id, a second id under the same parent is a second record (never an overwrite), and
+/// the parent-scoped listing still returns both.
+#[test]
+fn a_parented_upserted_record_reads_back_by_its_own_id() {
+    let Some(url) = test_url() else { return };
+    let store = MysqlStore::connect(&url).expect("connect");
+    let (t1, t2, ctx) = ("t_parented_1", "t_parented_2", "ctx_parented");
+    reset_plane(&store, "task", &[t1, t2, ctx]);
+    let child = |id: &str, body: &[u8]| PlaneRecord {
+        kind: "task".to_string(),
+        id: id.to_string(),
+        parent: Some(ctx.to_string()),
+        seq: 0,
+        ts: 0,
+        disposition: PlaneDisposition::Active,
+        body: body.to_vec(),
+    };
+    store.upsert_plane_record(child(t1, b"one").view()).unwrap();
+    store.upsert_plane_record(child(t2, b"two").view()).unwrap();
+
+    assert_eq!(
+        store.get_plane_record("task", t1).unwrap(),
+        Some(b"one".to_vec())
+    );
+    assert_eq!(
+        store.get_plane_record("task", t2).unwrap(),
+        Some(b"two".to_vec())
+    );
+    let mut listed = store
+        .list_plane_records("task", &PlaneSelector::Parent(ctx.into()))
+        .unwrap();
+    listed.sort();
+    assert_eq!(listed, vec![b"one".to_vec(), b"two".to_vec()]);
+
+    // A second upsert of one id replaces it; deleting it by id removes it alone.
+    store
+        .upsert_plane_record(child(t1, b"one'").view())
+        .unwrap();
+    assert_eq!(
+        store.get_plane_record("task", t1).unwrap(),
+        Some(b"one'".to_vec())
+    );
+    store.delete_plane_record("task", t1).unwrap();
+    assert_eq!(store.get_plane_record("task", t1).unwrap(), None);
+    assert_eq!(
+        store.get_plane_record("task", t2).unwrap(),
+        Some(b"two".to_vec())
+    );
+    reset_plane(&store, "task", &[t1, t2, ctx]);
+}
