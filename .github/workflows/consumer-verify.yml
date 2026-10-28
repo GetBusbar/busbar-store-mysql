@@ -16,12 +16,11 @@ on:
 
 permissions:
   contents: read
-  issues: write
   actions: read
 
 jobs:
   consumer:
-    uses: GetBusbar/busbar/.github/workflows/plugin-consumer-verify.yml@9f29c70fb0914c700c44bef77f77646d1cb110e9
+    uses: GetBusbar/busbar/.github/workflows/plugin-consumer-verify.yml@6acd5afc46969040ebd548bc3ae21feb5d979f34
     with:
       version: ${{ inputs.version || '' }}
       asset_prefix: busbar-store-mysql
@@ -30,4 +29,3 @@ jobs:
       plugin_kind: store
       bundle_image: ""
       bundle_env: ""
-    secrets: inherit

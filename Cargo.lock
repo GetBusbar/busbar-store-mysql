@@ -234,19 +234,16 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 [[package]]
 name = "busbar-contract"
 version = "1.6.0"
-source = "git+https://www.github.com/GetBusbar/busbar?rev=9f29c70fb0914c700c44bef77f77646d1cb110e9#9f29c70fb0914c700c44bef77f77646d1cb110e9"
+source = "git+https://www.github.com/GetBusbar/busbar?rev=6acd5afc46969040ebd548bc3ae21feb5d979f34#6acd5afc46969040ebd548bc3ae21feb5d979f34"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
  "futures",
- "getrandom 0.3.4",
  "hex",
  "http",
  "idna",
  "indexmap",
  "memchr",
- "num-bigint",
- "ring",
  "serde",
  "serde_json",
  "serde_yaml_ng",
@@ -261,7 +258,7 @@ dependencies = [
 [[package]]
 name = "busbar-core-connector"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=9f29c70fb0914c700c44bef77f77646d1cb110e9#9f29c70fb0914c700c44bef77f77646d1cb110e9"
+source = "git+https://github.com/GetBusbar/busbar?rev=6acd5afc46969040ebd548bc3ae21feb5d979f34#6acd5afc46969040ebd548bc3ae21feb5d979f34"
 dependencies = [
  "arc-swap",
  "base64 0.22.1",
@@ -290,7 +287,7 @@ dependencies = [
 [[package]]
 name = "busbar-kernel"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=9f29c70fb0914c700c44bef77f77646d1cb110e9#9f29c70fb0914c700c44bef77f77646d1cb110e9"
+source = "git+https://github.com/GetBusbar/busbar?rev=6acd5afc46969040ebd548bc3ae21feb5d979f34#6acd5afc46969040ebd548bc3ae21feb5d979f34"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -315,6 +312,8 @@ dependencies = [
  "http-body",
  "http-body-util",
  "httpdate",
+ "hyper",
+ "hyper-util",
  "indexmap",
  "metrics",
  "metrics-util",
@@ -336,7 +335,7 @@ dependencies = [
 [[package]]
 name = "busbar-kernel-audit"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=9f29c70fb0914c700c44bef77f77646d1cb110e9#9f29c70fb0914c700c44bef77f77646d1cb110e9"
+source = "git+https://github.com/GetBusbar/busbar?rev=6acd5afc46969040ebd548bc3ae21feb5d979f34#6acd5afc46969040ebd548bc3ae21feb5d979f34"
 dependencies = [
  "busbar-contract",
  "ed25519-dalek",
@@ -347,7 +346,7 @@ dependencies = [
 [[package]]
 name = "busbar-kernel-breaker"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=9f29c70fb0914c700c44bef77f77646d1cb110e9#9f29c70fb0914c700c44bef77f77646d1cb110e9"
+source = "git+https://github.com/GetBusbar/busbar?rev=6acd5afc46969040ebd548bc3ae21feb5d979f34#6acd5afc46969040ebd548bc3ae21feb5d979f34"
 dependencies = [
  "busbar-contract",
 ]
@@ -355,7 +354,7 @@ dependencies = [
 [[package]]
 name = "busbar-kernel-egress"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=9f29c70fb0914c700c44bef77f77646d1cb110e9#9f29c70fb0914c700c44bef77f77646d1cb110e9"
+source = "git+https://github.com/GetBusbar/busbar?rev=6acd5afc46969040ebd548bc3ae21feb5d979f34#6acd5afc46969040ebd548bc3ae21feb5d979f34"
 dependencies = [
  "busbar-contract",
  "bytes",
@@ -365,7 +364,7 @@ dependencies = [
 [[package]]
 name = "busbar-kernel-identity"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=9f29c70fb0914c700c44bef77f77646d1cb110e9#9f29c70fb0914c700c44bef77f77646d1cb110e9"
+source = "git+https://github.com/GetBusbar/busbar?rev=6acd5afc46969040ebd548bc3ae21feb5d979f34#6acd5afc46969040ebd548bc3ae21feb5d979f34"
 dependencies = [
  "busbar-contract",
  "hex",
@@ -375,7 +374,7 @@ dependencies = [
 [[package]]
 name = "busbar-kernel-ledger"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=9f29c70fb0914c700c44bef77f77646d1cb110e9#9f29c70fb0914c700c44bef77f77646d1cb110e9"
+source = "git+https://github.com/GetBusbar/busbar?rev=6acd5afc46969040ebd548bc3ae21feb5d979f34#6acd5afc46969040ebd548bc3ae21feb5d979f34"
 dependencies = [
  "busbar-contract",
  "ring",
@@ -385,7 +384,7 @@ dependencies = [
 [[package]]
 name = "busbar-kernel-scope"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=9f29c70fb0914c700c44bef77f77646d1cb110e9#9f29c70fb0914c700c44bef77f77646d1cb110e9"
+source = "git+https://github.com/GetBusbar/busbar?rev=6acd5afc46969040ebd548bc3ae21feb5d979f34#6acd5afc46969040ebd548bc3ae21feb5d979f34"
 dependencies = [
  "busbar-contract",
 ]
@@ -393,7 +392,7 @@ dependencies = [
 [[package]]
 name = "busbar-kernel-wal"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=9f29c70fb0914c700c44bef77f77646d1cb110e9#9f29c70fb0914c700c44bef77f77646d1cb110e9"
+source = "git+https://github.com/GetBusbar/busbar?rev=6acd5afc46969040ebd548bc3ae21feb5d979f34#6acd5afc46969040ebd548bc3ae21feb5d979f34"
 dependencies = [
  "busbar-contract",
  "ring",
@@ -402,7 +401,7 @@ dependencies = [
 [[package]]
 name = "busbar-plugin-loader"
 version = "1.5.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=9f29c70fb0914c700c44bef77f77646d1cb110e9#9f29c70fb0914c700c44bef77f77646d1cb110e9"
+source = "git+https://github.com/GetBusbar/busbar?rev=6acd5afc46969040ebd548bc3ae21feb5d979f34#6acd5afc46969040ebd548bc3ae21feb5d979f34"
 dependencies = [
  "base64 0.22.1",
  "busbar-contract",
@@ -434,6 +433,7 @@ dependencies = [
  "percent-encoding",
  "serde",
  "serde_json",
+ "tracing",
  "ulid",
  "url",
 ]
@@ -769,6 +769,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fnv"
+version = "1.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
+
+[[package]]
 name = "foldhash"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -921,6 +927,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "h2"
+version = "0.4.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "839c0e8a181239723652be9062bb56ca5bf5f64011f73b623f6f4fc59086a228"
+dependencies = [
+ "atomic-waker",
+ "bytes",
+ "fnv",
+ "futures-core",
+ "futures-sink",
+ "http",
+ "indexmap",
+ "slab",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -996,6 +1021,7 @@ dependencies = [
  "bytes",
  "futures-channel",
  "futures-core",
+ "h2",
  "http",
  "http-body",
  "httparse",

@@ -12,6 +12,29 @@ use std::collections::BTreeMap;
 mod harness;
 use harness::MysqlStore;
 
+/// The verify path's read, which is no longer a store op: a credential's secret by `(kind,
+/// public_id)`, read back through the revision delta (which carries every row, revoked or not).
+trait Lookup {
+    fn lookup_credential_secret(
+        &self,
+        kind: &str,
+        public_id: &str,
+    ) -> RecordStoreResult<Option<CredentialSecret>>;
+}
+
+impl Lookup for MysqlStore {
+    fn lookup_credential_secret(
+        &self,
+        kind: &str,
+        public_id: &str,
+    ) -> RecordStoreResult<Option<CredentialSecret>> {
+        Ok(self
+            .list_credentials_since(0)?
+            .into_iter()
+            .find(|c| c.meta.kind == kind && c.meta.public_id == public_id))
+    }
+}
+
 /// A name-keyed `usage_units` map from literal pairs — the 1.6.0 shape of what used to be the four
 /// `TierTokens`/`TierTokensDelta` fields.
 fn units<V: Copy>(pairs: &[(&str, V)]) -> BTreeMap<String, V> {
@@ -86,13 +109,14 @@ fn ensure_reset(store: &MysqlStore) {
     });
 }
 
-/// `purge_windows_before` is UNSCOPED by contract: it deletes every window below the cutoff, across
-/// every bucket. That is correct for a retention sweep and incompatible with this suite's usual
-/// isolation-by-unique-id, so the purge test and the tests that read a window back must not run at
-/// the same time. They cannot be isolated by a throwaway database either: the CI user has no
-/// CREATE DATABASE privilege (see the note above the backfill tests). One shared lock, held only by
-/// the handful of tests that care, keeps the rest of the suite parallel.
-static USAGE_WINDOWS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// The server's `root` on the test URL's host, for the DDL the `busbar` user may not run (CREATE
+/// DATABASE). CI's service container sets root's password to `busbar`; a local server with another
+/// one names it in `BUSBAR_TEST_MYSQL_ROOT_PASSWORD`.
+fn root_url(url: &str) -> String {
+    let password =
+        std::env::var("BUSBAR_TEST_MYSQL_ROOT_PASSWORD").unwrap_or_else(|_| "busbar".into());
+    url.replacen("busbar:busbar@", &format!("root:{password}@"), 1)
+}
 
 /// The two tests that build a WHOLE schema from nothing against their own throwaway database (the
 /// v2 real-wiring test and the v4->v5 task-store migration) run ~25 DDL statements apiece. MySQL 8's
@@ -107,10 +131,6 @@ fn lock_fresh_database_ddl() -> std::sync::MutexGuard<'static, ()> {
     FRESH_DATABASE_DDL_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-}
-
-fn lock_usage_windows() -> std::sync::MutexGuard<'static, ()> {
-    USAGE_WINDOWS_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn sample_key(id: &str, generation: &str) -> VirtualKey {
@@ -309,20 +329,6 @@ fn tombstone_and_credential_destruction_share_one_transaction() {
     );
 }
 
-#[test]
-fn scrub_key_requires_tombstone_first() {
-    let Some(s) = fresh_store() else { return };
-    s.put_key(&sample_key("vk_scrub", "g")).unwrap();
-    assert!(
-        s.scrub_key("vk_scrub").is_err(),
-        "scrub on a LIVE key must error"
-    );
-    s.delete_key("vk_scrub").unwrap();
-    s.scrub_key("vk_scrub").unwrap();
-    let row = s.get_key("vk_scrub").unwrap().unwrap();
-    assert_eq!(row.name, "");
-}
-
 // ── Credentials: slot bounds, revoke, secret isolation ──────────────────────────────────────────
 
 #[test]
@@ -407,7 +413,6 @@ fn public_id_lookup_is_case_sensitive() {
 
 #[test]
 fn put_and_get_usage_roundtrips() {
-    let _guard = lock_usage_windows();
     let Some(s) = fresh_store() else { return };
     let ledger = UsageLedger {
         requests: 5,
@@ -433,7 +438,6 @@ fn put_and_get_usage_roundtrips() {
 /// count, and budget hydration reads the window as N times its real usage.
 #[test]
 fn usage_request_counters_do_not_multiply_with_the_model_count() {
-    let _guard = lock_usage_windows();
     let Some(s) = fresh_store() else { return };
     let model = |name: &str| ModelTokens {
         model: name.to_string(),
@@ -489,7 +493,6 @@ fn usage_request_counters_do_not_multiply_with_the_model_count() {
 /// real: a window whose requests were all refunded to zero tokens still has a request count.
 #[test]
 fn usage_with_no_model_breakdown_still_records_its_request_counters() {
-    let _guard = lock_usage_windows();
     let Some(s) = fresh_store() else { return };
     let ledger = UsageLedger {
         requests: 4,
@@ -517,7 +520,6 @@ fn usage_with_no_model_breakdown_still_records_its_request_counters() {
 /// 1.5.5 golden stays deterministic; this test is where the split itself stays proven.
 #[test]
 fn a_request_split_across_two_flushes_keeps_its_count_across_a_reconnect() {
-    let _guard = lock_usage_windows();
     let Some(s) = fresh_store() else { return };
     let admission = UsageDelta {
         requests: 1,
@@ -549,98 +551,6 @@ fn a_request_split_across_two_flushes_keeps_its_count_across_a_reconnect() {
     assert_eq!(back.models[0].tier(UNIT_OUTPUT), 7, "{back:?}");
 }
 
-/// `purge_metering_before` must match the rows `add_metering` actually wrote. The bucket column is
-/// `CHAR(10)` and both the write and the read zero-pad into it; only the purge compared the caller's
-/// raw string, so a caller passing the unpadded form matched nothing and got a successful purge of
-/// zero rows. A retention sweep that reports success having deleted nothing is the shape this whole
-/// release has been chasing.
-#[test]
-fn purge_metering_before_matches_the_padding_the_write_path_uses() {
-    let Some(s) = fresh_store() else { return };
-    s.put_key(&sample_key("vk_purge_meter", "g")).unwrap();
-    let bucket = 20_260_731u64;
-    s.add_metering(&MeteringDelta {
-        key_id: "vk_purge_meter".to_string(),
-        bucket,
-        model: "m".to_string(),
-        provider: "p".to_string(),
-        tokens_input: 1,
-        tokens_output: 1,
-        tokens_cache_read: 0,
-        tokens_cache_write: 0,
-        requests: 1,
-        billable_requests: 1,
-        key_group_at_use: String::new(),
-        pricing_version: String::new(),
-        priced_from_ms: 0,
-        usage_units: BTreeMap::new(),
-    })
-    .unwrap();
-    assert!(
-        s.list_metering(bucket)
-            .unwrap()
-            .iter()
-            .any(|r| r.key_id == "vk_purge_meter"),
-        "precondition: the metering row must exist"
-    );
-
-    // The caller has a u64 bucket and renders it the obvious way. That is the form the trait's
-    // `&str` parameter invites, and it must reach the padded rows.
-    let purged = s.purge_metering_before(&bucket.to_string()).unwrap();
-    assert!(
-        purged >= 1,
-        "the purge must actually match the stored rows, got {purged} deleted"
-    );
-    assert!(
-        !s.list_metering(bucket)
-            .unwrap()
-            .iter()
-            .any(|r| r.key_id == "vk_purge_meter"),
-        "the named bucket must be gone after the purge"
-    );
-}
-
-/// `purge_windows_before` must purge EVERY window below the cutoff, not one capped batch. The
-/// contract is "purge every window whose window_start < before"; a single `LIMIT 5000` statement
-/// leaves a backlog larger than the cap permanently un-swept while returning a nonzero count each
-/// tick that looks like progress.
-#[test]
-fn purge_windows_before_sweeps_past_a_single_batch() {
-    let _guard = lock_usage_windows();
-    let Some(s) = fresh_store() else { return };
-    // Well clear of every other test's windows, and above the batch size so one capped statement
-    // cannot finish the job.
-    let base = 7_000_000u64;
-    let n = 5_200u64;
-    {
-        let mut conn = s.pool.get_conn().unwrap();
-        let mut sql = String::from(
-            "INSERT INTO usage_windows (window_start, bucket_scope, bucket_id, model, requests) VALUES ",
-        );
-        for i in 0..n {
-            if i > 0 {
-                sql.push(',');
-            }
-            sql.push_str(&format!("({}, 'key', 'vk_purge_sweep', '', 1)", base + i));
-        }
-        conn.query_drop(sql).unwrap();
-    }
-
-    let purged = s.purge_windows_before(base + n).unwrap();
-    assert!(
-        purged >= n,
-        "every window below the cutoff must be purged and counted, not just one capped batch: \
-         expected at least {n}, got {purged}"
-    );
-    let left: u64 = {
-        let mut conn = s.pool.get_conn().unwrap();
-        conn.query_first("SELECT COUNT(*) FROM usage_windows WHERE bucket_id = 'vk_purge_sweep'")
-            .unwrap()
-            .unwrap_or(0)
-    };
-    assert_eq!(left, 0, "no window below the cutoff may survive the purge");
-}
-
 #[test]
 fn get_usage_on_an_empty_window_returns_zeroes_not_a_panic() {
     // Regression test: `SUM(x)` with no GROUP BY always returns exactly one row even when zero
@@ -657,10 +567,6 @@ fn get_usage_on_an_empty_window_returns_zeroes_not_a_panic() {
 
 #[test]
 fn add_usage_accumulates_and_floors_at_zero() {
-    // Reads a usage window back, so it has to be serialised against the UNSCOPED
-    // `purge_windows_before` like the other window-reading tests. It was missed when that lock was
-    // introduced, which left it losing its rows to a concurrent purge about 1 run in 18.
-    let _guard = lock_usage_windows();
     let Some(s) = fresh_store() else { return };
     let delta = UsageDelta {
         requests: 3,
@@ -700,7 +606,8 @@ fn add_metering_upserts_and_accumulates() {
     s.put_key(&sample_key("vk_meter", "g")).unwrap();
     let d = MeteringDelta {
         key_id: "vk_meter".to_string(),
-        bucket: 20260731,
+        // A bucket no other test uses: the purge tests wipe whole buckets.
+        bucket: 20260915,
         model: "m".to_string(),
         provider: "p".to_string(),
         tokens_input: 10,
@@ -716,7 +623,12 @@ fn add_metering_upserts_and_accumulates() {
     };
     s.add_metering(&d).unwrap();
     s.add_metering(&d).unwrap();
-    let rows = s.list_metering(20260731).unwrap();
+    let rows: Vec<_> = s
+        .list_metering(20260915)
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.key_id == "vk_meter")
+        .collect();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].requests, 2);
     assert_eq!(rows[0].tokens_input, 20);
@@ -728,26 +640,39 @@ fn add_metering_upserts_and_accumulates() {
 #[test]
 fn denylist_add_and_list_roundtrips_and_never_shortens_the_window() {
     let Some(s) = fresh_store() else { return };
-    s.add_denylist("sub1", "revoked").unwrap();
-    assert!(s.list_denylist().unwrap().contains(&"sub1".to_string()));
-    // Re-adding must not error (idempotent upsert path).
-    s.add_denylist("sub1", "revoked again").unwrap();
+    s.add_denylist("sub_window", "revoked").unwrap();
+    assert!(s
+        .list_denylist()
+        .unwrap()
+        .contains(&"sub_window".to_string()));
+    // Push the stored expiry far past anything a re-add computes, and note the revision.
+    let far = 4_000_000_000_000u64;
+    let (before_exp, before_rev): (u64, u64) = {
+        let mut conn = s.pool.get_conn().unwrap();
+        conn.exec_drop(
+            "UPDATE denylist SET expires_at = :far WHERE sub = 'sub_window'",
+            params! { "far" => far },
+        )
+        .unwrap();
+        conn.query_first("SELECT expires_at, revision FROM denylist WHERE sub = 'sub_window'")
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(before_exp, far);
+    // Re-adding must not error (idempotent upsert path), must never shorten the window, and must
+    // bump the revision.
+    s.add_denylist("sub_window", "revoked again").unwrap();
+    let (after_exp, after_rev): (u64, u64) = {
+        let mut conn = s.pool.get_conn().unwrap();
+        conn.query_first("SELECT expires_at, revision FROM denylist WHERE sub = 'sub_window'")
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(after_exp, far, "a re-add must never shorten the window");
+    assert!(after_rev > before_rev, "{after_rev} > {before_rev}");
 }
 
 // ── Boot-time invariant probes ───────────────────────────────────────────────────────────────────
-
-/// Proves the CHECK-enforcement functional probe actually detects a real violation attempt and
-/// would refuse to boot if the server didn't enforce it (this test can't easily simulate a real
-/// pre-8.0.16 server, so it proves the probe's DETECTION half by confirming a live server currently
-/// running under CI/local docker actually enforces the constraint it probes).
-#[test]
-fn boot_probe_confirms_check_enforcement_on_a_real_server() {
-    let Some(url) = test_url() else { return };
-    // connect() itself runs the probe internally and would have returned Err if enforcement were
-    // missing -- reaching this line at all is the proof for a real MySQL 8 server.
-    let store = MysqlStore::connect(&url).unwrap();
-    drop(store);
-}
 
 #[test]
 fn boot_probe_rejects_a_permissive_sql_mode() {
@@ -842,13 +767,12 @@ fn is_check_constraint_violation_accepts_only_the_two_real_engine_codes() {
 fn connect_establishes_strict_sql_mode_via_init_even_when_the_default_would_be_permissive() {
     let Some(url) = test_url() else { return };
     let opts = Opts::from_url(&url).unwrap();
-    let opts = mysql::OptsBuilder::from_opts(opts).init(vec![
-        // Simulates a permissive starting session (as if the server's own default were empty) --
-        // then the SAME append statement connect() itself uses. Both run, in order, on THIS
-        // pool's own connections only; never touches the real shared server default.
-        "SET SESSION sql_mode = ''",
-        "SET SESSION sql_mode = CONCAT(@@sql_mode, ',STRICT_ALL_TABLES')",
-    ]);
+    // Simulates a permissive starting session (as if the server's own default were empty) --
+    // then the SAME statements connect() itself runs (`crate::INIT`). All run, in order, on THIS
+    // pool's own connections only; never touches the real shared server default.
+    let mut init = vec!["SET SESSION sql_mode = ''"];
+    init.extend(crate::INIT.iter().copied());
+    let opts = mysql::OptsBuilder::from_opts(opts).init(init);
     let pool = Pool::new(opts).unwrap();
     let mut conn = pool.get_conn().unwrap();
     let sql_mode: String = conn.query_first("SELECT @@sql_mode").unwrap().unwrap();
@@ -860,7 +784,7 @@ fn connect_establishes_strict_sql_mode_via_init_even_when_the_default_would_be_p
 
 // ── Lock ordering ─────────────────────────────────────────────────────────────────────────────────
 
-/// `delete_key`/`scrub_key` must lock `store_sequence` (via `bump_revision`) BEFORE locking the
+/// `delete_key` must lock `store_sequence` (via `bump_revision`) BEFORE locking the
 /// `api_keys` row, matching every other control-plane transaction (`put_key`, `put_credential`,
 /// `revoke_credential`) — that fixed order is what the module doc claims makes deadlock across the
 /// admin plane structurally impossible. Proves it by racing a tight loop of `put_key` against a tight
@@ -1130,73 +1054,6 @@ fn migrate_v3_does_not_touch_a_table_when_the_database_is_not_pre_v3() {
     );
 }
 
-/// KNOWN, DOCUMENTED, NOT-YET-CLOSED GAP -- see `run_v2_backfill_if_needed`'s own doc comment for
-/// the full writeup, including why a `GET_LOCK` does not close it. Characterizes the exact
-/// rolling-upgrade race as a
-/// deterministic ORDER-of-operations reproduction (no real thread timing needed -- the race is
-/// about which write reaches the row first, which a single-threaded test can fully control): a
-/// pre-v2 row that receives ONE legitimate real v2 write (simulating an already-live node
-/// elsewhere in the fleet) BEFORE this node's own backfill runs permanently loses its pre-v2
-/// history from ever being counted as billable.
-///
-/// `#[ignore]`d: it documents real, CURRENT behavior rather than guarding a regression, so it
-/// fails today by design. Un-ignore once the provenance-based redesign
-/// `run_v2_backfill_if_needed` describes lands, at which point the assertion starts passing.
-#[test]
-#[ignore = "characterizes a known, documented, not-yet-fixed gap -- see run_v2_backfill_if_needed's doc comment"]
-fn characterize_v2_backfill_loses_a_row_to_a_racing_live_write() {
-    let Some(s) = fresh_store() else { return };
-    let table = unique_scratch_table("racecharacterize");
-
-    let mut conn = s.pool.get_conn().unwrap();
-    conn.query_drop(format!(
-        "CREATE TABLE {table} (
-            bucket_id VARCHAR(64) NOT NULL,
-            window_start BIGINT NOT NULL,
-            requests BIGINT NOT NULL DEFAULT 0,
-            billable_requests BIGINT NOT NULL DEFAULT 0,
-            PRIMARY KEY (bucket_id, window_start)
-        ) ENGINE=InnoDB"
-    ))
-    .unwrap();
-    // Pre-v2 history: 10 real requests, never tracked as billable (this store didn't split the
-    // counters before v2).
-    conn.query_drop(format!(
-        "INSERT INTO {table} (bucket_id, window_start, requests, billable_requests) \
-         VALUES ('vk_race', 7000, 10, 0)"
-    ))
-    .unwrap();
-
-    // A live, already-upgraded node's REAL v2 write lands FIRST -- legitimate: 2 new billable
-    // requests arrive after the upgrade, correctly tracked in lockstep by v2-aware code.
-    conn.query_drop(format!(
-        "UPDATE {table} SET requests = requests + 2, billable_requests = billable_requests + 2 \
-         WHERE bucket_id = 'vk_race' AND window_start = 7000"
-    ))
-    .unwrap();
-
-    // THEN this (still-booting) node's backfill runs.
-    MysqlStore::run_v2_backfill_if_needed(&mut conn, 1, &table).unwrap();
-
-    let (requests, billable): (u64, u64) = conn
-        .query_first(format!(
-            "SELECT requests, billable_requests FROM {table} \
-             WHERE bucket_id='vk_race' AND window_start=7000"
-        ))
-        .unwrap()
-        .unwrap();
-    conn.query_drop(format!("DROP TABLE {table}")).unwrap();
-
-    assert_eq!(requests, 12, "sanity: 10 pre-v2 + 2 live v2 requests");
-    assert_eq!(
-        billable, 12,
-        "the pre-v2 10 requests should be reclassified as billable too -- if this fails, \
-         billable_requests stayed at 2 (only the live write's own delta) because the backfill's \
-         predicate (billable_requests = 0) no longer matched once the live write touched the row \
-         first. This is the documented, known gap in run_v2_backfill_if_needed's doc comment."
-    );
-}
-
 /// The two tests above prove `run_v2_backfill_if_needed` works correctly called DIRECTLY with a
 /// hand-supplied `prior_version`/`table` -- neither ever goes through `try_init_schema`'s REAL
 /// wiring: reading `prior_version` from the actual `store_meta.schema_version` row and calling the
@@ -1216,38 +1073,10 @@ fn characterize_v2_backfill_loses_a_row_to_a_racing_live_write() {
 #[test]
 fn try_init_schema_real_wiring_backfills_a_genuinely_pre_v2_database() {
     let _ddl_guard = lock_fresh_database_ddl();
-    let Some(url) = test_url() else { return };
-    let db_name = format!(
-        "busbar_wiring_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
-
-    let root_url = url.replacen("busbar:busbar@", "root:busbar@", 1);
-    let root_opts = Opts::from_url(&root_url).unwrap();
-    let root_pool = Pool::new(root_opts).unwrap();
-    let mut root_conn = root_pool.get_conn().unwrap();
-    root_conn
-        .query_drop(format!("CREATE DATABASE {db_name}"))
-        .unwrap();
-    root_conn
-        .query_drop(format!(
-            "GRANT ALL PRIVILEGES ON {db_name}.* TO 'busbar'@'%'"
-        ))
-        .unwrap();
-
-    // Point the app-level busbar user at the fresh dedicated database (swap the path component of
-    // the URL, keep the same host/port/credentials). `url` is only a transitive dep (via `mysql`),
-    // so plain string surgery on the last path segment instead of a proper URL crate.
-    let dedicated_url = {
-        let cut = url
-            .rfind('/')
-            .expect("test_url() must be a mysql:// URL with a /database path");
-        format!("{}/{db_name}", &url[..cut])
+    let Some(db) = ScratchDb::new("wiring") else {
+        return;
     };
+    let dedicated_url = db.url.clone();
 
     // Boot ONCE to create the real schema for real via try_init_schema, then hand-seed a genuine
     // pre-v2 marker directly in the real store_meta row (safe here -- this database has no other
@@ -1279,10 +1108,6 @@ fn try_init_schema_real_wiring_backfills_a_genuinely_pre_v2_database() {
         .unwrap()
         .unwrap();
     drop(store2);
-
-    root_conn
-        .query_drop(format!("DROP DATABASE {db_name}"))
-        .unwrap();
 
     assert_eq!(requests, 5);
     assert_eq!(
@@ -1351,6 +1176,194 @@ fn read_prior_version_hard_fails_on_a_corrupt_stored_value() {
         result.is_err(),
         "a corrupt (non-numeric) schema_version value must hard-fail, not silently read as 0"
     );
+}
+
+// ── Audit fixes: usage_windows scope, metering collation, schema stamp, DDL race codes ───────────
+
+/// The `usage_windows` reads must pin `bucket_scope = 'key'`: it sits inside the primary key, and a
+/// row of another scope for the same bucket id and window is not this bucket's usage.
+#[test]
+fn get_usage_ignores_usage_windows_rows_of_another_scope() {
+    let Some(s) = fresh_store() else { return };
+    let bucket = "vk_scope_pin_unique";
+    let window = 7_700_000_000_123u64;
+    s.add_usage(
+        bucket,
+        window,
+        &UsageDelta {
+            requests: 2,
+            billable_requests: 1,
+            models: vec![ModelTokensDelta {
+                model: "m-key-scope".to_string(),
+                usage_units: units(&[(UNIT_INPUT, 10), (UNIT_OUTPUT, 5)]),
+            }],
+        },
+    )
+    .unwrap();
+    let mut conn = s.pool.get_conn().unwrap();
+    conn.exec_drop(
+        "INSERT INTO usage_windows (window_start, bucket_scope, bucket_id, model, requests, \
+         billable_requests, tokens_input, tokens_output) VALUES (:w, 'group', :b, 'm-group-scope', 40, 30, 900, 800)",
+        params! { "w" => window, "b" => bucket },
+    )
+    .unwrap();
+    let back = s.get_usage(bucket, window).unwrap();
+    conn.exec_drop(
+        "DELETE FROM usage_windows WHERE window_start = :w AND bucket_id = :b",
+        params! { "w" => window, "b" => bucket },
+    )
+    .unwrap();
+    assert_eq!((back.requests, back.billable_requests), (2, 1), "{back:?}");
+    assert_eq!(back.models.len(), 1, "{back:?}");
+    assert_eq!(back.models[0].model, "m-key-scope", "{back:?}");
+    assert_eq!(back.models[0].tier(UNIT_INPUT), 10, "{back:?}");
+}
+
+/// `model`/`provider` in the metering tables are byte-exact keys (v11, D19), as in every other
+/// store: `GPT-4o` and `gpt-4o` are two cells, and each cell's units land on it and only on it.
+/// (Before v11 the case-insensitive default collation folded them onto one cell.)
+#[test]
+fn list_metering_keeps_model_spellings_apart_and_units_on_their_cell() {
+    let Some(s) = fresh_store() else { return };
+    let key = "vk_meter_collation_unique";
+    s.put_key(&sample_key(key, "g")).unwrap();
+    let bucket = 20_991_231u64;
+    let mut conn = s.pool.get_conn().unwrap();
+    let clean = |conn: &mut PooledConn| {
+        for t in ["usage_metering_units", "usage_metering"] {
+            conn.exec_drop(
+                format!("DELETE FROM {t} WHERE key_id = :k AND bucket = :b"),
+                params! { "k" => key, "b" => format!("{bucket:010}") },
+            )
+            .unwrap();
+        }
+    };
+    clean(&mut conn);
+    let delta = |model: &str, usage_units: BTreeMap<String, u64>| MeteringDelta {
+        key_id: key.to_string(),
+        bucket,
+        model: model.to_string(),
+        provider: "p".to_string(),
+        tokens_input: 1,
+        tokens_output: 1,
+        tokens_cache_read: 0,
+        tokens_cache_write: 0,
+        requests: 1,
+        billable_requests: 1,
+        key_group_at_use: String::new(),
+        pricing_version: "v1".to_string(),
+        priced_from_ms: 0,
+        usage_units,
+    };
+    s.add_metering(&delta("GPT-4o", BTreeMap::new())).unwrap();
+    s.add_metering(&delta("gpt-4o", units(&[("tool_calls", 5)])))
+        .unwrap();
+    let rows: Vec<_> = s
+        .list_metering(bucket)
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.key_id == key)
+        .collect();
+    clean(&mut conn);
+    assert_eq!(rows.len(), 2, "two spellings, two cells: {rows:?}");
+    let cell = |model: &str| {
+        rows.iter()
+            .find(|r| r.model == model)
+            .unwrap_or_else(|| panic!("no {model} cell: {rows:?}"))
+    };
+    assert_eq!(
+        cell("gpt-4o").usage_units.get("tool_calls"),
+        Some(&5),
+        "{rows:?}"
+    );
+    assert_eq!(cell("gpt-4o").requests, 1, "{rows:?}");
+    assert!(cell("GPT-4o").usage_units.is_empty(), "{rows:?}");
+    assert_eq!(cell("GPT-4o").requests, 1, "{rows:?}");
+}
+
+#[test]
+fn stamp_schema_version_never_lowers_a_newer_marker() {
+    let Some(s) = fresh_store() else { return };
+    let mut conn = s.pool.get_conn().unwrap();
+    let table = scratch_meta_table(&mut conn, "stampversion");
+    let read = |conn: &mut PooledConn| -> Option<String> {
+        conn.query_first(format!("SELECT v FROM {table} WHERE k = 'schema_version'"))
+            .unwrap()
+    };
+    let mut results = Vec::new();
+    // No row yet.
+    MysqlStore::stamp_schema_version(&mut conn, &table).unwrap();
+    results.push(read(&mut conn));
+    // An older marker is raised.
+    conn.query_drop(format!(
+        "UPDATE {table} SET v = '3' WHERE k = 'schema_version'"
+    ))
+    .unwrap();
+    MysqlStore::stamp_schema_version(&mut conn, &table).unwrap();
+    results.push(read(&mut conn));
+    // A newer build's marker is kept.
+    let newer = (SCHEMA_VERSION + 1).to_string();
+    conn.query_drop(format!(
+        "UPDATE {table} SET v = '{newer}' WHERE k = 'schema_version'"
+    ))
+    .unwrap();
+    MysqlStore::stamp_schema_version(&mut conn, &table).unwrap();
+    results.push(read(&mut conn));
+    conn.query_drop(format!("DROP TABLE {table}")).unwrap();
+    let current = Some(SCHEMA_VERSION.to_string());
+    assert_eq!(results[0], current, "no row -> stamped");
+    assert_eq!(results[1], current, "older marker -> raised");
+    assert_eq!(
+        results[2].as_deref(),
+        Some(newer.as_str()),
+        "a newer marker must not be lowered"
+    );
+}
+
+fn server_error(code: u16, state: &str, message: &str) -> crate::mysqlwire::Error {
+    crate::mysqlwire::Error::MySqlError(crate::mysqlwire::MySqlError {
+        code,
+        state: state.into(),
+        message: message.into(),
+    })
+}
+
+/// Boot DDL races are recognised by server error code, not by English message text.
+#[test]
+fn ddl_race_is_recognised_by_code_not_by_english_text() {
+    assert!(crate::MysqlStore::is_ddl_race(&server_error(
+        1061,
+        "42000",
+        "Doppelter Schlüsselname 'idx'"
+    )));
+    assert!(crate::MysqlStore::is_ddl_race(&server_error(
+        1050,
+        "42S01",
+        "Tabelle 't' existiert bereits"
+    )));
+    assert!(
+        !crate::MysqlStore::is_ddl_race(&server_error(
+            1146,
+            "42S02",
+            "Table 'x.y' already exists in some other sense"
+        )),
+        "an unrelated error whose text says 'already exists' is not a race"
+    );
+}
+
+#[test]
+fn deadlock_is_recognised_by_code_not_by_english_text() {
+    let e = server_error(
+        1213,
+        "40001",
+        "Verklemmung beim Versuch, eine Sperre zu bekommen",
+    );
+    assert!(crate::MysqlStore::is_deadlock(&format!(
+        "schema init failed: {e}\nstatement: CREATE INDEX x"
+    )));
+    assert!(!crate::MysqlStore::is_deadlock(
+        "schema init failed: ERROR 1146 (42S02): Deadlock found in a message"
+    ));
 }
 
 /// `revoke_credential` must reject an unknown/typo'd id loudly, not silently return `Ok(())`.
@@ -1647,15 +1660,6 @@ mod conformance {
     }
 
     #[test]
-    fn append_audit_duplicate_seq_is_ok_when_identical_and_an_error_when_different() {
-        let seq = 910_000_000u64 + (std::process::id() as u64 % 1_000_000);
-        let Some((store, _ns)) = setup("aud", seq) else {
-            return;
-        };
-        conf::assert_append_audit_duplicate_seq(&**store, seq);
-    }
-
-    #[test]
     fn plane_task_upsert_get_list() {
         let Some((store, ns)) = setup("ptk", 0) else {
             return;
@@ -1755,90 +1759,6 @@ mod conformance {
             b.join().expect("run B must not panic");
         });
     }
-}
-
-/// Concurrent appends of DIFFERENT seqs must not deadlock.
-///
-/// The duplicate-seq comparison was first written as `SELECT ... FOR UPDATE` then INSERT. Under
-/// REPEATABLE READ (what `TxOpts::default()` leaves the server on) a `FOR UPDATE` on a MISSING row
-/// takes a next-key/gap lock; two appends of different, both-new seqs land in the same gap, and each
-/// side's following INSERT needs an insert-intention lock that conflicts with the other's gap lock.
-/// Four threads over 200 distinct seqs each produced 39 `ERROR 1213` deadlocks that way, against 0
-/// for the plain insert it replaced. `append_audit` is also the one control-plane path that does not
-/// call `bump_revision`, so it sits outside the `store_sequence` serialization that keeps every other
-/// admin-plane transaction deadlock-free.
-///
-/// A durable audit write-through failing under ordinary multi-node load defeats the whole point of
-/// the durable sink, so this pins it.
-#[test]
-fn concurrent_appends_of_distinct_seqs_never_deadlock() {
-    // ONE store, shared by every thread, instead of one `connect()` per worker.
-    //
-    // `MysqlStore::connect` re-runs the whole schema DDL on every call (`init_schema`), and doing
-    // that mid-suite makes sibling tests holding `SELECT ... FOR UPDATE` fail with
-    // `ERROR 1412 (Table definition has changed, please retry transaction)`. An earlier version of
-    // this test connected six extra times and took a suite that was 20/20 clean to 3/20 failing --
-    // while the commit adding it claimed to have REMOVED mid-suite connects. The pool inside one
-    // store is what provides the concurrency here; extra stores only bought extra DDL.
-    let Some(url) = test_url() else { return };
-    let base = 940_000_000u64 + (std::process::id() as u64 % 100_000) * 1_000;
-    let shared = std::sync::Arc::new(MysqlStore::connect(&url).expect("connect"));
-    // Join the one-time wipe barrier before writing anything, or it can fire mid-run and truncate
-    // `audit_log` underneath these 200 appends.
-    ensure_reset(&shared);
-    {
-        let store = std::sync::Arc::clone(&shared);
-        let mut conn = store.conn().expect("conn");
-        let _ = conn.exec_drop(
-            "DELETE FROM audit_log WHERE seq >= :lo AND seq < :hi",
-            params! { "lo" => base, "hi" => base + 1_000 },
-        );
-    }
-
-    let threads: Vec<_> = (0..4u64)
-        .map(|t| {
-            let store = std::sync::Arc::clone(&shared);
-            std::thread::spawn(move || {
-                for i in 0..50u64 {
-                    let seq = base + t * 100 + i;
-                    let rec = AuditRecord {
-                        seq,
-                        ts: 1_700_000_000,
-                        action: "key.mint".into(),
-                        resource: format!("key:vk_{seq}"),
-                        outcome: "applied".into(),
-                        principal: "admin".into(),
-                        prev_hash: String::new(),
-                        hash: format!("h{seq}"),
-                    };
-                    if let Err(e) = store.append_audit(&rec) {
-                        let msg = e.to_string();
-                        assert!(
-                            !msg.contains("Deadlock") && !msg.contains("1213"),
-                            "concurrent appends of DISTINCT seqs deadlocked: {msg}"
-                        );
-                        panic!("append_audit failed unexpectedly: {msg}");
-                    }
-                }
-            })
-        })
-        .collect();
-    for h in threads {
-        h.join().expect("no append thread may fail");
-    }
-
-    let mut conn = shared.conn().expect("conn");
-    let n: Option<u64> = conn
-        .exec_first(
-            "SELECT COUNT(*) FROM audit_log WHERE seq >= :lo AND seq < :hi",
-            params! { "lo" => base, "hi" => base + 1_000 },
-        )
-        .unwrap();
-    assert_eq!(n, Some(200), "every distinct append must be durably stored");
-    let _ = conn.exec_drop(
-        "DELETE FROM audit_log WHERE seq >= :lo AND seq < :hi",
-        params! { "lo" => base, "hi" => base + 1_000 },
-    );
 }
 
 // ── THE NEUTRAL PLANE-RECORD STORE (busbar 1.6.0) ─────────────────────────────────────────────
@@ -3297,7 +3217,6 @@ fn the_1_6_0_key_fields_round_trip() {
 /// absolute `put_usage`.
 #[test]
 fn open_usage_units_round_trip_accumulate_and_floor_at_zero() {
-    let _guard = lock_usage_windows();
     let Some(s) = fresh_store() else { return };
     let ledger = UsageLedger {
         requests: 2,
@@ -3353,18 +3272,6 @@ fn open_usage_units_round_trip_accumulate_and_floor_at_zero() {
     };
     s.put_usage("vk_open_units", 1_000_201, &replaced).unwrap();
     assert_eq!(s.get_usage("vk_open_units", 1_000_201).unwrap(), replaced);
-
-    // And the retention sweep takes a window's open units with it.
-    s.purge_windows_before(1_000_202).unwrap();
-    let mut conn = s.conn().unwrap();
-    let left: Option<u64> = conn
-        .query_first("SELECT COUNT(*) FROM usage_window_units WHERE bucket_id = 'vk_open_units'")
-        .unwrap();
-    assert_eq!(
-        left,
-        Some(0),
-        "a purged window leaves no open-unit rows behind"
-    );
 }
 
 fn metering_delta(key: &str, bucket: u64, priced_from_ms: u64) -> MeteringDelta {
@@ -3419,22 +3326,6 @@ fn metering_cells_split_on_priced_from_ms_and_carry_open_units() {
     assert_eq!(rows[1].priced_from_ms, 1_780_000_000_000);
     assert_eq!(rows[1].requests, 1);
     assert_eq!(rows[1].usage_units, units(&[("tool_calls", 2)]));
-
-    assert!(s.purge_metering_before(&bucket.to_string()).unwrap() >= 2);
-    assert!(s
-        .list_metering(bucket)
-        .unwrap()
-        .iter()
-        .all(|r| r.key_id != "vk_meter79"));
-    let mut conn = s.conn().unwrap();
-    let left: Option<u64> = conn
-        .query_first("SELECT COUNT(*) FROM usage_metering_units WHERE key_id = 'vk_meter79'")
-        .unwrap();
-    assert_eq!(
-        left,
-        Some(0),
-        "a purged cell leaves no open-unit rows behind"
-    );
 }
 
 // ── The store v3 slots (the door's additions to the 1.5.5 op set) ─────────────────────────────
@@ -3465,7 +3356,7 @@ impl ScratchDb {
                 .unwrap()
                 .as_nanos()
         );
-        let root_url = url.replacen("busbar:busbar@", "root:busbar@", 1);
+        let root_url = root_url(&url);
         let root = Pool::new(Opts::from_url(&root_url).unwrap()).unwrap();
         let mut c = root.get_conn().unwrap();
         c.query_drop(format!("CREATE DATABASE {name}")).unwrap();
@@ -4049,4 +3940,543 @@ fn migrate_over_the_1_5_5_rows_is_idempotent() {
     assert_eq!(schema_version_of(&db), SCHEMA_VERSION.to_string());
     assert_1_5_5_rows_read_back(&store);
     assert_eq!(read_everything_1_5_5(&store), first);
+}
+
+// ── settings, redaction, newer schema, purge bucket: the alignment refusals ─────────────────────
+
+/// `open`/`validate` judge the settings the same way, and every refusal is in the plugin's words.
+#[test]
+fn settings_are_judged_strictly() {
+    let open = |s: &str| MysqlStore::open(s.as_bytes()).err();
+    assert_eq!(
+        open(r#"{"url":"mysql://u@h/d","bogus":1}"#).as_deref(),
+        Some("invalid mysql plugin config: unknown setting `bogus` (accepted: url)")
+    );
+    assert_eq!(
+        open(r#"{"url":5}"#).as_deref(),
+        Some("invalid mysql plugin config: `url` must be a string")
+    );
+    assert_eq!(
+        open(r#"{"url":null}"#).as_deref(),
+        Some("invalid mysql plugin config: `url` must be a string")
+    );
+    let e = open(r#"{"url":"mysql://u@h/d?pool_max=5"}"#).unwrap();
+    assert!(
+        e.starts_with("invalid mysql plugin config: url: mysql store: URL parameter `pool_max`"),
+        "{e}"
+    );
+    let e = open(r#"{"url":"postgres://u@h/d"}"#).unwrap();
+    assert!(e.starts_with("invalid mysql plugin config: url: "), "{e}");
+    assert!(open(r#"{"url":"mysql://u@h/d"}"#).is_none());
+    // validate and open agree.
+    assert_eq!(
+        <crate::MysqlStore as busbar_contract::abi::sdk::store::StoreSlots>::validate(
+            br#"{"url":"mysql://u@h/d","x":1}"#
+        )
+        .unwrap_err(),
+        "invalid mysql plugin config: unknown setting `x` (accepted: url)"
+    );
+}
+
+/// An unencoded `?` in the password makes the URL's tail a bogus parameter; neither `open` nor
+/// `validate` may echo any of the password, raw or percent-decoded.
+#[test]
+fn a_settings_refusal_never_carries_the_url_password() {
+    for url in [
+        "mysql://u:12?abc@h/db",
+        "mysql://u:p%40ss%3Fw0rd@h/db?bogus=1",
+        "mysql://u:s3cret@h/db?pool_max=5&bogus",
+    ] {
+        let settings = serde_json::json!({ "url": url }).to_string();
+        for e in [
+            MysqlStore::open(settings.as_bytes()).err().unwrap(),
+            <crate::MysqlStore as busbar_contract::abi::sdk::store::StoreSlots>::validate(
+                settings.as_bytes(),
+            )
+            .unwrap_err(),
+        ] {
+            for secret in ["12?abc", "abc@h", "p%40ss%3Fw0rd", "p@ss?w0rd", "s3cret"] {
+                assert!(!e.contains(secret), "{url}: {secret:?} leaked in {e:?}");
+            }
+        }
+    }
+}
+
+/// A database stamped ABOVE this build's schema is refused at open, before any DDL; the same
+/// version opens.
+#[test]
+fn a_newer_schema_is_refused_at_open() {
+    let _ddl_guard = lock_fresh_database_ddl();
+    let Some(db) = ScratchDb::new("newer") else {
+        return;
+    };
+    drop(MysqlStore::connect(&db.url).expect("a fresh database opens"));
+    assert_eq!(schema_version_of(&db), SCHEMA_VERSION.to_string());
+    drop(MysqlStore::connect(&db.url).expect("the same version opens"));
+    let newer = SCHEMA_VERSION + 1;
+    db.conn()
+        .query_drop(format!(
+            "UPDATE store_meta SET v = '{newer}' WHERE k = 'schema_version'"
+        ))
+        .unwrap();
+    // A marker table the open would have created had it run DDL.
+    db.conn().query_drop("DROP TABLE store_records").unwrap();
+    let e = MysqlStore::connect(&db.url)
+        .err()
+        .expect("a newer schema is refused");
+    assert!(
+        e.contains(&format!(
+            "mysql store: database schema v{newer} is newer than this build (v{SCHEMA_VERSION}); \
+             refusing to open"
+        )),
+        "{e}"
+    );
+    let recreated: Option<String> = db
+        .conn()
+        .query_first("SHOW TABLES LIKE 'store_records'")
+        .unwrap();
+    assert!(recreated.is_none(), "no DDL ran before the refusal");
+    assert_eq!(schema_version_of(&db), newer.to_string(), "not restamped");
+}
+
+// ── D19: store keys are EXACT ──────────────────────────────────────────────────────────────────
+
+/// D19, RED BEFORE GREEN: `'abc'` and `'abc '` are TWO keys, as they are in every other store
+/// (postgres, sqlite, valkey, memory). MySQL's `ascii_bin`/`utf8mb4_bin` collations are PAD SPACE,
+/// so under them the trailing space vanished from every comparison: a key minted as `'abc '`
+/// overwrote `'abc'`, a spent token's space-padded twin was refused as already spent, and a record
+/// schema read back another schema's rows. Each surface below writes both spellings and reads
+/// each back as itself.
+#[test]
+fn keys_differing_only_by_trailing_space_are_distinct() {
+    let _ddl_guard = lock_fresh_database_ddl();
+    let Some(db) = ScratchDb::new("exact") else {
+        return;
+    };
+    let store = MysqlStore::connect(&db.url).expect("a fresh database opens");
+
+    // Virtual keys (`api_keys.id`, ascii_bin before the fix).
+    store.put_key(&sample_key("abc", "gen-plain")).unwrap();
+    store.put_key(&sample_key("abc ", "gen-padded")).unwrap();
+    assert_eq!(
+        store.get_key("abc").unwrap().unwrap().generation_hash,
+        "gen-plain",
+        "'abc ' overwrote 'abc'"
+    );
+    let padded = store
+        .get_key("abc ")
+        .unwrap()
+        .expect("'abc ' is its own key");
+    assert_eq!(padded.id, "abc ");
+    assert_eq!(padded.generation_hash, "gen-padded");
+
+    // Plane records (`plane_records.ident`, utf8mb4_bin before the fix).
+    store
+        .upsert_plane_record(active_task("abc", "working", TASK_LIVE_TS + 1).view())
+        .unwrap();
+    store
+        .upsert_plane_record(active_task("abc ", "submitted", TASK_LIVE_TS + 2).view())
+        .unwrap();
+    assert_eq!(get_task(&store, "abc").unwrap()["state"], "working");
+    assert_eq!(get_task(&store, "abc ").unwrap()["state"], "submitted");
+
+    // The single-use ledger (`plane_tokens.token`): spending 'abc' does not spend 'abc '.
+    assert!(store
+        .redeem_plane_token("ask", "abc", TRUST_NOW + 900, TRUST_NOW)
+        .unwrap());
+    assert!(
+        store
+            .redeem_plane_token("ask", "abc ", TRUST_NOW + 900, TRUST_NOW)
+            .unwrap(),
+        "'abc ' was refused as already spent because 'abc' was"
+    );
+
+    // Kernel records (`store_records.schema_id`).
+    store.record_put("abc", b"k", b"plain").unwrap();
+    store.record_put("abc ", b"k", b"padded").unwrap();
+    assert_eq!(
+        store.record_get("abc", b"k").unwrap().unwrap().as_slice(),
+        b"plain"
+    );
+    assert_eq!(
+        store.record_get("abc ", b"k").unwrap().unwrap().as_slice(),
+        b"padded"
+    );
+}
+
+/// A database exactly as the v10 build (dev before D19) left it, holding one row keyed `'abc'` in
+/// every table v11 retypes.
+fn build_v10_database(db: &ScratchDb) {
+    let mut c = db.conn();
+    c.query_drop("SET SESSION sql_mode = CONCAT(@@sql_mode, ',STRICT_ALL_TABLES')")
+        .unwrap();
+    for stmt in schema_fixtures::V10_SCHEMA {
+        c.query_drop(*stmt).unwrap();
+    }
+    for stmt in V10_ABC_ROWS {
+        c.query_drop(*stmt).unwrap();
+    }
+}
+
+const V10_ABC_ROWS: &[&str] = &[
+    "INSERT INTO store_meta (k, v) VALUES ('schema_version', '10')",
+    "INSERT INTO store_sequence (id, revision) VALUES (1, 7)",
+    "INSERT INTO api_keys (id, name, key_group, allowed_pools, labels, enabled, generation_hash, \
+     created_at, updated_at, revision) VALUES ('abc', 'old', 'grp', NULL, '{}', 1, 'gen-abc', \
+     1000, 1000, 7)",
+    "INSERT INTO credentials (id, key_id, kind, slot, public_id, secret, secret_form, created_at, \
+     updated_at, revision) VALUES ('abc', 'abc', 'sigv4', 0, 'abc', 'v1:plain:abc', \
+     'recoverable', 1000, 1000, 7)",
+    "INSERT INTO denylist (sub, reason, revoked_at, expires_at, revision) \
+     VALUES ('abc', 'r', 2000, 9000000000, 7)",
+    "INSERT INTO usage_windows (window_start, bucket_scope, bucket_id, model, requests, \
+     billable_requests) VALUES (3000, 'key', 'abc', 'gpt-x', 9, 8)",
+    "INSERT INTO usage_metering (bucket, key_id, provider, model, key_group_at_use, \
+     pricing_version, requests, billable_requests) VALUES ('0020260731', 'abc', 'p', 'm', 'grp', \
+     'v1', 4, 3)",
+    "INSERT INTO plane_records (kind, ident, seq, id, parent, ts, terminal, body) \
+     VALUES ('task', 'abc', 0, 'abc', NULL, 2000000001, FALSE, '{\"state\":\"working\"}')",
+    "INSERT INTO plane_tokens (kind, token, expires_at) VALUES ('ask', 'abc', 9000000000)",
+    "INSERT INTO usage_window_units (window_start, bucket_scope, bucket_id, model, unit, count) \
+     VALUES (3000, 'key', 'abc', 'gpt-x', 'abc', 5)",
+    "INSERT INTO usage_metering_units (bucket, key_id, provider, model, priced_from_ms, unit, \
+     count) VALUES ('0020260731', 'abc', 'p', 'm', 0, 'abc', 2)",
+    "INSERT INTO store_records (schema_id, rkey, value) VALUES ('abc', 'k', 'v-abc')",
+];
+
+/// The same rows with `'abc '` where the v10 key held `'abc'`: one per table, each a different key
+/// under byte comparison, each the SAME key under v10's PAD SPACE collations.
+const V10_PADDED_TWINS: &[&str] = &[
+    "INSERT INTO api_keys (id, name, key_group, allowed_pools, labels, enabled, generation_hash, \
+     created_at, updated_at, revision) VALUES ('abc ', 'twin', 'grp', NULL, '{}', 1, 'gen-twin', \
+     1000, 1000, 8)",
+    "INSERT INTO credentials (id, key_id, kind, slot, public_id, secret, secret_form, created_at, \
+     updated_at, revision) VALUES ('abc ', 'abc', 'sigv4', 1, 'abc2', 'v1:plain:abc', \
+     'recoverable', 1000, 1000, 8)",
+    "INSERT INTO credentials (id, key_id, kind, slot, public_id, secret, secret_form, created_at, \
+     updated_at, revision) VALUES ('abc2', 'abc ', 'sigv4', 0, 'abc ', 'v1:plain:abc', \
+     'recoverable', 1000, 1000, 8)",
+    "INSERT INTO denylist (sub, reason, revoked_at, expires_at, revision) \
+     VALUES ('abc ', 'r', 2000, 9000000000, 8)",
+    "INSERT INTO usage_windows (window_start, bucket_scope, bucket_id, model, requests, \
+     billable_requests) VALUES (3000, 'key', 'abc ', 'gpt-x', 1, 1)",
+    "INSERT INTO usage_metering (bucket, key_id, provider, model, key_group_at_use, \
+     pricing_version, requests, billable_requests) VALUES ('0020260731', 'abc ', 'p', 'm', 'grp', \
+     'v1', 1, 1)",
+    "INSERT INTO plane_records (kind, ident, seq, id, parent, ts, terminal, body) \
+     VALUES ('task', 'abc ', 0, 'abc ', NULL, 2000000001, FALSE, '{}')",
+    "INSERT INTO plane_tokens (kind, token, expires_at) VALUES ('ask', 'abc ', 9000000000)",
+    "INSERT INTO usage_window_units (window_start, bucket_scope, bucket_id, model, unit, count) \
+     VALUES (3000, 'key', 'abc', 'gpt-x', 'abc ', 1)",
+    "INSERT INTO usage_metering_units (bucket, key_id, provider, model, priced_from_ms, unit, \
+     count) VALUES ('0020260731', 'abc', 'p', 'm', 0, 'abc ', 1)",
+    "INSERT INTO store_records (schema_id, rkey, value) VALUES ('abc ', 'k', 'v-twin')",
+];
+
+/// Every column, constraint and index of `db`'s tables, as `information_schema` reports them.
+fn schema_shape(db: &ScratchDb) -> Vec<String> {
+    let mut c = db.conn();
+    let mut out: Vec<String> = c
+        .exec_map(
+            "SELECT table_name, column_name, column_type, is_nullable, \
+             COALESCE(column_default, '<none>'), COALESCE(collation_name, '<none>') \
+             FROM information_schema.columns WHERE table_schema = DATABASE() \
+             ORDER BY table_name, ordinal_position",
+            (),
+            |(t, col, ty, null, def, coll): (String, String, String, String, String, String)| {
+                format!("column {t}.{col} {ty} null={null} default={def} collation={coll}")
+            },
+        )
+        .unwrap();
+    out.extend(
+        c.exec_map(
+            "SELECT table_name, constraint_name, constraint_type FROM \
+             information_schema.table_constraints WHERE table_schema = DATABASE() \
+             ORDER BY table_name, constraint_name",
+            (),
+            |(t, n, ty): (String, String, String)| format!("constraint {t}.{n} {ty}"),
+        )
+        .unwrap(),
+    );
+    out.extend(
+        c.exec_map(
+            "SELECT table_name, index_name, seq_in_index, column_name FROM \
+             information_schema.statistics WHERE table_schema = DATABASE() \
+             ORDER BY table_name, index_name, seq_in_index",
+            (),
+            |(t, i, n, col): (String, String, u64, String)| format!("index {t}.{i}[{n}] {col}"),
+        )
+        .unwrap(),
+    );
+    out
+}
+
+fn meta_row(db: &ScratchDb, k: &str) -> Option<String> {
+    db.conn()
+        .exec_first("SELECT v FROM store_meta WHERE k = ?", (k,))
+        .unwrap()
+}
+
+/// The shape a FRESH database gets from this build.
+fn fresh_schema_shape() -> Option<Vec<String>> {
+    let db = ScratchDb::new("shape")?;
+    drop(MysqlStore::connect(&db.url).expect("a fresh database opens"));
+    Some(schema_shape(&db))
+}
+
+/// The `'abc'` rows read back through this build's surface, unchanged by the migration.
+fn assert_abc_rows_read_back(store: &MysqlStore) {
+    let k = store.get_key("abc").unwrap().expect("the key survives");
+    assert_eq!(
+        (k.id.as_str(), k.generation_hash.as_str()),
+        ("abc", "gen-abc")
+    );
+    let cred = store
+        .lookup_credential_secret("sigv4", "abc")
+        .unwrap()
+        .expect("the credential survives");
+    assert_eq!(cred.meta.key_id, "abc");
+    assert_eq!(
+        store.get_plane_record("task", "abc").unwrap().as_deref(),
+        Some(&br#"{"state":"working"}"#[..])
+    );
+    assert!(
+        !store
+            .redeem_plane_token("ask", "abc", TRUST_NOW + 900, TRUST_NOW)
+            .unwrap(),
+        "the spent token is still spent"
+    );
+    assert_eq!(
+        store.record_get("abc", b"k").unwrap().unwrap().as_slice(),
+        b"v-abc"
+    );
+}
+
+/// D19's MIGRATION. A v10 database (every key `ascii_bin`/`utf8mb4_bin`, PAD SPACE) is converted
+/// in place on the first v11 open:
+/// - BEFORE: every `'abc '` twin is REFUSED as a duplicate of the `'abc'` row (ER_DUP_ENTRY), which
+///   is why no pair that collides under byte comparison can exist in a database to migrate;
+/// - AFTER: the database's shape is exactly a fresh v11 database's, every row reads back, the
+///   version is stamped, the migration marker is gone, and every twin is now its own row;
+/// - a second open changes nothing.
+#[test]
+fn v11_converts_a_v10_database_to_exact_keys_in_place() {
+    let _ddl_guard = lock_fresh_database_ddl();
+    let Some(fresh) = fresh_schema_shape() else {
+        return;
+    };
+    let Some(db) = ScratchDb::new("v11") else {
+        return;
+    };
+    build_v10_database(&db);
+    {
+        let mut c = db.conn();
+        for twin in V10_PADDED_TWINS {
+            match c.query_drop(*twin) {
+                Err(mysql::Error::MySqlError(e)) if e.code == 1062 => {}
+                other => panic!("v10 must merge the padded twin onto 'abc': {other:?}\n{twin}"),
+            }
+        }
+    }
+    assert_ne!(schema_shape(&db), fresh, "the fixture is the pre-D19 shape");
+
+    let store = MysqlStore::connect(&db.url).expect("this build opens and migrates a v10 database");
+    assert_eq!(schema_version_of(&db), SCHEMA_VERSION.to_string());
+    assert_eq!(meta_row(&db, "migrating_to"), None, "the marker is cleared");
+    assert_eq!(
+        schema_shape(&db),
+        fresh,
+        "a migrated database is a fresh one's shape"
+    );
+    assert_abc_rows_read_back(&store);
+
+    // Every twin is now a row of its own, beside the 'abc' row.
+    {
+        let mut c = db.conn();
+        for twin in V10_PADDED_TWINS {
+            c.query_drop(*twin)
+                .unwrap_or_else(|e| panic!("after v11 the padded twin is distinct: {e}\n{twin}"));
+        }
+    }
+    assert_eq!(
+        store.get_key("abc ").unwrap().unwrap().generation_hash,
+        "gen-twin"
+    );
+    assert_eq!(
+        store.get_key("abc").unwrap().unwrap().generation_hash,
+        "gen-abc"
+    );
+    drop(store);
+
+    let again = MysqlStore::connect(&db.url).expect("a second open");
+    assert_eq!(schema_version_of(&db), SCHEMA_VERSION.to_string());
+    assert_eq!(schema_shape(&db), fresh, "the second open changes nothing");
+    assert_abc_rows_read_back(&again);
+}
+
+/// A v11 migration that crashed part-way (MySQL DDL commits statement by statement) left its
+/// marker, both foreign keys onto `api_keys.id` dropped and one table converted. The next open
+/// holds the lock no one else does, RESUMES, and converges on the fresh shape.
+#[test]
+fn v11_resumes_a_migration_that_crashed_part_way() {
+    let _ddl_guard = lock_fresh_database_ddl();
+    let Some(fresh) = fresh_schema_shape() else {
+        return;
+    };
+    let Some(db) = ScratchDb::new("v11crash") else {
+        return;
+    };
+    build_v10_database(&db);
+    {
+        let mut c = db.conn();
+        for stmt in [
+            "INSERT INTO store_meta (k, v) VALUES ('migrating_to', '11')",
+            "ALTER TABLE credentials DROP FOREIGN KEY fk_cred_key",
+            "ALTER TABLE usage_metering DROP FOREIGN KEY fk_metering_key",
+            "ALTER TABLE api_keys MODIFY COLUMN id VARBINARY(64) NOT NULL, \
+             MODIFY COLUMN key_group VARBINARY(128) NOT NULL DEFAULT ''",
+        ] {
+            c.query_drop(stmt).unwrap();
+        }
+    }
+    let store = MysqlStore::connect(&db.url).expect("the crashed migration resumes");
+    assert_eq!(schema_version_of(&db), SCHEMA_VERSION.to_string());
+    assert_eq!(meta_row(&db, "migrating_to"), None);
+    assert_eq!(schema_shape(&db), fresh);
+    assert_abc_rows_read_back(&store);
+}
+
+/// While ANOTHER connection holds this database's migration lock (it is migrating right now), an
+/// open waits, then REFUSES with the reason and the holder rather than serve a schema half way
+/// between two shapes. It runs no DDL and stamps nothing; once the lock is free the same open
+/// migrates.
+#[test]
+fn an_open_during_another_connections_migration_is_refused() {
+    let _ddl_guard = lock_fresh_database_ddl();
+    let Some(db) = ScratchDb::new("v11busy") else {
+        return;
+    };
+    build_v10_database(&db);
+    let before = schema_shape(&db);
+    let mut migrator = db.conn();
+    let holder: u64 = migrator
+        .query_first("SELECT CONNECTION_ID()")
+        .unwrap()
+        .unwrap();
+    let got: Option<i64> = migrator
+        .query_first(format!("SELECT GET_LOCK({}, 0)", crate::MIGRATION_LOCK))
+        .unwrap();
+    assert_eq!(got, Some(1));
+
+    let e = MysqlStore::init_schema_waiting(&mut db.conn(), 1)
+        .expect_err("an open during another connection's migration is refused")
+        .0;
+    assert!(
+        e.contains(&format!(
+            "mysql store: database is mid-migration: connection {holder} holds its migration \
+             lock and is migrating it from schema v10 to v{SCHEMA_VERSION}; refusing to open"
+        )),
+        "{e}"
+    );
+    assert_eq!(schema_version_of(&db), "10", "not stamped");
+    assert_eq!(schema_shape(&db), before, "no DDL ran");
+
+    migrator
+        .query_drop(format!("DO RELEASE_LOCK({})", crate::MIGRATION_LOCK))
+        .unwrap();
+    MysqlStore::init_schema_waiting(&mut db.conn(), 1).expect("the lock is free: it migrates");
+    assert_eq!(schema_version_of(&db), SCHEMA_VERSION.to_string());
+}
+
+/// A database a NEWER build was part-way through migrating (its marker names a version past this
+/// build's) is refused at open, before any DDL, and the marker is left for that build.
+#[test]
+fn a_database_mid_migration_to_a_newer_schema_is_refused() {
+    let _ddl_guard = lock_fresh_database_ddl();
+    let Some(db) = ScratchDb::new("v11newer") else {
+        return;
+    };
+    drop(MysqlStore::connect(&db.url).expect("a fresh database opens"));
+    let newer = SCHEMA_VERSION + 1;
+    db.conn()
+        .query_drop(format!(
+            "INSERT INTO store_meta (k, v) VALUES ('migrating_to', '{newer}')"
+        ))
+        .unwrap();
+    db.conn().query_drop("DROP TABLE store_records").unwrap();
+    let e = MysqlStore::connect(&db.url)
+        .err()
+        .expect("a database mid-migration to a newer schema is refused");
+    assert!(
+        e.contains(&format!(
+            "mysql store: database is mid-migration from schema v{SCHEMA_VERSION} to v{newer}, \
+             which is newer than this build (v{SCHEMA_VERSION}); refusing to open"
+        )),
+        "{e}"
+    );
+    let recreated: Option<String> = db
+        .conn()
+        .query_first("SHOW TABLES LIKE 'store_records'")
+        .unwrap();
+    assert!(recreated.is_none(), "no DDL ran before the refusal");
+    assert_eq!(meta_row(&db, "migrating_to"), Some(newer.to_string()));
+}
+
+/// v11 never orphans a row its old collation let reach its parent under another spelling. In v10 a
+/// credential could name its key `'abc '` (PAD SPACE found `'abc'`), and a metering unit could be
+/// spelled `gpt-4o` under its cell's `GPT-4o` (case-insensitive). Byte-exact keys would orphan both
+/// (the foreign key could not be restored; the unit would drop out of `list_metering`): the
+/// migration gives each its parent's spelling first.
+#[test]
+fn v11_respells_children_onto_their_parents_keys() {
+    let _ddl_guard = lock_fresh_database_ddl();
+    let Some(db) = ScratchDb::new("v11spell") else {
+        return;
+    };
+    build_v10_database(&db);
+    {
+        let mut c = db.conn();
+        for stmt in [
+            "INSERT INTO credentials (id, key_id, kind, slot, public_id, secret, secret_form, \
+             created_at, updated_at, revision) VALUES ('cred_pad', 'abc ', 'sigv4', 1, 'pad', \
+             'v1:plain:pad', 'recoverable', 1000, 1000, 7)",
+            "INSERT INTO usage_metering (bucket, key_id, provider, model, key_group_at_use, \
+             pricing_version, requests, billable_requests) VALUES ('0020991231', 'abc', 'P', \
+             'GPT-4o', '', 'v1', 1, 1)",
+            "INSERT INTO usage_metering_units (bucket, key_id, provider, model, priced_from_ms, \
+             unit, count) VALUES ('0020991231', 'abc', 'p', 'gpt-4o', 0, 'tool_calls', 5)",
+        ] {
+            c.query_drop(stmt).unwrap();
+        }
+    }
+    let store = MysqlStore::connect(&db.url).expect("v11 migrates");
+    let pad = store
+        .lookup_credential_secret("sigv4", "pad")
+        .unwrap()
+        .expect("the credential survives");
+    assert_eq!(
+        pad.meta.key_id, "abc",
+        "the credential takes its key's spelling"
+    );
+    let rows = store.list_metering(20_991_231).unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        (rows[0].model.as_str(), rows[0].provider.as_str()),
+        ("GPT-4o", "P")
+    );
+    assert_eq!(
+        rows[0].usage_units.get("tool_calls"),
+        Some(&5),
+        "the unit is on its cell"
+    );
+    // The key's delete still cascades to the re-spelt credential: the foreign key is back.
+    let n: u64 = db
+        .conn()
+        .query_first(
+            "SELECT COUNT(*) FROM information_schema.table_constraints \
+             WHERE table_schema = DATABASE() AND constraint_type = 'FOREIGN KEY'",
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(n, 2, "both foreign keys onto api_keys.id are restored");
 }
