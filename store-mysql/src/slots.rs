@@ -361,14 +361,23 @@ impl StoreSlots for MysqlStore {
     ) -> Step<Result<(), String>> {
         let (schema, key, value) = (schema.to_owned(), key.to_vec(), value.to_vec());
         on_conn!(self, cx, text, |c| {
-            c
-            .exec_drop(
-                "INSERT INTO store_records (schema_id, rkey, value) VALUES (:schema, :rkey, :value) \
-                 ON DUPLICATE KEY UPDATE value = VALUES(value)",
-                params! { "schema" => &schema, "rkey" => &key, "value" => &value },
-            )
-            .await
-            .map_err(|e| e.to_string())
+            // AN EMPTY VALUE REMOVES THE ROW (abi/store slot 26 `record_put`).
+            if value.is_empty() {
+                c.exec_drop(
+                    "DELETE FROM store_records WHERE schema_id = :schema AND rkey = :rkey",
+                    params! { "schema" => &schema, "rkey" => &key },
+                )
+                .await
+                .map_err(|e| e.to_string())
+            } else {
+                c.exec_drop(
+                    "INSERT INTO store_records (schema_id, rkey, value) VALUES (:schema, :rkey, :value) \
+                     ON DUPLICATE KEY UPDATE value = VALUES(value)",
+                    params! { "schema" => &schema, "rkey" => &key, "value" => &value },
+                )
+                .await
+                .map_err(|e| e.to_string())
+            }
         })
     }
 
