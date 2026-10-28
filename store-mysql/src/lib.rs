@@ -74,14 +74,14 @@ fn store_err<E: std::fmt::Display>(e: E) -> RecordStoreError {
     RecordStoreError(e.to_string())
 }
 
-/// The schema version this build creates and migrates to. A released 1.5.x database is v3.
-/// v4..v6 never shipped (per-protocol tables); v7 is busbar 1.6.0's neutral `plane_records` /
+/// The schema version this build creates and migrates to. An older released database is v3.
+/// v4..v6 never shipped (per-protocol tables); v7 is the neutral `plane_records` /
 /// `plane_tokens` and open usage units (`run_v7_*`); v8/v9 added the store v3 door's tables; v10
 /// dropped the deleted slots' tables (`run_v10_drop_dead_slot_tables`); v11 made every key exact
 /// (`run_v11_exact_keys`).
 const SCHEMA_VERSION: u32 = 11;
 
-/// The oldest schema a release shipped (v1.0.6 stamps v3): a database stamped older is refused.
+/// The oldest schema a release shipped (v3): a database stamped older is refused.
 const FIRST_RELEASED_SCHEMA: u32 = 3;
 
 /// The version each one-time migration step targets crossing INTO — named so a gate reads as "did
@@ -358,7 +358,7 @@ const SCHEMA: &[&str] = &[
     // No IF NOT EXISTS -- MySQL has no such form for CREATE INDEX; a re-run's duplicate error is
     // swallowed by try_init_schema, exactly as it is for every other index here.
     "CREATE INDEX idx_plane_records_kind_ts ON plane_records (kind, ts)",
-    // THE SINGLE-USE TOKEN LEDGER (`redeem_plane_token`) -- the durable record that makes a
+    // The single-use token ledger (`redeem_plane_token`) -- the durable record that makes a
     // confirm-once approval execute once across a restart AND across the nodes of a fleet. A sealed
     // token is valid bytes on its second presentation exactly as on its first; only a record that
     // the first happened tells them apart, and in process memory that record dies with the process
@@ -379,8 +379,8 @@ const SCHEMA: &[&str] = &[
     // scan, and a scan under InnoDB's REPEATABLE READ takes a lock on every row it visits -- which on
     // the one table every concurrent redemption in the fleet touches is a lock-wait storm.
     "CREATE INDEX idx_plane_tokens_expires ON plane_tokens (expires_at)",
-    // THE OPEN USAGE UNITS of a budget window. busbar 1.6.0 made `ModelTokens` a name-keyed
-    // `usage_units` map: the reserved four (`input`/`output`/`cache_read`/`cache_write`) keep their
+    // The open usage units of a budget window. `ModelTokens` is a name-keyed `usage_units` map:
+    // the reserved four (`input`/`output`/`cache_read`/`cache_write`) keep their
     // existing `usage_windows` columns -- so a v3 row reads back unchanged with no data migration --
     // and every OTHER unit a plane declares (`tool_calls`, `bytes`, a rerank's search units, ...)
     // lands here, one row per (window, bucket, model, unit), so `add_usage` stays one atomic
@@ -395,7 +395,7 @@ const SCHEMA: &[&str] = &[
         count BIGINT UNSIGNED NOT NULL DEFAULT 0,
         PRIMARY KEY (window_start, bucket_scope, bucket_id, model, unit)
     ) ENGINE=InnoDB",
-    // THE OPEN USAGE UNITS of a metering cell -- every ledgered class the token columns do not hold
+    // The open usage units of a metering cell -- every ledgered class the token columns do not hold
     // (`MeteringRow::usage_units`), additive like them. Keyed by the metering cell's own key plus the
     // unit. No foreign key: the parent cell is written first in the same transaction, and
     // a delete of the cell removes both.
@@ -410,9 +410,7 @@ const SCHEMA: &[&str] = &[
         PRIMARY KEY (key_id, bucket, model, provider, priced_from_ms, unit)
     ) ENGINE=InnoDB",
     "CREATE INDEX idx_metering_units_bucket ON usage_metering_units (bucket)",
-    // ── v8 (busbar 1.6.0, the store v3 door) ──────────────────────────────────────────────────
-    //
-    // THE DURABLE `op_id` DEDUPE LOG (`abi::store` S1-S4). One row per op that APPLIED: its value
+    // The durable `op_id` dedupe log (`abi::store` S1-S4). One row per op that APPLIED: its value
     // fields (`body`, compared byte for byte on a replay) and what it answered (`answer`, replayed
     // verbatim). The row is inserted FIRST in the op's own transaction, so two racing calls with
     // one `op_id` serialise on its primary key: the second waits, then reads the first's committed
@@ -435,8 +433,7 @@ const SCHEMA: &[&str] = &[
     ) ENGINE=InnoDB",
 ];
 
-/// How many connections the store keeps (the 1.5.5 pool's bound, `PoolConstraints::new(1, 8)`):
-/// this store is control-plane-frequency (key/credential CRUD) plus write-behind usage flush, not a
+/// How many connections the store keeps: this store is control-plane-frequency (key/credential CRUD) plus write-behind usage flush, not a
 /// high-fan-out OLTP workload, and an unbounded set across many instances (a multi-process fleet
 /// booting simultaneously) is what exhausts MySQL's default `max_connections`.
 pub const KEPT_CONNECTIONS: usize = 8;
@@ -452,7 +449,7 @@ pub(crate) const INIT: &[&str] =
     &["SET SESSION sql_mode = CONCAT(@@sql_mode, ',STRICT_ALL_TABLES')"];
 
 /// MySQL/MariaDB-backed store: the connection URL and the kept connections every op runs on (one
-/// connection per op at a time, as 1.5.5's pool checked one out per call).
+/// connection per op at a time).
 pub struct MysqlStore {
     pub(crate) opts: Arc<Opts>,
     pub(crate) pool: Arc<Pool>,
@@ -569,7 +566,7 @@ impl MysqlStore {
 
     /// v7 schema upgrade, in place and idempotent, gated on what the database HAS: five NULLable
     /// `api_keys` columns, and `usage_metering.priced_from_ms` (DEFAULT 0, "the opening card")
-    /// joined to the primary key (DECISION #79) in one `ALTER`, so the `key_id` FK always has an
+    /// joined to the primary key in one `ALTER`, so the `key_id` FK always has an
     /// index. The table names are parameters for test isolation.
     pub(crate) async fn run_v7_schema_upgrade(
         conn: &mut Conn,
@@ -613,7 +610,7 @@ impl MysqlStore {
     /// v7 data step, ONE-TIME (crossing into v7 from v4..v6 only; a re-copy would resurrect rows
     /// the engine has since cleared): `tasks`, `task_events` and `mcp_demotions` become
     /// `plane_records` rows in the envelope the engine reads, `spent_ask_states` becomes the `ask`
-    /// token ledger. `mcp_calls` stays (1.6.0 has no decode path for it); nothing is dropped.
+    /// token ledger. `mcp_calls` stays (nothing decodes it); nothing is dropped.
     /// `ON DUPLICATE KEY UPDATE kind = kind`, not `INSERT IGNORE`, so a real error is not
     /// downgraded to a warning and a truncated row.
     pub(crate) async fn run_v7_plane_record_copy_if_needed(
@@ -906,10 +903,9 @@ impl MysqlStore {
     /// yet" (a genuinely fresh database, or one already at v2 that never needed a marker written
     /// pre-v2) as version 0, but propagating any OTHER query failure (a connection blip, a lock
     /// timeout) instead of silently treating it identically to "fresh install" -- collapsing those
-    /// two outcomes previously meant a transient failure here permanently marked a possibly-
-    /// unmigrated database as migrated (schema_version still got written unconditionally right
-    /// after). A stored value that fails to parse as a version number is ALSO now a hard error
-    /// rather than a silent 0 -- a corrupt marker is exactly the kind of "looks fine, isn't" state
+    /// two outcomes would let a transient failure here permanently mark a possibly-unmigrated
+    /// database as migrated. A stored value that fails to parse as a version number is ALSO a hard
+    /// error rather than a silent 0 -- a corrupt marker is exactly the kind of "looks fine, isn't" state
     /// this store's own boot-probe philosophy (module doc, above) says must hard-fail, not warn.
     /// Takes `table` rather than hardcoding `store_meta`, purely for test isolation -- same reason
     /// `store_meta` is a single shared row the whole test binary's `connect()` calls race on.
@@ -1023,11 +1019,10 @@ impl MysqlStore {
         for stmt in SCHEMA {
             // An index that is ALREADY THERE is skipped without issuing the DDL at all. A
             // `CREATE INDEX` that is going to fail as a duplicate still takes an exclusive
-            // metadata lock first, so every boot of an up-to-date database used to run a dozen DDL
-            // statements for nothing -- and several nodes (or this crate's parallel tests) booting
-            // at once then deadlocked on each other's metadata locks (ERROR 1213). Checking first
-            // makes a steady-state boot DDL-free apart from `CREATE TABLE IF NOT EXISTS`, which
-            // only takes a shared lock on a table that exists.
+            // metadata lock first, and several nodes (or this crate's parallel tests) booting at
+            // once would deadlock on each other's metadata locks (ERROR 1213). Checking first makes
+            // a steady-state boot DDL-free apart from `CREATE TABLE IF NOT EXISTS`, which only
+            // takes a shared lock on a table that exists.
             if let Some((index, table)) = parse_create_index(stmt) {
                 if Self::index_exists(conn, table, index).await? {
                     continue;
@@ -1081,7 +1076,7 @@ impl MysqlStore {
     /// CHECK-violation error this schema's two target engines actually produce -- MySQL 8.0.16+'s
     /// `ER_CHECK_CONSTRAINT_VIOLATED` (3819) or MariaDB's `ER_CONSTRAINT_FAILED` (4025). Any other
     /// error (a lock timeout, a connection blip) is inconclusive and must never be silently read as
-    /// "enforced" -- that was the bug: the prior code treated ANY error as proof.
+    /// "enforced".
     pub(crate) fn is_check_constraint_violation(e: &Error) -> bool {
         matches!(e, Error::MySqlError(inner) if inner.code == 3819 || inner.code == 4025)
     }
@@ -1311,10 +1306,10 @@ async fn insert_credential(
 /// sees exactly the pool grant it always did) and `allowed_scopes_ext` (every OTHER kind, as a JSON
 /// array of `[kind, value]` pairs).
 ///
-/// This used to write ONLY the value of every scope into `allowed_pools`, whatever its kind -- so
-/// an `mcp_server` grant came back from the store as a POOL grant: the MCP grant lost AND a pool
-/// the key was never given admitted. busbar 1.6.0 ships non-`pool` kinds (`mcp_server`, `agent`),
-/// which makes that a live escalation, not a latent one. A kind is never remapped and never dropped.
+/// Writing only the value of every scope into `allowed_pools`, whatever its kind, would bring an
+/// `mcp_server` grant back as a POOL grant: the MCP grant lost AND a pool the key was never given
+/// admitted. Non-`pool` kinds (`mcp_server`, `agent`) exist, so a kind is never remapped and never
+/// dropped.
 ///
 /// `None` (the wildcard) writes NULL to both. An explicit grant ALWAYS writes `allowed_pools`, even
 /// as `[]`, so `Some([])` -- no scopes at all -- survives the trip and can never widen to `None`.
@@ -1510,7 +1505,7 @@ impl MysqlStore {
         delta: &MeteringDelta,
     ) -> RecordStoreResult<()> {
         let bucket = format!("{:010}", delta.bucket); // matches the CHAR(10) 'YYYY-MM-DD'-shaped bucket
-                                                      // `priced_from_ms` is part of the KEY (DECISION #79): a rate-card edit inside the UTC day
+                                                      // `priced_from_ms` is part of the KEY: a rate-card edit inside the UTC day
                                                       // opens a SECOND cell for that day, so each half keeps the card it was earned under rather
                                                       // than one card repricing the whole day.
         tx.exec_drop(
@@ -1623,7 +1618,7 @@ impl MysqlStore {
     }
 }
 
-/// THE 1.5.5 OP SET (store slots 0-32), each one body on the op's connection.
+/// The base op set (store slots 0-32), each one body on the op's connection.
 impl MysqlStore {
     pub(crate) async fn put_key(conn: &mut Conn, key: &VirtualKey) -> RecordStoreResult<()> {
         let mut tx = conn.start_transaction().await.map_err(store_err)?;
@@ -1785,13 +1780,10 @@ impl MysqlStore {
         // `SUM()` with no GROUP BY always returns exactly one row, even when zero rows match the
         // WHERE clause — it returns SQL NULL for each aggregate, not an empty result set. So
         // `exec_first::<(u64, u64)>` is NEVER `None` here (that would require zero rows, which
-        // never happens); instead it was a `Some(Row)` whose columns are NULL for a bucket/window
+        // never happens); instead it is a `Some(Row)` whose columns are NULL for a bucket/window
         // with no usage yet, and mysql_common's `FromRow` for a non-Option tuple PANICS trying to
-        // convert NULL into `u64` (confirmed: this crashed the freshly-restarted process during
-        // governance boot's budget hydration on a brand-new store, well before it enforced
-        // `STRICT_ALL_TABLES` any differently — this is a Rust-side conversion bug, not a sql_mode
-        // issue). `COALESCE(..., 0)` makes MySQL itself hand back 0 for the empty-aggregate case,
-        // matching Postgres/SQLite's "no row yet" -> 0 semantics.
+        // convert NULL into `u64`. `COALESCE(..., 0)` makes MySQL itself hand back 0 for the
+        // empty-aggregate case, matching Postgres/SQLite's "no row yet" -> 0 semantics.
         let totals: Option<(u64, u64)> = conn
             .exec_first(
                 "SELECT COALESCE(SUM(requests), 0), COALESCE(SUM(billable_requests), 0) \
@@ -2240,10 +2232,7 @@ impl MysqlStore {
             .map_err(store_err)
     }
 
-    // ── THE NEUTRAL KIND-TAGGED PLANE-RECORD VERBS (busbar 1.6.0) ─────────────────────────────
-    //
-    // Eight verbs over ONE table replace the fourteen per-protocol methods (`put_task`,
-    // `append_mcp_call`, `put_mcp_demotion`, `redeem_ask_state`, ...) this store used to implement.
+    // The neutral kind-tagged plane-record verbs: eight verbs over ONE table.
     // Every one is GENERIC over `kind`: nothing here decodes a `body`, and identity, ordering and
     // retention read only the typed sidecar columns. That is what lets a plane registered after this
     // build persist through it unchanged. The one kind-aware rule is retention's, and it is the
@@ -2514,8 +2503,6 @@ fn crate_now() -> u64 {
         .unwrap_or(0)
 }
 
-// ── THE DOOR (DECISIONS #2 rule (1): compiled in or dropped in, one contract, one loading path) ──
-//
 // The store's door lives HERE, in the logic crate (`slots`: `store_door!` over this store's
 // `StoreSlots`): a busbar build that links this crate registers `door` as its compiled-in row
 // (`LinkedRow::of(door)`), and the sibling `busbar-store-mysql-plugin` cdylib exports the same
@@ -2573,7 +2560,7 @@ impl MysqlStore {
 
 mod slots;
 
-/// THE STORE DOOR (store v3, `busbar_contract::abi::store`): every slot of the store v3 table over
+/// The store door (store v3, `busbar_contract::abi::store`): every slot of the store v3 table over
 /// [`MysqlStore`], through the contract's store SDK.
 pub use slots::door;
 
