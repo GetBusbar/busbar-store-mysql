@@ -573,8 +573,6 @@ struct Stmt {
     num_params: u16,
 }
 
-/// What a connection carries across the ops that reuse it (the store SDK's kept set keeps it with
-/// the connection, [`Wire::set_session`]).
 /// A query text parsed once: the positional text sent to the server and, for a named query, the
 /// order its parameters were named in.
 struct ParsedQuery {
@@ -582,6 +580,8 @@ struct ParsedQuery {
     named: Option<Vec<Vec<u8>>>,
 }
 
+/// What a connection carries across the ops that reuse it (the store SDK's kept set keeps it with
+/// the connection, [`Wire::set_session`]).
 struct State {
     opts: Arc<Opts>,
     codec: PacketCodec,
