@@ -358,6 +358,9 @@ const SCHEMA: &[&str] = &[
     // No IF NOT EXISTS -- MySQL has no such form for CREATE INDEX; a re-run's duplicate error is
     // swallowed by try_init_schema, exactly as it is for every other index here.
     "CREATE INDEX idx_plane_records_kind_ts ON plane_records (kind, ts)",
+    // The parent-scoped listing's access path: an appended chain lives at `ident = parent`, but an
+    // upserted record that names a parent lives at its own id, so the listing reads `parent`.
+    "CREATE INDEX idx_plane_records_kind_parent ON plane_records (kind, parent, seq)",
     // The single-use token ledger (`redeem_plane_token`) -- the durable record that makes a
     // confirm-once approval execute once across a restart AND across the nodes of a fleet. A sealed
     // token is valid bytes on its second presentation exactly as on its first; only a record that
@@ -2296,7 +2299,7 @@ impl MysqlStore {
             PlaneSelector::Parent(parent) => {
                 conn.exec(
                     "SELECT body FROM plane_records \
-                 WHERE kind = :kind AND ident = :parent AND parent = :parent ORDER BY seq",
+                 WHERE kind = :kind AND parent = :parent ORDER BY seq",
                     params! { "kind" => kind, "parent" => parent.as_ref() },
                 )
                 .await
