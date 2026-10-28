@@ -862,29 +862,6 @@ fn delete_and_put_on_the_same_key_never_deadlock_under_concurrency() {
         .expect("delete_key thread must not panic/error");
 }
 
-// ── Schema v2 migration: hydrate_budgets billing-bug backfill ──────────────────────────────────────
-//
-// Both tests below run the backfill against a PRIVATE, uniquely-named scratch table, never the real
-// shared `usage_windows` every other concurrently-running test also writes to. Two approaches were
-// tried and rejected first:
-//   1. Mutate the real `store_meta.schema_version` row and reconnect via `MysqlStore::connect()` —
-//      that row is a single GLOBAL singleton shared by the whole test binary (unlike every other row
-//      in this suite, which is scoped by a unique key id and so never collides even under
-//      `fresh_store()`'s documented parallel execution); any OTHER concurrently-running test's own
-//      `connect()` unconditionally overwrites it back to the current `SCHEMA_VERSION`, racing a
-//      deliberately-lowered test marker in both directions (reproduced: one run backfilled a row
-//      that should have been left alone, another failed to backfill one that should have been
-//      touched).
-//   2. Call `run_v2_backfill_if_needed` directly against the real `usage_windows` table — the
-//      production UPDATE is correctly UNSCOPED (a real one-time boot migration touches the whole
-//      table, matching store-postgres/store-sqlite exactly), so calling it directly during a
-//      concurrently-running suite corrupts OTHER tests' legitimate `billable_requests=0` rows,
-//      which shows up as unrelated failures in tests like `put_and_get_usage_roundtrips`.
-// Unlike store-postgres's own equivalent test (which isolates via a throwaway DATABASE per test),
-// the `busbar` CI user has no `CREATE DATABASE` privilege (confirmed: `ERROR 1044 Access denied for
-// user 'busbar'@'%'`) — only table-level DDL within the one shared database, which is what
-// `run_v2_backfill_if_needed`'s `table` parameter exists to target here.
-
 fn unique_scratch_table(name: &str) -> String {
     format!(
         "scratch_{name}_{}_{}",
@@ -895,229 +872,6 @@ fn unique_scratch_table(name: &str) -> String {
             .as_nanos()
     )
 }
-
-/// A row created before v2 (`billable_requests = 0` purely because this store didn't track the
-/// split yet, not because of a genuine refund) must be backfilled to `billable_requests = requests`
-/// when the database predates v2 (`prior_version` 1..2).
-#[test]
-fn migrate_v2_backfills_billable_requests_for_a_pre_migration_row() {
-    let Some(s) = fresh_store() else { return };
-    let table = unique_scratch_table("premigration");
-
-    let mut conn = s.pool.get_conn().unwrap();
-    conn.query_drop(format!(
-        "CREATE TABLE {table} (
-            bucket_id VARCHAR(64) NOT NULL,
-            window_start BIGINT NOT NULL,
-            requests BIGINT NOT NULL DEFAULT 0,
-            billable_requests BIGINT NOT NULL DEFAULT 0,
-            PRIMARY KEY (bucket_id, window_start)
-        ) ENGINE=InnoDB"
-    ))
-    .unwrap();
-    conn.query_drop(format!(
-        "INSERT INTO {table} (bucket_id, window_start, requests, billable_requests) \
-         VALUES ('vk_premigration_v2', 5000, 7, 0)"
-    ))
-    .unwrap();
-
-    MysqlStore::run_v2_backfill_if_needed(&mut conn, 1, &table)
-        .expect("the v2 backfill must succeed against a prior_version=1 database");
-
-    let (requests, billable): (u64, u64) = conn
-        .query_first(format!(
-            "SELECT requests, billable_requests FROM {table} \
-             WHERE bucket_id='vk_premigration_v2' AND window_start=5000"
-        ))
-        .unwrap()
-        .unwrap();
-    conn.query_drop(format!("DROP TABLE {table}")).unwrap();
-    assert_eq!(requests, 7, "the backfill must never touch `requests`");
-    assert_eq!(
-        billable, 7,
-        "a pre-v2 row's billable_requests must be backfilled to equal requests"
-    );
-}
-
-/// A row with `billable_requests = 0` that already lives on an at-or-past-v2 database (i.e. a
-/// genuine full refund/discount, not a pre-v2 artifact) must NOT be touched — gated on
-/// `prior_version >= 2` (already migrated) as well as `prior_version == 0` (a brand-new database
-/// with no pre-migration rows to backfill in the first place).
-#[test]
-fn migrate_v2_does_not_touch_a_row_when_the_database_is_not_pre_v2() {
-    let Some(s) = fresh_store() else { return };
-    let table = unique_scratch_table("norerun");
-
-    let mut conn = s.pool.get_conn().unwrap();
-    conn.query_drop(format!(
-        "CREATE TABLE {table} (
-            bucket_id VARCHAR(64) NOT NULL,
-            window_start BIGINT NOT NULL,
-            requests BIGINT NOT NULL DEFAULT 0,
-            billable_requests BIGINT NOT NULL DEFAULT 0,
-            PRIMARY KEY (bucket_id, window_start)
-        ) ENGINE=InnoDB"
-    ))
-    .unwrap();
-    conn.query_drop(format!(
-        "INSERT INTO {table} (bucket_id, window_start, requests, billable_requests) \
-         VALUES ('vk_already_v2_refund', 6000, 9, 0)"
-    ))
-    .unwrap();
-
-    MysqlStore::run_v2_backfill_if_needed(&mut conn, 2, &table)
-        .expect("a no-op call at prior_version=2 must still succeed");
-    MysqlStore::run_v2_backfill_if_needed(&mut conn, 0, &table)
-        .expect("a no-op call at prior_version=0 (fresh database) must still succeed");
-
-    let (requests, billable): (u64, u64) = conn
-        .query_first(format!(
-            "SELECT requests, billable_requests FROM {table} \
-             WHERE bucket_id='vk_already_v2_refund' AND window_start=6000"
-        ))
-        .unwrap()
-        .unwrap();
-    conn.query_drop(format!("DROP TABLE {table}")).unwrap();
-    assert_eq!(requests, 9);
-    assert_eq!(
-        billable, 0,
-        "a genuine billable_requests=0 row must survive both no-op calls untouched"
-    );
-}
-
-fn scratch_collation(conn: &mut PooledConn, table: &str, column: &str) -> String {
-    conn.query_first(format!(
-        "SELECT COLLATION_NAME FROM information_schema.COLUMNS \
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '{table}' AND COLUMN_NAME = '{column}'"
-    ))
-    .unwrap()
-    .expect("column exists")
-}
-
-/// A `usage_metering`-shaped table created before v3 (v1.0.0 shipped `key_group_at_use` without
-/// `ascii_bin`, inheriting MySQL's case-insensitive default) must have its collation corrected to
-/// `ascii_bin` when the database predates v3 (`prior_version` 1..3).
-#[test]
-fn migrate_v3_fixes_key_group_at_use_collation_for_a_pre_migration_table() {
-    let Some(s) = fresh_store() else { return };
-    let table = unique_scratch_table("premigration_v3");
-
-    let mut conn = s.pool.get_conn().unwrap();
-    // The pre-v3 shape: no explicit collation, so it inherits the database default (utf8mb4_*, NOT
-    // ascii_bin) -- exactly what a real v1.0.0-created `usage_metering` table has today.
-    conn.query_drop(format!(
-        "CREATE TABLE {table} (key_group_at_use VARCHAR(128) NOT NULL DEFAULT '') ENGINE=InnoDB"
-    ))
-    .unwrap();
-    let before = scratch_collation(&mut conn, &table, "key_group_at_use");
-    assert_ne!(
-        before, "ascii_bin",
-        "the scratch table must start on a non-ascii_bin collation, or this test proves nothing"
-    );
-
-    MysqlStore::run_v3_ascii_bin_fix_if_needed(&mut conn, 1, &table)
-        .expect("the v3 ascii_bin fix must succeed against a prior_version=1 database");
-
-    let after = scratch_collation(&mut conn, &table, "key_group_at_use");
-    conn.query_drop(format!("DROP TABLE {table}")).unwrap();
-    assert_eq!(
-        after, "ascii_bin",
-        "a pre-v3 table's key_group_at_use collation must be corrected to ascii_bin"
-    );
-}
-
-/// A table already at-or-past v3 (already `ascii_bin`, or a fresh v3+ install) must not have the
-/// migration re-run pointlessly — gated on `prior_version >= 3` as well as `prior_version == 0`.
-#[test]
-fn migrate_v3_does_not_touch_a_table_when_the_database_is_not_pre_v3() {
-    let Some(s) = fresh_store() else { return };
-    let table = unique_scratch_table("norerun_v3");
-
-    let mut conn = s.pool.get_conn().unwrap();
-    conn.query_drop(format!(
-        "CREATE TABLE {table} (
-            key_group_at_use VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT ''
-        ) ENGINE=InnoDB"
-    ))
-    .unwrap();
-
-    MysqlStore::run_v3_ascii_bin_fix_if_needed(&mut conn, 3, &table)
-        .expect("a no-op call at prior_version=3 must still succeed");
-    MysqlStore::run_v3_ascii_bin_fix_if_needed(&mut conn, 0, &table)
-        .expect("a no-op call at prior_version=0 (fresh database) must still succeed");
-
-    let after = scratch_collation(&mut conn, &table, "key_group_at_use");
-    conn.query_drop(format!("DROP TABLE {table}")).unwrap();
-    assert_eq!(
-        after, "ascii_bin",
-        "both no-op calls must leave the collation untouched"
-    );
-}
-
-/// The two tests above prove `run_v2_backfill_if_needed` works correctly called DIRECTLY with a
-/// hand-supplied `prior_version`/`table` -- neither ever goes through `try_init_schema`'s REAL
-/// wiring: reading `prior_version` from the actual `store_meta.schema_version` row and calling the
-/// backfill with the real hardcoded table name `"usage_windows"`. A regression that reordered that
-/// real read (e.g. moved it after the SCHEMA loop / the `schema_version` write) or typo'd the real
-/// table name would ship undetected by either test above.
-///
-/// Exercises the REAL public `MysqlStore::connect()` entry point (which internally calls the real,
-/// unparameterized `try_init_schema`) against a DEDICATED, throwaway database -- not the shared
-/// `busbar_test` every other test in this suite uses -- so this can safely pre-seed a real pre-v2
-/// `store_meta.schema_version='1'` row without racing any other concurrently-running test's own
-/// `connect()` calls (the documented reason `run_v2_backfill_if_needed` takes an explicit
-/// `prior_version` instead of reading the shared row itself). Needs `root` to `CREATE DATABASE`
-/// (same constraint as the app-level `busbar` CI user lacking that privilege, documented on the
-/// migration tests above) -- real CI has `root`/`busbar` available with matching credentials (see
-/// `plugin-ci.yml`'s own "set strict sql_mode" step, which already connects as root).
-#[test]
-fn try_init_schema_real_wiring_backfills_a_genuinely_pre_v2_database() {
-    let _ddl_guard = lock_fresh_database_ddl();
-    let Some(db) = ScratchDb::new("wiring") else {
-        return;
-    };
-    let dedicated_url = db.url.clone();
-
-    // Boot ONCE to create the real schema for real via try_init_schema, then hand-seed a genuine
-    // pre-v2 marker directly in the real store_meta row (safe here -- this database has no other
-    // concurrent user) and a pre-v2-shaped row in the real usage_windows table.
-    let store1 = MysqlStore::connect(&dedicated_url).expect("first boot must create the schema");
-    {
-        let mut conn = store1.pool.get_conn().unwrap();
-        conn.query_drop("UPDATE store_meta SET v = '1' WHERE k = 'schema_version'")
-            .unwrap();
-        conn.query_drop(
-            "INSERT INTO usage_windows \
-             (window_start, bucket_scope, bucket_id, model, requests, billable_requests) \
-             VALUES (9000, 'key', 'vk_wiring', 'gpt', 5, 0)",
-        )
-        .unwrap();
-    }
-    drop(store1);
-
-    // Reconnect -- THIS is the real try_init_schema call under test: it must read prior_version=1
-    // from the real store_meta row (not a hand-supplied one) and run the backfill against the
-    // real, hardcoded "usage_windows" table name (not a scratch table a test pointed it at).
-    let store2 = MysqlStore::connect(&dedicated_url).expect("second boot (the real migration)");
-    let mut conn = store2.pool.get_conn().unwrap();
-    let (requests, billable): (u64, u64) = conn
-        .query_first(
-            "SELECT requests, billable_requests FROM usage_windows \
-             WHERE bucket_id = 'vk_wiring' AND window_start = 9000",
-        )
-        .unwrap()
-        .unwrap();
-    drop(store2);
-
-    assert_eq!(requests, 5);
-    assert_eq!(
-        billable, 5,
-        "try_init_schema's REAL wiring (real store_meta read, real \"usage_windows\" table name) \
-         must have backfilled this pre-v2 row -- a regression to either would leave billable_requests \
-         at 0, undetected by the two tests above that bypass this wiring entirely"
-    );
-}
-
 // ── read_prior_version: real query errors must not collapse into "fresh install" ───────────────────
 
 fn scratch_meta_table(conn: &mut PooledConn, name: &str) -> String {
@@ -4037,6 +3791,30 @@ fn a_newer_schema_is_refused_at_open() {
         .unwrap();
     assert!(recreated.is_none(), "no DDL ran before the refusal");
     assert_eq!(schema_version_of(&db), newer.to_string(), "not restamped");
+}
+
+/// A database stamped BELOW the oldest released schema is refused at open, before any DDL.
+#[test]
+fn a_pre_release_schema_is_refused_at_open() {
+    let _ddl_guard = lock_fresh_database_ddl();
+    let Some(db) = ScratchDb::new("older") else {
+        return;
+    };
+    drop(MysqlStore::connect(&db.url).expect("a fresh database opens"));
+    db.conn()
+        .query_drop("UPDATE store_meta SET v = '2' WHERE k = 'schema_version'")
+        .unwrap();
+    let e = MysqlStore::connect(&db.url)
+        .err()
+        .expect("a pre-release schema is refused");
+    assert!(
+        e.contains(&format!(
+            "mysql store: database schema v2 predates v{FIRST_RELEASED_SCHEMA}, the oldest \
+             released schema; refusing to open"
+        )),
+        "{e}"
+    );
+    assert_eq!(schema_version_of(&db), "2", "not restamped");
 }
 
 // ── D19: store keys are EXACT ──────────────────────────────────────────────────────────────────
