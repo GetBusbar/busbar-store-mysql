@@ -31,8 +31,8 @@ use mysqlwire::{Conn, Error, Opts, Params, Row, Transaction};
 use busbar_contract::records::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, ModelTokens,
     ModelTokensDelta, PlaneDisposition, PlaneRecord, PlaneSelector, RecordStoreError,
-    RecordStoreResult, ScopeRef, SecretForm, UsageDelta, UsageLedger, VirtualKey, UNIT_CACHE_READ,
-    UNIT_CACHE_WRITE, UNIT_INPUT, UNIT_OUTPUT,
+    RecordStoreResult, Retention, ScopeRef, SecretForm, UsageDelta, UsageLedger, VirtualKey,
+    UNIT_CACHE_READ, UNIT_CACHE_WRITE, UNIT_INPUT, UNIT_OUTPUT,
 };
 use std::collections::BTreeMap;
 
@@ -2328,9 +2328,48 @@ impl MysqlStore {
         kind: &str,
         before: u64,
     ) -> RecordStoreResult<u64> {
+        // The age-only entry: `task` has always dropped only its TERMINAL rows here, every other
+        // kind every row older than `before`.
+        let retention = if kind == KIND_TASK {
+            Retention::TerminalOnly
+        } else {
+            Retention::Age
+        };
+        Self::purge_plane_records(conn, kind, before, retention).await
+    }
+
+    pub(crate) async fn purge_plane_records(
+        conn: &mut Conn,
+        kind: &str,
+        before: u64,
+        retention: Retention,
+    ) -> RecordStoreResult<u64> {
         // STRICTLY older than the cutoff: a row exactly at `before` is kept. The count returned is
-        // one the DELETE actually performed (`affected_rows`), never an estimate.
-        if kind == KIND_TASK {
+        // one the DELETE actually performed (`affected_rows`), never an estimate. WHICH rows go is
+        // the rule the call carries, never one inferred from the kind's name.
+        let terminal_only = retention == Retention::TerminalOnly;
+        if terminal_only && kind != KIND_TASK {
+            // A terminal-only sweep of any other kind: its TERMINAL rows older than the cutoff, in
+            // bounded batches (the typed `terminal` column, never the body); an ACTIVE row stays.
+            const BATCH: u64 = 5000;
+            let mut total = 0u64;
+            loop {
+                conn.exec_drop(
+                    "DELETE FROM plane_records WHERE kind = :kind AND ts < :before AND terminal \
+                     LIMIT 5000",
+                    params! { "kind" => kind, "before" => before },
+                )
+                .await
+                .map_err(store_err)?;
+                let n = conn.affected_rows();
+                total += n;
+                if n < BATCH {
+                    break;
+                }
+            }
+            return Ok(total);
+        }
+        if terminal_only {
             // TERMINAL ONLY: an interrupted task waiting on a human must survive. Its event chain
             // goes with it in the same transaction. Candidates come from a non-locking read and
             // each is deleted by primary key with the predicate re-checked, so concurrent sweeps

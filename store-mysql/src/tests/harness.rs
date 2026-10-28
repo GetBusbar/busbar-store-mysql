@@ -28,7 +28,7 @@ use busbar_plugin_loader::dispatch::{
     load_linked, Bind, ConnTable, DispatchConfig, Dispatcher, LinkedRow, NoSink,
 };
 use busbar_plugin_loader::store_v3::LoadedStore;
-use busbar_plugin_loader::tcp_conns::TcpConns;
+use busbar_test_kit::tcp_conns::TcpConns;
 use mysql::prelude::Queryable;
 
 use crate::mysqlwire;

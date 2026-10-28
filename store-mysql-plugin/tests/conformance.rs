@@ -40,7 +40,7 @@ mod common;
 #[path = "support/conformance_host.rs"]
 mod conformance_host;
 
-busbar_plugin_loader::conformance_suite! {
+busbar_test_kit::conformance_suite! {
     door: busbar_store_mysql::door,
     cdylib: "busbar_store_mysql_plugin",
     inputs: inputs(),
@@ -180,7 +180,6 @@ use busbar_contract::kinds::RecordBytes;
 use busbar_contract::records::{
     PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore, UsageDelta, VirtualKey,
 };
-use busbar_contract::store_calls::StoreCalls;
 use busbar_plugin_loader::dispatch::kinds::secret::Secret;
 use busbar_plugin_loader::dispatch::kinds::store::Store;
 use busbar_plugin_loader::dispatch::{
@@ -223,9 +222,8 @@ fn cdylib() -> PathBuf {
 /// What a door is bound to: its own dispatcher's adopter, no envelope sink, and the loader's test
 /// connection table (plain TCP, the host's connector path) for the one `tcp` need the store states.
 fn bind(d: &Dispatcher) -> Bind {
-    let conns: Arc<dyn busbar_contract::conn::DeclaredConns> = Arc::new(
-        busbar_plugin_loader::tcp_conns::TcpConns::new(d.conn_waker()),
-    );
+    let conns: Arc<dyn busbar_contract::conn::DeclaredConns> =
+        Arc::new(busbar_test_kit::tcp_conns::TcpConns::new(d.conn_waker()));
     Bind {
         instance: Arc::from("store-mysql-conformance"),
         max_inflight_cap: 64,
@@ -409,20 +407,20 @@ fn transcript(load: impl Fn() -> Loaded, url: Option<&str>) -> Vec<String> {
         let id = op(1);
         t.push(format!(
             "add_usage_batch = {:?}",
-            StoreCalls::add_usage_batch(&s, id, &cells).await
+            busbar_contract::store_calls::StoreCalls::add_usage_batch(&s, id, &cells).await
         ));
         t.push(format!(
             "replay = {:?}",
-            StoreCalls::add_usage_batch(&s, id, &cells).await
+            busbar_contract::store_calls::StoreCalls::add_usage_batch(&s, id, &cells).await
         ));
         let r = |b: &[u8]| RecordBytes::new(b.to_vec()).unwrap();
         t.push(format!(
             "record_put = {:?}",
-            StoreCalls::record_put(&s, SCHEMA, b"k", &r(b"v")).await
+            busbar_contract::store_calls::StoreCalls::record_put(&s, SCHEMA, b"k", &r(b"v")).await
         ));
         t.push(format!(
             "record_get = {:?}",
-            StoreCalls::record_get(&s, SCHEMA, b"k")
+            busbar_contract::store_calls::StoreCalls::record_get(&s, SCHEMA, b"k")
                 .await
                 .map(|v| v.map(|v| String::from_utf8_lossy(v.as_slice()).into_owned()))
         ));

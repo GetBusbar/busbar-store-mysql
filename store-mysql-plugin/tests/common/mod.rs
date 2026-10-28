@@ -191,36 +191,46 @@ pub fn busbar_root() -> PathBuf {
 /// stub, the exact binaries a real release ships.
 pub fn build_real_binaries() -> (PathBuf, PathBuf) {
     let root = busbar_root();
-    let status = Command::new("cargo")
-        // `busbar-plugin-pack` is a feature-gated `[[bin]]` of `busbar-plugin-loader` in busbar 1.6.0
-        // (roster def 14), built the way busbar's own release workflow does.
-        .args([
+    // Two builds: the busbar binary is the DEFAULT DISTRIBUTION's (`dist/default`: core plus the
+    // standard plugins, the llm plane included, as busbar's signing gate builds it; a bare `-p busbar`
+    // links no plugin), and `busbar-plugin-pack` is a feature-gated `[[bin]]` of `busbar-plugin-loader`
+    // in busbar 1.6.0. Both land in `<checkout>/target`.
+    for args in [
+        &[
+            "build",
+            "--release",
+            "--manifest-path",
+            "dist/default/Cargo.toml",
+            "--target-dir",
+            "target",
+            "--bin",
+            "busbar",
+        ][..],
+        &[
             "build",
             "--release",
             "-p",
-            "busbar",
-            "-p",
             "busbar-plugin-loader",
             "--features",
-            "busbar-plugin-loader/pack",
-            "--bin",
-            "busbar",
+            "pack",
             "--bin",
             "busbar-plugin-pack",
-        ])
-        .env("BUSBAR_RELEASE_PUBKEY", E2E_RELEASE_PUBKEY)
-        .current_dir(&root)
-        .status()
-        .expect("run cargo build for busbar + busbar-plugin-pack");
-    assert!(
-        status.success(),
-        "building the real busbar + busbar-plugin-pack binaries must succeed"
-    );
-    // The child `cargo` inherits CARGO_TARGET_DIR when one is set, so the binaries land THERE, not
-    // under the checkout's own `target/` — look where they were actually built.
-    let target = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| root.join("target"));
+        ][..],
+    ] {
+        let status = Command::new("cargo")
+            .args(args)
+            .env("BUSBAR_RELEASE_PUBKEY", E2E_RELEASE_PUBKEY)
+            // Both binaries are read back from `<checkout>/target/release` below.
+            .env_remove("CARGO_TARGET_DIR")
+            .current_dir(&root)
+            .status()
+            .expect("run cargo build for busbar + busbar-plugin-pack");
+        assert!(
+            status.success(),
+            "building the real busbar + busbar-plugin-pack binaries must succeed ({args:?})"
+        );
+    }
+    let target = root.join("target");
     (
         target.join("release/busbar"),
         target.join("release/busbar-plugin-pack"),

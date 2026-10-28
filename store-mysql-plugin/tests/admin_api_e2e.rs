@@ -289,7 +289,7 @@ fn install_over_admin_api_then_mint_a_key_and_verify_mysql_directly() {
     let providers = work.join("providers.yaml");
     std::fs::write(
         &providers,
-        "mock:\n  protocol: anthropic\n  base_url: \"http://127.0.0.1:9\"\n  api_key_env: MOCK_KEY\n",
+        "mock:\n  protocol: anthropic\n  base_url: \"http://127.0.0.1:9\"\n",
     )
     .unwrap();
     let providers_and_common = format!(
@@ -298,6 +298,7 @@ fn install_over_admin_api_then_mint_a_key_and_verify_mysql_directly() {
          plugins:\n  enabled: true\n  dir: {}\n  trust:\n    allow_unsigned: true\n\
          identity-providers:\n  admin-tokens: {{ module: admin-tokens, token: {{ env: BUSBAR_ADMIN_TOKEN }} }}\n\
          auth:\n  chain: [keys]\n  signing_key: {{ env: BUSBAR_SIGNING_KEY }}\n  admin_auth: [admin-tokens]\n\
+             credentials:\n  at_rest:\n    key: {{ env: BUSBAR_SIGNING_KEY }}\n\
          providers:\n  mock:\n    api_key: {{ env: MOCK_KEY }}\n\
          models:\n  test-model:\n    provider: mock\n",
         plugins_dir.display()
