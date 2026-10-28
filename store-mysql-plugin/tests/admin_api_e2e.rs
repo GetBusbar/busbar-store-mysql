@@ -289,7 +289,7 @@ fn install_over_admin_api_then_mint_a_key_and_verify_mysql_directly() {
     let providers = work.join("providers.yaml");
     std::fs::write(
         &providers,
-        "mock:\n  protocol: anthropic\n  base_url: \"http://127.0.0.1:9\"\n  api_key_env: MOCK_KEY\n",
+        "mock:\n  protocol: anthropic\n  base_url: \"http://127.0.0.1:9\"\n",
     )
     .unwrap();
     let providers_and_common = format!(

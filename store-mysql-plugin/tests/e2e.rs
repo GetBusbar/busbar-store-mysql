@@ -201,7 +201,7 @@ fn load_and_exercise_mysql_plugin_via_file_drop() {
     // crates/busbar/tests/cli_validate.rs::write_configs, not invented here.
     std::fs::write(
         &providers,
-        "mock:\n  protocol: anthropic\n  base_url: \"http://127.0.0.1:9\"\n  api_key_env: MOCK_KEY\n",
+        "mock:\n  protocol: anthropic\n  base_url: \"http://127.0.0.1:9\"\n",
     )
     .unwrap();
     let config_text = format!(
