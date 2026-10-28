@@ -665,6 +665,19 @@ impl StoreSlots for MysqlStore {
         })
     }
 
+    fn purge_plane_records(
+        &self,
+        cx: &mut Op<'_>,
+        kind: &str,
+        before: u64,
+        retention: busbar_contract::records::Retention,
+    ) -> Step<RecordStoreResult<u64>> {
+        let kind = kind.to_owned();
+        on_conn!(self, cx, store_err, |c| {
+            MysqlStore::purge_plane_records(&mut c, &kind, before, retention).await
+        })
+    }
+
     fn purge_plane_records_before(
         &self,
         cx: &mut Op<'_>,
