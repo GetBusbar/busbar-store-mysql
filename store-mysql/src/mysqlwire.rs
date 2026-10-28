@@ -588,6 +588,9 @@ struct State {
     auth_plugin: AuthPlugin<'static>,
     /// Prepared statements by their (positional) query text.
     stmts: HashMap<Vec<u8>, Arc<Stmt>>,
+    /// Each query text's parse into (positional text, named-parameter order), so a repeated query
+    /// is not re-parsed per execute. Bounded by `stmt_cache_size` like `stmts`.
+    parsed: HashMap<String, Arc<(Vec<u8>, Option<Vec<Vec<u8>>>)>>,
     /// The last OK packet (affected rows, last insert id).
     ok: Option<OkPacket<'static>>,
     has_results: bool,
@@ -671,6 +674,7 @@ impl State {
             nonce: Vec::new(),
             auth_plugin: AuthPlugin::MysqlNativePassword,
             stmts: HashMap::new(),
+            parsed: HashMap::new(),
             ok: None,
             has_results: false,
             socket,
@@ -1358,18 +1362,31 @@ impl Conn {
 
     async fn execute(&mut self, query: &str, params: Params) -> Result<Meta> {
         self.settle().await?;
-        let parsed = ParsedNamedParams::parse(query.as_bytes())
-            .map_err(|_| Error::DriverError(DriverError::MixedParams))?;
-        let named: Option<Vec<Vec<u8>>> = if parsed.params().is_empty() {
-            None
-        } else {
-            Some(parsed.params().iter().map(|p| p.to_vec()).collect())
+        let parsed = match self.st.parsed.get(query) {
+            Some(p) => p.clone(),
+            None => {
+                let p = ParsedNamedParams::parse(query.as_bytes())
+                    .map_err(|_| Error::DriverError(DriverError::MixedParams))?;
+                let named = if p.params().is_empty() {
+                    None
+                } else {
+                    Some(p.params().iter().map(|p| p.to_vec()).collect())
+                };
+                let parsed = Arc::new((p.query().to_vec(), named));
+                let cap = self.st.opts.stmt_cache_size;
+                if cap > 0 {
+                    if self.st.parsed.len() >= cap {
+                        self.st.parsed.clear();
+                    }
+                    self.st.parsed.insert(query.to_owned(), parsed.clone());
+                }
+                parsed
+            }
         };
-        let positional = parsed.query().to_vec();
-        drop(parsed);
-        let stmt = self.prepare(&positional).await?;
+        let (positional, named) = (&parsed.0, &parsed.1);
+        let stmt = self.prepare(positional).await?;
         let params = match params {
-            Params::Named(_) => match &named {
+            Params::Named(_) => match named {
                 Some(n) => params.into_positional(n).map_err(|e| {
                     Error::DriverError(DriverError::MissingNamedParameter(
                         String::from_utf8_lossy(&e.0).into_owned(),

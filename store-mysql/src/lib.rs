@@ -81,13 +81,14 @@ fn store_err<E: std::fmt::Display>(e: E) -> RecordStoreError {
 /// (`run_v11_exact_keys`).
 const SCHEMA_VERSION: u32 = 11;
 
+/// The oldest schema a release shipped (v1.0.6 stamps v3): a database stamped older is refused.
+const FIRST_RELEASED_SCHEMA: u32 = 3;
+
 /// The version each one-time migration step targets crossing INTO — named so a gate reads as "did
 /// this database predate step N" rather than a bare magic number, and so a future step can't be
 /// accidentally gated on `< SCHEMA_VERSION` (wrong: that would re-fire EVERY prior step, not just
 /// the newest one, every time SCHEMA_VERSION bumps again — each step must stay pinned to the one
 /// version boundary it actually closes).
-const V2_BILLABLE_REQUESTS_BACKFILL: u32 = 2;
-const V3_KEY_GROUP_AT_USE_ASCII_BIN: u32 = 3;
 const V7_PLANE_RECORDS: u32 = 7;
 const V10_DEAD_SLOTS: u32 = 10;
 const V11_EXACT_KEYS: u32 = 11;
@@ -514,70 +515,6 @@ impl MysqlStore {
         unreachable!("loop always returns on the final attempt")
     }
 
-    /// v2 one-time backfill (the `hydrate_budgets` billing fix): pre-v2 rows may carry
-    /// `billable_requests = 0` beside a real `requests` count only because the split was not
-    /// tracked yet. Fires only when crossing INTO v2 from an existing older database. `table` is a
-    /// parameter for test isolation (the CI user cannot create databases); production passes
-    /// `"usage_windows"`.
-    ///
-    /// KNOWN GAP: in a rolling upgrade a node already live on v2 can write a pre-v2 row before
-    /// this runs, and that row is then never backfilled. A lock cannot close it (the live node
-    /// never enters here). Mitigation: pause the fleet for a v1->v2 upgrade, or re-run the
-    /// idempotent predicate afterwards. Reproduced by
-    /// `characterize_v2_backfill_loses_a_row_to_a_racing_live_write`.
-    pub(crate) async fn run_v2_backfill_if_needed(
-        conn: &mut Conn,
-        prior_version: u32,
-        table: &str,
-    ) -> RecordStoreResult<()> {
-        if prior_version > 0 && prior_version < V2_BILLABLE_REQUESTS_BACKFILL {
-            // Batched (LIMIT 5000 per statement, looped until exhausted), matching the same
-            // bounded-batch convention the plane-record retention already uses
-            // elsewhere in this file -- an unbounded single UPDATE across the whole table risks
-            // holding its lock/scan for a long time on a large production table, worse than
-            // necessary even for a one-time migration.
-            loop {
-                conn.query_drop(format!(
-                    "UPDATE {table} SET billable_requests = requests \
-                     WHERE billable_requests = 0 AND requests > 0 LIMIT 5000"
-                ))
-                .await
-                .map_err(store_err)?;
-                if conn.affected_rows() < 5000 {
-                    break;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// v3: `usage_metering.key_group_at_use` shipped in v1.0.0 without `ascii_bin` (inherited
-    /// MySQL's default case-INSENSITIVE collation) -- a real gap against this crate's own stated
-    /// invariant that every opaque identifier/group-name column gets byte-exact comparison. The
-    /// The `CREATE TABLE IF NOT EXISTS` declaration above only affects a FRESH database; any
-    /// database created by a pre-v3 release already has the table at the wrong collation, so a real
-    /// `ALTER TABLE` is required to close it on upgrade.
-    /// Idempotent: MODIFY COLUMN to the same collation it's already at is a harmless no-op on a
-    /// database created fresh (already ascii_bin) or one already migrated past v3.
-    ///
-    /// Same `table` parameter for test isolation as `run_v2_backfill_if_needed` -- see that
-    /// function's doc comment for why (no `CREATE DATABASE` privilege in CI).
-    pub(crate) async fn run_v3_ascii_bin_fix_if_needed(
-        conn: &mut Conn,
-        prior_version: u32,
-        table: &str,
-    ) -> RecordStoreResult<()> {
-        if prior_version > 0 && prior_version < V3_KEY_GROUP_AT_USE_ASCII_BIN {
-            conn.query_drop(format!(
-                "ALTER TABLE {table} MODIFY COLUMN key_group_at_use \
-                 VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT ''"
-            ))
-            .await
-            .map_err(store_err)?;
-        }
-        Ok(())
-    }
-
     /// Whether `information_schema.<view>` has a row for `cond` in the connected database
     /// (`DATABASE()` scopes it to this store's own schema).
     async fn exists(conn: &mut Conn, view: &str, cond: &str, p: Params) -> RecordStoreResult<bool> {
@@ -900,9 +837,10 @@ impl MysqlStore {
         .transpose()
     }
 
-    /// Refuse a database this build must not touch: stamped by a newer build, or left part-way
-    /// through a newer build's migration (its marker names a version this build does not know the
-    /// steps of, and its tables may be half way to a shape this build cannot read).
+    /// Refuse a database this build must not touch: older than the oldest released schema, stamped
+    /// by a newer build, or left part-way through a newer build's migration (its marker names a
+    /// version this build does not know the steps of, and its tables may be half way to a shape this
+    /// build cannot read).
     fn refuse_unknown_schema(
         prior_version: u32,
         migrating_to: Option<u32>,
@@ -911,6 +849,12 @@ impl MysqlStore {
             return Err(store_err(format!(
                 "mysql store: database schema v{prior_version} is newer than this build \
                  (v{SCHEMA_VERSION}); refusing to open"
+            )));
+        }
+        if prior_version != 0 && prior_version < FIRST_RELEASED_SCHEMA {
+            return Err(store_err(format!(
+                "mysql store: database schema v{prior_version} predates v{FIRST_RELEASED_SCHEMA}, \
+                 the oldest released schema; refusing to open"
             )));
         }
         if let Some(to) = migrating_to.filter(|to| *to > SCHEMA_VERSION) {
@@ -968,7 +912,6 @@ impl MysqlStore {
     /// rather than a silent 0 -- a corrupt marker is exactly the kind of "looks fine, isn't" state
     /// this store's own boot-probe philosophy (module doc, above) says must hard-fail, not warn.
     /// Takes `table` rather than hardcoding `store_meta`, purely for test isolation -- same reason
-    /// `run_v2_backfill_if_needed` takes its own `table` param (see that function's doc comment):
     /// `store_meta` is a single shared row the whole test binary's `connect()` calls race on.
     /// Production always calls this with `"store_meta"`.
     pub(crate) async fn read_prior_version(conn: &mut Conn, table: &str) -> RecordStoreResult<u32> {
@@ -1104,8 +1047,6 @@ impl MysqlStore {
             }
         }
 
-        Self::run_v2_backfill_if_needed(conn, prior_version, "usage_windows").await?;
-        Self::run_v3_ascii_bin_fix_if_needed(conn, prior_version, "usage_metering").await?;
         Self::run_v7_schema_upgrade(conn, "api_keys", "usage_metering").await?;
         Self::run_v7_plane_record_copy_if_needed(conn, prior_version).await?;
         Self::run_v10_drop_dead_slot_tables(conn, prior_version).await?;
