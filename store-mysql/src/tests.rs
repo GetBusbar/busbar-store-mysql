@@ -2475,7 +2475,11 @@ fn purge_tasks_before_drops_only_terminal_rows_and_returns_a_real_count() {
         .unwrap();
 
     let purged = store
-        .purge_plane_records_before("task", 1_000_000_200)
+        .purge_plane_records(
+            "task",
+            1_000_000_200,
+            busbar_contract::records::Retention::TerminalOnly,
+        )
         .unwrap();
     assert_eq!(
         purged, 4,
@@ -2504,7 +2508,11 @@ fn purge_tasks_before_drops_only_terminal_rows_and_returns_a_real_count() {
     );
     assert_eq!(
         store
-            .purge_plane_records_before("task", 1_000_000_200)
+            .purge_plane_records(
+                "task",
+                1_000_000_200,
+                busbar_contract::records::Retention::TerminalOnly
+            )
             .unwrap(),
         0,
         "re-running the same purge removes nothing"
@@ -2543,7 +2551,11 @@ fn purging_a_task_takes_its_provenance_chain_with_it_and_no_other() {
 
     assert_eq!(
         store
-            .purge_plane_records_before("task", 1_000_000_200)
+            .purge_plane_records(
+                "task",
+                1_000_000_200,
+                busbar_contract::records::Retention::TerminalOnly
+            )
             .unwrap(),
         1,
         "exactly the one terminal task in this band is swept, and the count must be one actually \
@@ -3631,7 +3643,16 @@ fn a_v6_development_database_carries_its_plane_state_across_once() {
     // Terminality came across on the typed column: a purge takes the terminal task only — and
     // `Completed` (not a recognised terminal token) is kept, the closed-set rule the v5 sweep had.
     let _guard = lock_plane_purge();
-    assert_eq!(store.purge_plane_records_before("task", 1_000).unwrap(), 1);
+    assert_eq!(
+        store
+            .purge_plane_records(
+                "task",
+                1_000,
+                busbar_contract::records::Retention::TerminalOnly
+            )
+            .unwrap(),
+        1
+    );
     let ids = all_task_ids(&store);
     assert!(ids.contains(&"t_v6_live".to_string()));
     assert!(ids.contains(&"t_v6_Done".to_string()));

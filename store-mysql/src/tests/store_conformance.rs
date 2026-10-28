@@ -775,7 +775,11 @@ pub fn assert_plane_purge_task_keeps_active_rows(store: &dyn RecordStore, ns: &s
     // executes second can correctly see `0` for its own call, without either backend being
     // non-conforming. What holds under any interleaving is the namespace-scoped evidence below.
     let _purged = store
-        .purge_plane_records_before("task", cutoff)
+        .purge_plane_records(
+            "task",
+            cutoff,
+            busbar_contract::records::Retention::TerminalOnly,
+        )
         .expect("purge the task plane records older than the cutoff");
 
     let ids: Vec<String> = store
