@@ -239,11 +239,14 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "futures",
+ "getrandom 0.3.4",
  "hex",
  "http",
  "idna",
  "indexmap",
  "memchr",
+ "num-bigint",
+ "ring",
  "serde",
  "serde_json",
  "serde_yaml_ng",
@@ -302,7 +305,6 @@ dependencies = [
  "busbar-kernel-ledger",
  "busbar-kernel-scope",
  "busbar-kernel-wal",
- "busbar-plugin-loader",
  "bytes",
  "crc32fast",
  "ed25519-dalek",
@@ -313,8 +315,6 @@ dependencies = [
  "http-body",
  "http-body-util",
  "httpdate",
- "hyper",
- "hyper-util",
  "indexmap",
  "metrics",
  "metrics-util",
@@ -350,7 +350,6 @@ version = "1.6.0"
 source = "git+https://github.com/GetBusbar/busbar?rev=9f29c70fb0914c700c44bef77f77646d1cb110e9#9f29c70fb0914c700c44bef77f77646d1cb110e9"
 dependencies = [
  "busbar-contract",
- "httpdate",
 ]
 
 [[package]]
@@ -458,7 +457,7 @@ dependencies = [
 [[package]]
 name = "busbar-transport-tcp"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar-transport-tcp?rev=223ec3f02000de94089a1752635b9e206f7492e5#223ec3f02000de94089a1752635b9e206f7492e5"
+source = "git+https://github.com/GetBusbar/busbar-transport-tcp?rev=de7af6404e1e281841c39a01d48fd2b405e2f1bc#de7af6404e1e281841c39a01d48fd2b405e2f1bc"
 dependencies = [
  "busbar-contract",
 ]
@@ -770,12 +769,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fnv"
-version = "1.0.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
-
-[[package]]
 name = "foldhash"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -928,25 +921,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "h2"
-version = "0.4.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "839c0e8a181239723652be9062bb56ca5bf5f64011f73b623f6f4fc59086a228"
-dependencies = [
- "atomic-waker",
- "bytes",
- "fnv",
- "futures-core",
- "futures-sink",
- "http",
- "indexmap",
- "slab",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
 name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1022,7 +996,6 @@ dependencies = [
  "bytes",
  "futures-channel",
  "futures-core",
- "h2",
  "http",
  "http-body",
  "httparse",
