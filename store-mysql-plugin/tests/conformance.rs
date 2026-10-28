@@ -470,3 +470,29 @@ fn the_statement_declares_exactly_its_secret_fields() {
     .expect("the rendering reads back");
     assert_eq!(stated.secret_refs, ["url".to_string()]);
 }
+
+/// A 1.5.5 store config's `url: {env: …}` passes the host's secret-field check: the one
+/// `--validate` and boot run over plugin settings (`busbar_contract::secret_fields::
+/// undeclared_reference`, busbar #1699), against the paths this store's Statement declares. A
+/// reference at a field the store does not declare is still refused, so the check is not vacuous.
+#[test]
+fn a_url_reference_passes_the_hosts_secret_field_check() {
+    let declared = busbar_contract::abi::mechanism::rendering::read(
+        &busbar_plugin_loader::dispatch::rendering_of(busbar_store_mysql::door)
+            .expect("the door renders"),
+    )
+    .expect("the rendering reads back")
+    .secret_refs;
+    let settings = serde_json::json!({ "url": { "env": "BUSBAR_STORE_URL" } });
+    assert_eq!(
+        busbar_contract::secret_fields::undeclared_reference(&settings, &declared),
+        None,
+        "a url reference must be accepted at the declared field"
+    );
+    let elsewhere = serde_json::json!({ "url": "x", "other": { "env": "BUSBAR_OTHER" } });
+    assert_eq!(
+        busbar_contract::secret_fields::undeclared_reference(&elsewhere, &declared),
+        Some("other".to_string()),
+        "a reference at an undeclared field is refused"
+    );
+}
