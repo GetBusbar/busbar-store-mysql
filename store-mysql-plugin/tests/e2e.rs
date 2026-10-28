@@ -45,7 +45,7 @@ use std::sync::Arc;
 fn host(instance: &str) -> (Arc<Dispatcher>, Bind) {
     let dispatcher = Arc::new(Dispatcher::new(DispatchConfig::default()));
     let conns: Arc<dyn busbar_contract::conn::DeclaredConns> = Arc::new(
-        busbar_plugin_loader::tcp_conns::TcpConns::new(dispatcher.conn_waker()),
+        busbar_test_kit::tcp_conns::TcpConns::new(dispatcher.conn_waker()),
     );
     let bind = Bind {
         instance: Arc::from(instance),

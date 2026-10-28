@@ -40,7 +40,7 @@ mod common;
 #[path = "support/conformance_host.rs"]
 mod conformance_host;
 
-busbar_plugin_loader::conformance_suite! {
+busbar_test_kit::conformance_suite! {
     door: busbar_store_mysql::door,
     cdylib: "busbar_store_mysql_plugin",
     inputs: include_str!("conformance.json"),
@@ -146,9 +146,8 @@ fn cdylib() -> PathBuf {
 /// What a door is bound to: its own dispatcher's adopter, no envelope sink, and the loader's test
 /// connection table (plain TCP, the host's connector path) for the one `tcp` need the store states.
 fn bind(d: &Dispatcher) -> Bind {
-    let conns: Arc<dyn busbar_contract::conn::DeclaredConns> = Arc::new(
-        busbar_plugin_loader::tcp_conns::TcpConns::new(d.conn_waker()),
-    );
+    let conns: Arc<dyn busbar_contract::conn::DeclaredConns> =
+        Arc::new(busbar_test_kit::tcp_conns::TcpConns::new(d.conn_waker()));
     Bind {
         instance: Arc::from("store-mysql-conformance"),
         max_inflight_cap: 64,
