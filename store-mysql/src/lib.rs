@@ -1577,7 +1577,7 @@ impl MysqlStore {
                 "INSERT INTO plane_records (kind, ident, seq, id, parent, ts, terminal, body) \
                  VALUES (:kind, :ident, :seq, :id, :parent, :ts, :terminal, :body) \
                  ON DUPLICATE KEY UPDATE kind = kind",
-                plane_params(record),
+                plane_params(record, ident),
             )
             .await
             .map_err(store_err)?;
@@ -2254,7 +2254,7 @@ impl MysqlStore {
              VALUES (:kind, :ident, :seq, :id, :parent, :ts, :terminal, :body) \
              ON DUPLICATE KEY UPDATE id = VALUES(id), parent = VALUES(parent), ts = VALUES(ts), \
                 terminal = VALUES(terminal), body = VALUES(body)",
-            plane_params(record),
+            plane_params(record, &record.id),
         )
         .await
         .map_err(store_err)
@@ -2472,9 +2472,9 @@ impl MysqlStore {
     }
 }
 
-/// A plane record's IDENTITY within its kind: its `parent` when it is an appended child (a chain
-/// position is `(parent, seq)`), else its own `id` (at seq 0 for an upsert kind). The same rule
-/// busbar's reference stores key by, so every backend agrees on what "the same record" means.
+/// An APPENDED plane record's IDENTITY within its kind: its `parent` when it is a child (a chain
+/// position is `(parent, seq)`), else its own `id`. An upserted record's identity is always its own
+/// `id`, parent or not (the contract upserts by `(kind, id)`).
 fn plane_ident(record: &PlaneRecord) -> &str {
     record.parent.as_deref().unwrap_or(&record.id)
 }
@@ -2483,10 +2483,11 @@ fn is_terminal(d: PlaneDisposition) -> bool {
     matches!(d, PlaneDisposition::Terminal)
 }
 
-fn plane_params(record: &PlaneRecord) -> Params {
+/// A plane record's row at identity `ident` ([`plane_ident`] for an append, its id for an upsert).
+fn plane_params(record: &PlaneRecord, ident: &str) -> Params {
     params! {
         "kind" => &record.kind,
-        "ident" => plane_ident(record),
+        "ident" => ident,
         "seq" => record.seq,
         "id" => &record.id,
         "parent" => &record.parent,
