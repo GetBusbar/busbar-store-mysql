@@ -456,3 +456,17 @@ fn a_statement_that_is_not_the_librarys_own_is_refused() {
     };
     assert!(e.contains("repack the plugin"), "{e}");
 }
+
+/// The store's Statement declares exactly its secret fields (`secret_refs`): `url`, the one
+/// setting that carries the connection's credentials (`user:password@host`). busbar resolves
+/// a secret reference only at a position the Statement declares secret and refuses one anywhere
+/// else (busbar #1699, ORACLE-SIGNOFF G14), so a 1.5.5 config's `url: {env: …}` keeps booting.
+#[test]
+fn the_statement_declares_exactly_its_secret_fields() {
+    let stated = busbar_contract::abi::mechanism::rendering::read(
+        &busbar_plugin_loader::dispatch::rendering_of(busbar_store_mysql::door)
+            .expect("the door renders"),
+    )
+    .expect("the rendering reads back");
+    assert_eq!(stated.secret_refs, ["url".to_string()]);
+}
