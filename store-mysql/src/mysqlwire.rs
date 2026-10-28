@@ -575,6 +575,13 @@ struct Stmt {
 
 /// What a connection carries across the ops that reuse it (the store SDK's kept set keeps it with
 /// the connection, [`Wire::set_session`]).
+/// A query text parsed once: the positional text sent to the server and, for a named query, the
+/// order its parameters were named in.
+struct ParsedQuery {
+    positional: Vec<u8>,
+    named: Option<Vec<Vec<u8>>>,
+}
+
 struct State {
     opts: Arc<Opts>,
     codec: PacketCodec,
@@ -590,7 +597,7 @@ struct State {
     stmts: HashMap<Vec<u8>, Arc<Stmt>>,
     /// Each query text's parse into (positional text, named-parameter order), so a repeated query
     /// is not re-parsed per execute. Bounded by `stmt_cache_size` like `stmts`.
-    parsed: HashMap<String, Arc<(Vec<u8>, Option<Vec<Vec<u8>>>)>>,
+    parsed: HashMap<String, Arc<ParsedQuery>>,
     /// The last OK packet (affected rows, last insert id).
     ok: Option<OkPacket<'static>>,
     has_results: bool,
@@ -1372,7 +1379,10 @@ impl Conn {
                 } else {
                     Some(p.params().iter().map(|p| p.to_vec()).collect())
                 };
-                let parsed = Arc::new((p.query().to_vec(), named));
+                let parsed = Arc::new(ParsedQuery {
+                    positional: p.query().to_vec(),
+                    named,
+                });
                 let cap = self.st.opts.stmt_cache_size;
                 if cap > 0 {
                     if self.st.parsed.len() >= cap {
@@ -1383,7 +1393,7 @@ impl Conn {
                 parsed
             }
         };
-        let (positional, named) = (&parsed.0, &parsed.1);
+        let (positional, named) = (&parsed.positional, &parsed.named);
         let stmt = self.prepare(positional).await?;
         let params = match params {
             Params::Named(_) => match named {
