@@ -1788,12 +1788,12 @@ fn a_replayed_call_is_idempotent_but_a_forked_one_is_refused() {
         "a replay must not duplicate the row"
     );
 
-    let forked = call_rec(p, 1, 2_000_000_100, "", "DIFFERENT");
+    let forked = call_rec(p, 1, 2_000_000_100, "", "h2-second-writer");
     let err = store
         .append_plane_record(forked.view())
         .expect_err("a different record at an occupied (principal, seq) is a fork and must error");
     assert!(
-        !format!("{err}").contains("DIFFERENT"),
+        !format!("{err}").contains("h2-second-writer"),
         "the error must not echo stored or caller content back"
     );
     assert_eq!(
