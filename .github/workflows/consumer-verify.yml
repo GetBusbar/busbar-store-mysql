@@ -20,7 +20,7 @@ permissions:
 
 jobs:
   consumer:
-    uses: GetBusbar/busbar/.github/workflows/plugin-consumer-verify.yml@7840242505d812f5d123c4e88a9f30137aa5ce86
+    uses: GetBusbar/busbar/.github/workflows/plugin-consumer-verify.yml@e171ea95260a76ba3cd7156dab480fe4cae60747
     with:
       version: ${{ inputs.version || '' }}
       asset_prefix: busbar-store-mysql
