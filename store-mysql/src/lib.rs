@@ -22,6 +22,7 @@
 
 use std::sync::Arc;
 
+use busbar_contract::abi::sdk::store::fork;
 use busbar_contract::abi::sdk::store::wire::Pool;
 use mysql_common::params;
 
@@ -1607,11 +1608,7 @@ impl MysqlStore {
                 return Ok(());
             }
             // Names the position and nothing else -- it must not echo stored (or caller) content.
-            return Err(store_err(format!(
-                "append_plane_record: kind '{}' seq {} already holds a different record for this \
-                 parent; the chain has forked",
-                record.kind, record.seq
-            )));
+            return Err(fork::chain_fork(&record.kind, ident, record.seq));
         }
         Err(store_err(format!(
             "append_plane_record: kind '{}' seq {} kept being freed between the insert and the \
