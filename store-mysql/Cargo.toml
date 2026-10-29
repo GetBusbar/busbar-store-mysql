@@ -50,6 +50,6 @@ ulid = { workspace = true }
 # dispatcher (`load_linked`, `LoadedStore`), every connection over the loader's test connection table
 # (`TcpConns`, `test-support`). The 1.5.5 `mysql` driver verifies what landed INDEPENDENTLY of the
 # store (tests only; never in the shipped image).
-busbar-plugin-loader = { workspace = true, features = ["test-support"] }
+busbar-plugin-loader = { workspace = true }
 busbar-test-kit = { workspace = true }
 mysql = { workspace = true }

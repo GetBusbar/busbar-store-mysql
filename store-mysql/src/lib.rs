@@ -31,8 +31,8 @@ use mysqlwire::{Conn, Error, Opts, Params, Row, Transaction};
 use busbar_contract::records::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, ModelTokens,
     ModelTokensDelta, PlaneDisposition, PlaneRecord, PlaneSelector, RecordStoreError,
-    RecordStoreResult, ScopeRef, SecretForm, UsageDelta, UsageLedger, VirtualKey, UNIT_CACHE_READ,
-    UNIT_CACHE_WRITE, UNIT_INPUT, UNIT_OUTPUT,
+    RecordStoreResult, Retention, ScopeRef, SecretForm, UsageDelta, UsageLedger, VirtualKey,
+    UNIT_CACHE_READ, UNIT_CACHE_WRITE, UNIT_INPUT, UNIT_OUTPUT,
 };
 use std::collections::BTreeMap;
 
@@ -358,6 +358,9 @@ const SCHEMA: &[&str] = &[
     // No IF NOT EXISTS -- MySQL has no such form for CREATE INDEX; a re-run's duplicate error is
     // swallowed by try_init_schema, exactly as it is for every other index here.
     "CREATE INDEX idx_plane_records_kind_ts ON plane_records (kind, ts)",
+    // The parent-scoped listing's access path: an appended chain lives at `ident = parent`, but an
+    // upserted record that names a parent lives at its own id, so the listing reads `parent`.
+    "CREATE INDEX idx_plane_records_kind_parent ON plane_records (kind, parent, seq)",
     // The single-use token ledger (`redeem_plane_token`) -- the durable record that makes a
     // confirm-once approval execute once across a restart AND across the nodes of a fleet. A sealed
     // token is valid bytes on its second presentation exactly as on its first; only a record that
@@ -1577,7 +1580,7 @@ impl MysqlStore {
                 "INSERT INTO plane_records (kind, ident, seq, id, parent, ts, terminal, body) \
                  VALUES (:kind, :ident, :seq, :id, :parent, :ts, :terminal, :body) \
                  ON DUPLICATE KEY UPDATE kind = kind",
-                plane_params(record),
+                plane_params(record, ident),
             )
             .await
             .map_err(store_err)?;
@@ -2254,7 +2257,7 @@ impl MysqlStore {
              VALUES (:kind, :ident, :seq, :id, :parent, :ts, :terminal, :body) \
              ON DUPLICATE KEY UPDATE id = VALUES(id), parent = VALUES(parent), ts = VALUES(ts), \
                 terminal = VALUES(terminal), body = VALUES(body)",
-            plane_params(record),
+            plane_params(record, &record.id),
         )
         .await
         .map_err(store_err)
@@ -2296,7 +2299,7 @@ impl MysqlStore {
             PlaneSelector::Parent(parent) => {
                 conn.exec(
                     "SELECT body FROM plane_records \
-                 WHERE kind = :kind AND ident = :parent AND parent = :parent ORDER BY seq",
+                 WHERE kind = :kind AND parent = :parent ORDER BY seq",
                     params! { "kind" => kind, "parent" => parent.as_ref() },
                 )
                 .await
@@ -2325,9 +2328,48 @@ impl MysqlStore {
         kind: &str,
         before: u64,
     ) -> RecordStoreResult<u64> {
+        // The age-only entry: `task` has always dropped only its TERMINAL rows here, every other
+        // kind every row older than `before`.
+        let retention = if kind == KIND_TASK {
+            Retention::TerminalOnly
+        } else {
+            Retention::Age
+        };
+        Self::purge_plane_records(conn, kind, before, retention).await
+    }
+
+    pub(crate) async fn purge_plane_records(
+        conn: &mut Conn,
+        kind: &str,
+        before: u64,
+        retention: Retention,
+    ) -> RecordStoreResult<u64> {
         // STRICTLY older than the cutoff: a row exactly at `before` is kept. The count returned is
-        // one the DELETE actually performed (`affected_rows`), never an estimate.
-        if kind == KIND_TASK {
+        // one the DELETE actually performed (`affected_rows`), never an estimate. WHICH rows go is
+        // the rule the call carries, never one inferred from the kind's name.
+        let terminal_only = retention == Retention::TerminalOnly;
+        if terminal_only && kind != KIND_TASK {
+            // A terminal-only sweep of any other kind: its TERMINAL rows older than the cutoff, in
+            // bounded batches (the typed `terminal` column, never the body); an ACTIVE row stays.
+            const BATCH: u64 = 5000;
+            let mut total = 0u64;
+            loop {
+                conn.exec_drop(
+                    "DELETE FROM plane_records WHERE kind = :kind AND ts < :before AND terminal \
+                     LIMIT 5000",
+                    params! { "kind" => kind, "before" => before },
+                )
+                .await
+                .map_err(store_err)?;
+                let n = conn.affected_rows();
+                total += n;
+                if n < BATCH {
+                    break;
+                }
+            }
+            return Ok(total);
+        }
+        if terminal_only {
             // TERMINAL ONLY: an interrupted task waiting on a human must survive. Its event chain
             // goes with it in the same transaction. Candidates come from a non-locking read and
             // each is deleted by primary key with the predicate re-checked, so concurrent sweeps
@@ -2472,9 +2514,9 @@ impl MysqlStore {
     }
 }
 
-/// A plane record's IDENTITY within its kind: its `parent` when it is an appended child (a chain
-/// position is `(parent, seq)`), else its own `id` (at seq 0 for an upsert kind). The same rule
-/// busbar's reference stores key by, so every backend agrees on what "the same record" means.
+/// An APPENDED plane record's IDENTITY within its kind: its `parent` when it is a child (a chain
+/// position is `(parent, seq)`), else its own `id`. An upserted record's identity is always its own
+/// `id`, parent or not (the contract upserts by `(kind, id)`).
 fn plane_ident(record: &PlaneRecord) -> &str {
     record.parent.as_deref().unwrap_or(&record.id)
 }
@@ -2483,10 +2525,11 @@ fn is_terminal(d: PlaneDisposition) -> bool {
     matches!(d, PlaneDisposition::Terminal)
 }
 
-fn plane_params(record: &PlaneRecord) -> Params {
+/// A plane record's row at identity `ident` ([`plane_ident`] for an append, its id for an upsert).
+fn plane_params(record: &PlaneRecord, ident: &str) -> Params {
     params! {
         "kind" => &record.kind,
-        "ident" => plane_ident(record),
+        "ident" => ident,
         "seq" => record.seq,
         "id" => &record.id,
         "parent" => &record.parent,

@@ -201,7 +201,7 @@ fn load_and_exercise_mysql_plugin_via_file_drop() {
     // crates/busbar/tests/cli_validate.rs::write_configs, not invented here.
     std::fs::write(
         &providers,
-        "mock:\n  protocol: anthropic\n  base_url: \"http://127.0.0.1:9\"\n  api_key_env: MOCK_KEY\n",
+        "mock:\n  protocol: anthropic\n  base_url: \"http://127.0.0.1:9\"\n",
     )
     .unwrap();
     let config_text = format!(
@@ -534,7 +534,7 @@ fn tasks_and_call_log_survive_an_unload_and_reload_over_the_real_plugin_abi() {
     );
     assert_eq!(
         store
-            .purge_plane_records_before("task", 25)
+            .purge_plane_records("task", 25, busbar_contract::records::Retention::TerminalOnly)
             .expect("purge tasks"),
         0,
         "no TERMINAL task is older than the cutoff: t_alpha and t_beta are active and must never be \
@@ -542,7 +542,11 @@ fn tasks_and_call_log_survive_an_unload_and_reload_over_the_real_plugin_abi() {
     );
     assert_eq!(
         store
-            .purge_plane_records_before("task", 31)
+            .purge_plane_records(
+                "task",
+                31,
+                busbar_contract::records::Retention::TerminalOnly
+            )
             .expect("purge tasks"),
         1,
         "the one terminal task at ts 30 is the only row retention may drop"
