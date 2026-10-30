@@ -1875,7 +1875,10 @@ impl MysqlStore {
         bucket_id: &str,
         window_start: u64,
     ) -> RecordStoreResult<UsageLedger> {
-        let rows: Vec<(String, u64, u64, u64, u64)> = conn
+        // One snapshot: a writer moving the request and token counters together is never seen
+        // half-applied.
+        let mut tx = conn.start_snapshot().await.map_err(store_err)?;
+        let rows: Vec<(String, u64, u64, u64, u64)> = tx
             .exec(
                 "SELECT model, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write \
                  FROM usage_windows WHERE window_start = :w AND bucket_scope = 'key' \
@@ -1888,10 +1891,10 @@ impl MysqlStore {
         // WHERE clause — it returns SQL NULL for each aggregate, not an empty result set. So
         // `exec_first::<(u64, u64)>` is NEVER `None` here (that would require zero rows, which
         // never happens); instead it is a `Some(Row)` whose columns are NULL for a bucket/window
-        // with no usage yet, and mysql_common's `FromRow` for a non-Option tuple PANICS trying to
-        // convert NULL into `u64`. `COALESCE(..., 0)` makes MySQL itself hand back 0 for the
-        // empty-aggregate case, matching Postgres/SQLite's "no row yet" -> 0 semantics.
-        let totals: Option<(u64, u64)> = conn
+        // with no usage yet, which a non-Option `u64` refuses. `COALESCE(..., 0)` makes MySQL
+        // itself hand back 0 for the empty-aggregate case, matching Postgres/SQLite's "no row
+        // yet" -> 0 semantics.
+        let totals: Option<(u64, u64)> = tx
             .exec_first(
                 "SELECT COALESCE(SUM(requests), 0), COALESCE(SUM(billable_requests), 0) \
                  FROM usage_windows WHERE window_start = :w AND bucket_scope = 'key' AND bucket_id = :b",
@@ -1904,7 +1907,7 @@ impl MysqlStore {
         // model's entry. A model that carries only open units still has its `usage_windows` row --
         // `put_usage`/`add_usage` always write one per model -- so it is already in `rows`; the
         // `or_insert` below only guards a row an operator deleted by hand.
-        let open: Vec<(String, String, u64)> = conn
+        let open: Vec<(String, String, u64)> = tx
             .exec(
                 "SELECT model, unit, count FROM usage_window_units \
                  WHERE bucket_id = :b AND window_start = :w AND bucket_scope = 'key' \
@@ -1913,6 +1916,7 @@ impl MysqlStore {
             )
             .await
             .map_err(store_err)?;
+        tx.commit().await.map_err(store_err)?;
 
         let mut models: Vec<ModelTokens> = rows
             .into_iter()
@@ -2039,7 +2043,9 @@ impl MysqlStore {
         bucket: u64,
     ) -> RecordStoreResult<Vec<MeteringRow>> {
         let bucket_s = format!("{bucket:010}");
-        let rows: Vec<Row> = conn
+        // One snapshot: a cell and its open units are read at one point in time.
+        let mut tx = conn.start_snapshot().await.map_err(store_err)?;
+        let rows: Vec<Row> = tx
             .exec(
                 "SELECT key_id, model, provider, tokens_input, tokens_output, tokens_cache_read, \
                  tokens_cache_write, requests, billable_requests, key_group_at_use, pricing_version, \
@@ -2047,7 +2053,7 @@ impl MysqlStore {
                 params! { "b" => &bucket_s },
             ).await
             .map_err(store_err)?;
-        let units: Vec<(String, String, String, u64, String, u64)> = conn
+        let units: Vec<(String, String, String, u64, String, u64)> = tx
             .exec(
                 // Joined to the cell in SQL. Both tables' keys are byte-exact (v11, which re-spelt
                 // any unit a pre-v11 case-insensitive key had let differ from its cell).
@@ -2060,6 +2066,7 @@ impl MysqlStore {
             )
             .await
             .map_err(store_err)?;
+        tx.commit().await.map_err(store_err)?;
         // The open units, keyed by their cell, so each lands on exactly the row it was accrued to.
         let mut by_cell: BTreeMap<(String, String, String, u64), BTreeMap<String, u64>> =
             BTreeMap::new();

@@ -1494,6 +1494,24 @@ impl Conn {
     }
 }
 
+impl Conn {
+    /// `START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY` under REPEATABLE READ: every read
+    /// until the commit sees one point in time.
+    ///
+    /// # Errors
+    /// The statement's failure.
+    pub async fn start_snapshot(&mut self) -> Result<Transaction<'_>> {
+        self.query_drop("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .await?;
+        self.query_drop("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY")
+            .await?;
+        Ok(Transaction {
+            conn: self,
+            done: false,
+        })
+    }
+}
+
 /// A transaction; rolled back unless committed (before the connection's next statement).
 pub struct Transaction<'a> {
     conn: &'a mut Conn,
