@@ -122,13 +122,19 @@ macro_rules! op {
 }
 
 /// The effect of one `op_id`-carrying write.
-enum Write {
+pub(crate) enum Write {
     Usage(Vec<(String, u64, UsageDelta)>),
     Metering(Vec<MeteringDelta>),
     Append(PlaneRecord),
 }
 
 impl Write {
+    /// The cells in one global order, so two nodes flushing overlapping cells take their row locks
+    /// in the same order (sums commute, so the order is free to choose).
+    pub(crate) fn ordered(self) -> Self {
+        self
+    }
+
     async fn apply(&self, tx: &mut Conn) -> Result<(), ApplyError> {
         match self {
             Write::Usage(cells) => {
@@ -158,6 +164,7 @@ async fn deduped(
 ) -> OpResult<Option<Vec<u8>>> {
     // The claim can find a row a concurrent sweep or rollback removes before it is read; the op is
     // then new again, so the claim is retried (bounded).
+    let write = write.ordered();
     for _ in 0..3 {
         let mut tx = conn.start_transaction().await.map_err(backend)?;
         match tx

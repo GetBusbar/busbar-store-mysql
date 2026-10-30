@@ -249,6 +249,70 @@ fn metering_counters_pin_at_the_ceiling() {
     }
 }
 
+/// M8: a batch is applied in one global order whatever order the caller sent it in (a unit-level
+/// check of the order handed to the apply loop; the deadlock itself needs two nodes).
+#[test]
+fn a_batch_applies_in_one_global_order() {
+    use crate::slots::Write;
+    use busbar_contract::records::MeteringDelta;
+    let cell = |b: &str, w: u64| (b.to_owned(), w, UsageDelta::default());
+    let Write::Usage(cells) =
+        Write::Usage(vec![cell("b", 2), cell("a", 9), cell("b", 1), cell("a", 3)]).ordered()
+    else {
+        unreachable!()
+    };
+    let got: Vec<_> = cells.iter().map(|(b, w, _)| (b.as_str(), *w)).collect();
+    assert_eq!(got, [("a", 3), ("a", 9), ("b", 1), ("b", 2)]);
+
+    let m = |bucket: u64, key: &str, model: &str, pfm: u64| MeteringDelta {
+        key_id: key.into(),
+        bucket,
+        model: model.into(),
+        provider: "p".into(),
+        priced_from_ms: pfm,
+        tokens_input: 0,
+        tokens_output: 0,
+        tokens_cache_read: 0,
+        tokens_cache_write: 0,
+        requests: 0,
+        billable_requests: 0,
+        key_group_at_use: String::new(),
+        pricing_version: String::new(),
+        usage_units: Default::default(),
+    };
+    let Write::Metering(ds) = Write::Metering(vec![
+        m(2, "k", "m", 0),
+        m(1, "z", "m", 0),
+        m(1, "k", "n", 0),
+        m(1, "k", "m", 5),
+        m(1, "k", "m", 0),
+    ])
+    .ordered() else {
+        unreachable!()
+    };
+    let got: Vec<_> = ds
+        .iter()
+        .map(|d| {
+            (
+                d.bucket,
+                d.key_id.as_str(),
+                d.model.as_str(),
+                d.priced_from_ms,
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        [
+            (1, "k", "m", 0),
+            (1, "k", "m", 5),
+            (1, "k", "n", 0),
+            (1, "z", "m", 0),
+            (2, "k", "m", 0)
+        ]
+    );
+}
+
 #[test]
 fn records_upsert_read_back_and_scan_a_prefix_in_key_order() {
     let Some(s) = fresh_store() else { return };
