@@ -2333,9 +2333,7 @@ impl MysqlStore {
         tx.exec_drop(
             "INSERT INTO denylist (sub, reason, revoked_at, expires_at, revision) \
              VALUES (:sub, :reason, :now, :expires, :rev) \
-             ON DUPLICATE KEY UPDATE
-                reason = VALUES(reason), revoked_at = VALUES(revoked_at),
-                expires_at = GREATEST(expires_at, VALUES(expires_at)), revision = VALUES(revision)",
+             ON DUPLICATE KEY UPDATE sub = sub",
             params! {
                 "sub" => sub, "reason" => reason, "now" => now, "expires" => now + max_ttl, "rev" => rev,
             },

@@ -638,38 +638,35 @@ fn add_metering_upserts_and_accumulates() {
 // ── Denylist ─────────────────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn denylist_add_and_list_roundtrips_and_never_shortens_the_window() {
+fn denylist_add_and_list_roundtrips_and_a_repeat_leaves_the_row_alone() {
     let Some(s) = fresh_store() else { return };
     s.add_denylist("sub_window", "revoked").unwrap();
     assert!(s
         .list_denylist()
         .unwrap()
         .contains(&"sub_window".to_string()));
-    // Push the stored expiry far past anything a re-add computes, and note the revision.
+    // Push the stored expiry far past anything a re-add computes, and note the row.
     let far = 4_000_000_000_000u64;
-    let (before_exp, before_rev): (u64, u64) = {
-        let mut conn = s.pool.get_conn().unwrap();
-        conn.exec_drop(
-            "UPDATE denylist SET expires_at = :far WHERE sub = 'sub_window'",
-            params! { "far" => far },
-        )
-        .unwrap();
+    let row = |conn: &mut PooledConn| -> (u64, u64) {
         conn.query_first("SELECT expires_at, revision FROM denylist WHERE sub = 'sub_window'")
             .unwrap()
             .unwrap()
     };
-    assert_eq!(before_exp, far);
-    // Re-adding must not error (idempotent upsert path), must never shorten the window, and must
-    // bump the revision.
+    let mut conn = s.pool.get_conn().unwrap();
+    conn.exec_drop(
+        "UPDATE denylist SET expires_at = :far WHERE sub = 'sub_window'",
+        params! { "far" => far },
+    )
+    .unwrap();
+    let before = row(&mut conn);
+    assert_eq!(before.0, far);
+    // Re-adding is a no-op (it must not error, and it never shortens the window).
     s.add_denylist("sub_window", "revoked again").unwrap();
-    let (after_exp, after_rev): (u64, u64) = {
-        let mut conn = s.pool.get_conn().unwrap();
-        conn.query_first("SELECT expires_at, revision FROM denylist WHERE sub = 'sub_window'")
-            .unwrap()
-            .unwrap()
-    };
-    assert_eq!(after_exp, far, "a re-add must never shorten the window");
-    assert!(after_rev > before_rev, "{after_rev} > {before_rev}");
+    assert_eq!(
+        row(&mut conn),
+        before,
+        "a repeat add leaves the row as it was"
+    );
 }
 
 // ── Boot-time invariant probes ───────────────────────────────────────────────────────────────────
