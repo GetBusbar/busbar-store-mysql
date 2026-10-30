@@ -1807,7 +1807,9 @@ impl MysqlStore {
     ) -> RecordStoreResult<Vec<VirtualKey>> {
         let rows: Vec<Row> = conn
             .exec(
-                format!("SELECT {KEY_COLUMNS} FROM api_keys WHERE revision > :since"),
+                format!(
+                    "SELECT {KEY_COLUMNS} FROM api_keys WHERE revision > :since OR revision = 0"
+                ),
                 params! { "since" => since },
             )
             .await
@@ -2277,7 +2279,7 @@ impl MysqlStore {
             .exec(
                 "SELECT id, key_id, kind, slot, public_id, secret_form, created_at, updated_at, \
                  expires_at, revoked_at, revoke_reason, revision, secret FROM credentials \
-                 WHERE revision > :since",
+                 WHERE revision > :since OR revision = 0",
                 params! { "since" => since },
             )
             .await
