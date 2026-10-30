@@ -512,11 +512,11 @@ impl MysqlStore {
         Ok(())
     }
 
-    /// Schema creation, retried on deadlock. Concurrent `CREATE TABLE`/`CREATE INDEX` from more than
+    /// Schema creation, retried (bounded, immediately) on deadlock. Concurrent `CREATE TABLE`/`CREATE INDEX` from more than
     /// one connection (a multi-node fleet booting simultaneously against a fresh database, or —
     /// exactly this crate's own parallel test suite — is a REAL scenario, not just a test artifact:
     /// MySQL's metadata locking can genuinely deadlock two concurrent DDL statements against the
-    /// same schema (`ERROR 1213`). A bounded retry-with-backoff is the correct response (the losing
+    /// same schema (`ERROR 1213`). A bounded retry is the correct response (the losing
     /// transaction is safe to retry — DDL here is idempotent via the `IF NOT EXISTS`/duplicate-error
     /// swallowing below), not a crash.
     async fn init_schema(conn: &mut Conn) -> RecordStoreResult<()> {
@@ -524,22 +524,9 @@ impl MysqlStore {
         for attempt in 1..=MAX_ATTEMPTS {
             match Self::try_init_schema_waiting(conn, MIGRATION_LOCK_WAIT_SECS).await {
                 Ok(()) => return Ok(()),
-                Err(e) if attempt < MAX_ATTEMPTS && Self::is_deadlock(&e.0) => {
-                    // Linear backoff plus a per-process/per-thread jitter, so two booters that
-                    // deadlocked once do not retry in lockstep and deadlock again.
-                    let jitter = {
-                        use std::hash::{Hash, Hasher};
-                        let mut h = std::collections::hash_map::DefaultHasher::new();
-                        std::thread::current().id().hash(&mut h);
-                        std::process::id().hash(&mut h);
-                        attempt.hash(&mut h);
-                        h.finish() % 50
-                    };
-                    std::thread::sleep(std::time::Duration::from_millis(
-                        50 * attempt as u64 + jitter,
-                    ));
-                    continue;
-                }
+                // No back-off: the connect step runs on a dispatcher thread and the SDK offers
+                // a body no timed pend, so the retry is immediate and bounded.
+                Err(e) if attempt < MAX_ATTEMPTS && Self::is_deadlock(&e.0) => {}
                 Err(e) => return Err(e),
             }
         }
