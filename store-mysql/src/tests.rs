@@ -2831,6 +2831,31 @@ fn redeeming_evicts_entries_whose_token_can_no_longer_be_presented() {
     reset_tokens(&store, "ask", &[&short, &long, &other]);
 }
 
+/// THE SWEEP IS STRICTLY LESS-THAN: an entry expiring exactly at `now` is still presentable at
+/// `now`, so it is kept (and a replay of it is still refused); one second later it goes.
+#[test]
+fn the_sweep_keeps_an_entry_expiring_exactly_at_now() {
+    let url = require_test_url();
+    let (edge, other) = (trust_ns("nonce_edge"), trust_ns("nonce_edge_sweeper"));
+    let store = MysqlStore::connect(&url).expect("connect");
+    reset_tokens(&store, "ask", &[&edge, &other]);
+    let expires = TRUST_NOW + 10;
+    assert!(store
+        .redeem_plane_token("ask", &edge, expires, TRUST_NOW)
+        .unwrap());
+    // A sweep at exactly the entry's expiry keeps it: its replay is refused, not "first".
+    assert!(store
+        .redeem_plane_token("ask", &other, expires + 900, expires)
+        .unwrap());
+    assert!(
+        !store
+            .redeem_plane_token("ask", &edge, expires, expires)
+            .unwrap(),
+        "an entry expiring exactly at `now` is kept, so its replay is still refused"
+    );
+    reset_tokens(&store, "ask", &[&edge, &other]);
+}
+
 /// THE FULL u64 RANGE STORES FAITHFULLY. A clamped or wrapped `now` would be a security bug rather
 /// than a rounding one: clamped high it sweeps the ENTIRE ledger and reports a replay as first.
 #[test]
