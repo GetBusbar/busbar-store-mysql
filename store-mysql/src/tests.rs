@@ -762,15 +762,18 @@ fn boot_probe_rejects_a_permissive_sql_mode() {
     let mut conn = pool.get_conn().unwrap();
     let original: String = conn.query_first("SELECT @@sql_mode").unwrap().unwrap();
     conn.query_drop("SET SESSION sql_mode = ''").unwrap();
-    // The probe reads the SESSION-visible sql_mode on ITS OWN connection from the pool, which for a
-    // single-connection-pool-in-test scenario should reflect this session's setting; if the pool
-    // hands back a different pooled connection this assertion may not trigger -- acceptable for a
-    // probe-logic proof rather than a strict guarantee across pool internals.
-    let result = MysqlStore::probe_invariants(&mut conn);
+    // The probe runs on the store's own client opened in THIS session's sql_mode.
+    let err = MysqlStore::probe_invariants(&mut conn)
+        .expect_err("an empty sql_mode (no STRICT_ALL_TABLES) must be rejected");
+    let text = err.to_string();
     assert!(
-        result.is_err(),
-        "an empty sql_mode (no STRICT_ALL_TABLES) must be rejected"
+        text.contains("sql_mode") && text.contains("STRICT"),
+        "the refusal must name sql_mode and STRICT, not fail for another reason: {text}"
     );
+    // Positive control: the same probe on a strict session passes.
+    conn.query_drop("SET SESSION sql_mode = 'STRICT_ALL_TABLES'")
+        .unwrap();
+    MysqlStore::probe_invariants(&mut conn).expect("a strict session passes the probe");
     conn.query_drop(format!("SET SESSION sql_mode = '{original}'"))
         .unwrap();
 }
