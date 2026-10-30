@@ -41,7 +41,7 @@ use mysql_common::packets::{
 };
 use mysql_common::proto::codec::{Compression, PacketCodec};
 use mysql_common::proto::{Binary, MySerialize, Text};
-use mysql_common::row::convert::{from_row, FromRow};
+use mysql_common::row::convert::{from_row_opt, FromRow};
 use mysql_common::row::RowDeserializer;
 use mysql_common::value::ServerSide;
 
@@ -100,6 +100,8 @@ pub enum DriverError {
     UnknownAuthPlugin(String),
     OldMysqlPasswordDisabled,
     CleartextPluginDisabled,
+    /// A row did not convert to the type asked for (its name, never the value).
+    RowConversion(&'static str),
 }
 
 impl fmt::Display for DriverError {
@@ -129,6 +131,9 @@ impl fmt::Display for DriverError {
                 f,
                 "Can not mix named and positional parameters in one statement"
             ),
+            DriverError::RowConversion(ty) => {
+                write!(f, "A row value does not convert to type `{ty}'")
+            }
             DriverError::UnknownAuthPlugin(name) => {
                 write!(f, "Unknown authentication protocol: `{name}`")
             }
@@ -1409,14 +1414,14 @@ impl Conn {
     pub async fn query<T: FromRow>(&mut self, query: impl AsRef<str>) -> Result<Vec<T>> {
         self.settle().await?;
         let rows = self.query_raw(query.as_ref()).await?;
-        Ok(rows.into_iter().map(from_row::<T>).collect())
+        rows.into_iter().map(convert::<T>).collect()
     }
 
     /// `COM_QUERY`, the first row (text protocol), as `T`.
     pub async fn query_first<T: FromRow>(&mut self, query: impl AsRef<str>) -> Result<Option<T>> {
         self.settle().await?;
         let rows = self.query_raw(query.as_ref()).await?;
-        Ok(rows.into_iter().next().map(from_row::<T>))
+        rows.into_iter().next().map(convert::<T>).transpose()
     }
 
     /// `COM_QUERY`, its rows dropped.
@@ -1434,7 +1439,7 @@ impl Conn {
         let params = params.into();
         let meta = self.execute(query.as_ref(), params).await?;
         let rows = self.rows(meta, true).await?;
-        Ok(rows.into_iter().map(from_row::<T>).collect())
+        rows.into_iter().map(convert::<T>).collect()
     }
 
     /// A prepared statement, the first row (binary protocol), as `T`.
@@ -1446,7 +1451,7 @@ impl Conn {
         let params = params.into();
         let meta = self.execute(query.as_ref(), params).await?;
         let rows = self.rows(meta, true).await?;
-        Ok(rows.into_iter().next().map(from_row::<T>))
+        rows.into_iter().next().map(convert::<T>).transpose()
     }
 
     /// A prepared statement, its rows dropped.
@@ -1536,6 +1541,11 @@ impl Transaction<'_> {
         self.done = true;
         Ok(())
     }
+}
+
+/// `row` as `T`; the driver's `from_row` panics (echoing the row) when it does not convert.
+fn convert<T: FromRow>(row: Row) -> Result<T> {
+    from_row_opt(row).map_err(|_| DriverError::RowConversion(std::any::type_name::<T>()).into())
 }
 
 /// RSA-encrypt `pass` to the server's PEM public key. The driver's encrypt panics on a key that

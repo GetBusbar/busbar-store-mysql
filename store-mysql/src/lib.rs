@@ -1199,8 +1199,8 @@ impl MysqlStore {
 
     fn row_to_key(mut row: Row) -> RecordStoreResult<VirtualKey> {
         let allowed_scopes = assemble_scopes(
-            row.take("allowed_pools").unwrap_or(None),
-            row.take("allowed_scopes_ext").unwrap_or(None),
+            opt_col(&mut row, "allowed_pools")?,
+            opt_col(&mut row, "allowed_scopes_ext")?,
         )?;
         let labels: String = col(&mut row, "labels")?;
         let key_group: String = col(&mut row, "key_group")?;
@@ -1213,13 +1213,13 @@ impl MysqlStore {
             created_at: col(&mut row, "created_at")?,
             group: Some(key_group).filter(|g| !g.is_empty()),
             labels: serde_json::from_str(&labels).map_err(store_err)?,
-            expires_at: row.take("expires_at").unwrap_or(None),
-            deleted_at: row.take("deleted_at").unwrap_or(None),
+            expires_at: opt_col(&mut row, "expires_at")?,
+            deleted_at: opt_col(&mut row, "deleted_at")?,
             revision: col(&mut row, "revision")?,
-            idp_subject: row.take("idp_subject").unwrap_or(None),
-            binding_mode: row.take("binding_mode").unwrap_or(None),
-            minted_by: row.take("minted_by").unwrap_or(None),
-            idp_provider: row.take("idp_provider").unwrap_or(None),
+            idp_subject: opt_col(&mut row, "idp_subject")?,
+            binding_mode: opt_col(&mut row, "binding_mode")?,
+            minted_by: opt_col(&mut row, "minted_by")?,
+            idp_provider: opt_col(&mut row, "idp_provider")?,
         })
     }
 
@@ -1237,9 +1237,9 @@ impl MysqlStore {
             secret_form: parse_secret_form(&secret_form)?,
             created_at: col(&mut row, "created_at")?,
             updated_at: col(&mut row, "updated_at")?,
-            expires_at: row.take("expires_at").unwrap_or(None),
-            revoked_at: row.take("revoked_at").unwrap_or(None),
-            revoke_reason: row.take("revoke_reason").unwrap_or(None),
+            expires_at: opt_col(&mut row, "expires_at")?,
+            revoked_at: opt_col(&mut row, "revoked_at")?,
+            revoke_reason: opt_col(&mut row, "revoke_reason")?,
             revision: col(&mut row, "revision")?,
         })
     }
@@ -1250,8 +1250,29 @@ fn col<T: mysql_common::value::convert::FromValue>(
     row: &mut Row,
     name: &str,
 ) -> RecordStoreResult<T> {
-    row.take(name)
-        .ok_or_else(|| store_err(format!("missing column: {name}")))
+    match row.take_opt(name) {
+        Some(Ok(v)) => Ok(v),
+        Some(Err(_)) => Err(store_err(format!(
+            "column {name} does not convert to {}",
+            std::any::type_name::<T>()
+        ))),
+        None => Err(store_err(format!("missing column: {name}"))),
+    }
+}
+
+/// An optional column of `row`, by name: NULL or absent is `None`.
+fn opt_col<T: mysql_common::value::convert::FromValue>(
+    row: &mut Row,
+    name: &str,
+) -> RecordStoreResult<Option<T>> {
+    match row.take_opt::<Option<T>, _>(name) {
+        Some(Ok(v)) => Ok(v),
+        Some(Err(_)) => Err(store_err(format!(
+            "column {name} does not convert to {}",
+            std::any::type_name::<T>()
+        ))),
+        None => Ok(None),
+    }
 }
 
 /// `(index, table)` for a `SCHEMA` statement of the form `CREATE INDEX <index> ON <table> (...)`,
@@ -2199,7 +2220,7 @@ impl MysqlStore {
             .map_err(store_err)?;
         rows.into_iter()
             .map(|mut row| {
-                let secret: Option<String> = row.take("secret");
+                let secret: Option<String> = opt_col(&mut row, "secret")?;
                 let meta = Self::row_to_cred_meta(row)?;
                 Ok(CredentialSecret {
                     meta,
