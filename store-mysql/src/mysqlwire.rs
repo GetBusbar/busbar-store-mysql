@@ -1553,7 +1553,8 @@ fn rsa_encrypt(pass: &[u8], key: &[u8]) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Conn, Io, Opts, UrlError};
+    use super::{Conn, DriverError, Error, Io, Opts, UrlError};
+    use mysql_common::packets::AuthSwitchRequest;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::Arc;
@@ -1571,11 +1572,19 @@ mod tests {
     fn fake_server(
         script: impl FnOnce(TcpStream) + Send + 'static,
     ) -> (Conn, std::thread::JoinHandle<()>) {
+        fake_server_at("mysql://u:p@127.0.0.1:1/d", script)
+    }
+
+    /// [`fake_server`] with the client's options parsed from `url`.
+    fn fake_server_at(
+        url: &str,
+        script: impl FnOnce(TcpStream) + Send + 'static,
+    ) -> (Conn, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || script(listener.accept().unwrap().0));
         let stream = TcpStream::connect(addr).unwrap();
-        let opts = Opts::from_url("mysql://u:p@127.0.0.1:1/d").unwrap();
+        let opts = Opts::from_url(url).unwrap();
         (Conn::new(Io::Tcp(stream), Arc::new(opts)), server)
     }
 
@@ -1670,6 +1679,23 @@ mod tests {
             drop(conn);
             server.join().unwrap();
         }
+    }
+
+    /// M3: an auth switch to MariaDB's ed25519 (not built in) is refused, not a panic in the driver.
+    #[test]
+    fn an_auth_switch_to_ed25519_is_refused_not_a_panic() {
+        let (mut conn, server) = fake_server(|_| {});
+        let req = AuthSwitchRequest::new("client_ed25519".as_bytes(), &[7_u8; 32][..]).into_owned();
+        let got = run(conn.auth_switch(req));
+        assert!(
+            matches!(
+                got,
+                Err(Error::DriverError(DriverError::UnknownAuthPlugin(ref n))) if n == "client_ed25519"
+            ),
+            "{got:?}"
+        );
+        drop(conn);
+        server.join().unwrap();
     }
 
     #[test]
