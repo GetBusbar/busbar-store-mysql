@@ -1124,11 +1124,11 @@ impl Conn {
                         }
                         self.write_packet(&[0x02]).await?;
                         let payload = self.read_packet().await?;
-                        let key = &payload[1..];
+                        let key = payload.get(1..).unwrap_or_default();
                         for (i, c) in pass.iter_mut().enumerate() {
                             *c ^= self.st.nonce[i % self.st.nonce.len()];
                         }
-                        let encrypted = mysql_common::crypto::encrypt(&pass, key);
+                        let encrypted = rsa_encrypt(&pass, key)?;
                         self.write_packet(&encrypted).await?;
                     }
                     let payload = self.read_packet().await?;
@@ -1537,6 +1537,18 @@ impl Transaction<'_> {
         self.done = true;
         Ok(())
     }
+}
+
+/// RSA-encrypt `pass` to the server's PEM public key. The driver's encrypt panics on a key that
+/// is not valid PEM, and the key is the server's to send: a panic is an unexpected packet.
+fn rsa_encrypt(pass: &[u8], key: &[u8]) -> Result<Vec<u8>> {
+    if key.is_empty() {
+        return Err(DriverError::UnexpectedPacket.into());
+    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        mysql_common::crypto::encrypt(pass, key)
+    }))
+    .map_err(|_| DriverError::UnexpectedPacket.into())
 }
 
 #[cfg(test)]
