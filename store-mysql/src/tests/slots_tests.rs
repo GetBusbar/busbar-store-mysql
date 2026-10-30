@@ -891,3 +891,31 @@ fn a_reclaimed_slot_takes_the_new_credentials_created_at() {
     assert_eq!(got.len(), 1, "{got:?}");
     assert_eq!(got[0].created_at, 5000, "{got:?}");
 }
+
+/// M12: adding a denied subject again is a no-op: the first row (its reason and instant) stays.
+#[test]
+fn a_repeat_denylist_add_keeps_the_first_row() {
+    let Some(s) = fresh_store() else { return };
+    let sub = fresh("sub_repeat");
+    s.add_denylist(&sub, "a").expect("first");
+    let mut c = s.conn().expect("conn");
+    let first: (String, u64) = c
+        .exec_first(
+            "SELECT reason, revoked_at FROM denylist WHERE sub = ?",
+            (&sub,),
+        )
+        .expect("read")
+        .expect("row");
+    c.exec_drop("UPDATE denylist SET revoked_at = 1 WHERE sub = ?", (&sub,))
+        .expect("age the row");
+    s.add_denylist(&sub, "b").expect("repeat");
+    let after: (String, u64) = c
+        .exec_first(
+            "SELECT reason, revoked_at FROM denylist WHERE sub = ?",
+            (&sub,),
+        )
+        .expect("read")
+        .expect("row");
+    assert_eq!(first.0, "a");
+    assert_eq!(after, ("a".to_owned(), 1), "the repeat changed the row");
+}
