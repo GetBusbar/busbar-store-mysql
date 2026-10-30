@@ -1156,10 +1156,8 @@ impl Conn {
         if matches!(req.auth_plugin(), AuthPlugin::MysqlOldPassword) && self.st.opts.secure_auth {
             return Err(DriverError::OldMysqlPasswordDisabled.into());
         }
-        if matches!(
-            req.auth_plugin(),
-            AuthPlugin::Other(Cow::Borrowed(b"mysql_clear_password"))
-        ) && !self.st.opts.enable_cleartext_plugin
+        if matches!(req.auth_plugin(), AuthPlugin::MysqlClearPassword)
+            && !self.st.opts.enable_cleartext_plugin
         {
             return Err(DriverError::CleartextPluginDisabled.into());
         }
@@ -1167,23 +1165,9 @@ impl Conn {
         self.st.auth_plugin = req.auth_plugin().into_owned();
         let pass = self.st.opts.pass.clone();
         let data = match self.st.auth_plugin {
-            AuthPlugin::MysqlOldPassword => {
-                if self.st.opts.secure_auth {
-                    return Err(DriverError::OldMysqlPasswordDisabled.into());
-                }
-                self.st
-                    .auth_plugin
-                    .gen_data(pass.as_deref(), &self.st.nonce)
-            }
-            AuthPlugin::MysqlClearPassword => {
-                if !self.st.opts.enable_cleartext_plugin {
-                    return Err(
-                        DriverError::UnknownAuthPlugin("mysql_clear_password".into()).into(),
-                    );
-                }
-                self.st
-                    .auth_plugin
-                    .gen_data(pass.as_deref(), &self.st.nonce)
+            // The driver's scramble takes the first 8 nonce bytes and panics on none.
+            AuthPlugin::MysqlOldPassword if self.st.nonce.len() < 8 => {
+                return Err(DriverError::UnexpectedPacket.into());
             }
             AuthPlugin::Other(_) => None,
             _ => self
