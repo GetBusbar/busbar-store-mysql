@@ -111,6 +111,33 @@ fn a_refused_op_applies_nothing_and_records_nothing() {
     assert_eq!(chain, vec![b"first".to_vec(), b"second".to_vec()]);
 }
 
+/// M1 (S5): a value the columns cannot hold is REFUSED (provably nothing applied), not FAILED (which
+/// makes the host replay it forever); nothing is recorded, so the same `op_id` applies afterwards.
+#[test]
+fn a_value_the_columns_cannot_hold_is_refused_and_records_nothing() {
+    use busbar_contract::records::ModelTokensDelta;
+    let Some(s) = fresh_store() else { return };
+    let bucket = fresh("toolong");
+    let delta = |model: String| UsageDelta {
+        requests: 1,
+        billable_requests: 1,
+        models: vec![ModelTokensDelta {
+            model,
+            usage_units: [("tokens_input".to_owned(), 5)].into_iter().collect(),
+        }],
+    };
+    let id = op(5);
+    let got = s.add_usage_op(id, &bucket, 60, &delta("m".repeat(2000)));
+    assert!(matches!(got, Err(OpRefused::Refused(_))), "{got:?}");
+    let mut c = s.pool.get_conn().expect("conn");
+    let rows: Option<u64> = c
+        .exec_first("SELECT COUNT(*) FROM store_ops WHERE op_id = ?", (&id.0[..],))
+        .expect("count");
+    assert_eq!(rows, Some(0), "a refused op records nothing");
+    s.add_usage_op(id, &bucket, 60, &delta("ok".into()))
+        .expect("the same op_id with a valid body applies");
+}
+
 #[test]
 fn records_upsert_read_back_and_scan_a_prefix_in_key_order() {
     let Some(s) = fresh_store() else { return };

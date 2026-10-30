@@ -160,9 +160,8 @@ impl std::ops::Deref for MysqlStore {
 fn op_refused(f: StoreFailure) -> OpRefused {
     match f {
         StoreFailure::Conflict => OpRefused::Conflict,
-        StoreFailure::Failed(t) | StoreFailure::Refused(t) | StoreFailure::Fault(t) => {
-            OpRefused::Failed(t)
-        }
+        StoreFailure::Refused(t) => OpRefused::Refused(t),
+        StoreFailure::Failed(t) | StoreFailure::Fault(t) => OpRefused::Failed(t),
         other => OpRefused::Failed(other.to_string()),
     }
 }
