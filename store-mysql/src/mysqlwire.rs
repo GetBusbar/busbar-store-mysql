@@ -1148,6 +1148,11 @@ impl Conn {
     }
 
     async fn auth_switch(&mut self, req: AuthSwitchRequest<'static>) -> Result<()> {
+        // The driver builds ed25519 only with a feature this store does not enable; asked for it,
+        // it panics.
+        if matches!(req.auth_plugin(), AuthPlugin::Ed25519) {
+            return Err(DriverError::UnknownAuthPlugin("client_ed25519".into()).into());
+        }
         if matches!(req.auth_plugin(), AuthPlugin::MysqlOldPassword) && self.st.opts.secure_auth {
             return Err(DriverError::OldMysqlPasswordDisabled.into());
         }
