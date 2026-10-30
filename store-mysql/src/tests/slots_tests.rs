@@ -845,3 +845,29 @@ fn the_v10_upgrade_drops_the_money_and_dead_slot_tables() {
         .expect("list");
     assert_eq!(chain, vec![b"one".to_vec()], "appended exactly once");
 }
+
+/// M10: a row stamped `revision = 0` is always "changed" (the contract's own arm), whatever
+/// `since` is.
+#[test]
+fn revision_zero_rows_are_listed_for_any_since() {
+    let Some(s) = fresh_store() else { return };
+    let (key, public_id) = (fresh("vk_rev0"), fresh("AKIA"));
+    let cred = super::sample_credential(&key, &public_id, 0);
+    s.put_key_with_credential(&sample_key(&key, "g"), &cred)
+        .expect("put");
+    let mut c = s.conn().expect("conn");
+    c.exec_drop("UPDATE api_keys SET revision = 0 WHERE id = ?", (&key,))
+        .expect("zero");
+    c.exec_drop(
+        "UPDATE credentials SET revision = 0 WHERE key_id = ?",
+        (&key,),
+    )
+    .expect("zero");
+    let keys = s.list_keys_since(5).expect("list_keys_since");
+    assert!(keys.iter().any(|k| k.id == key), "the revision-0 key");
+    let creds = s.list_credentials_since(5).expect("list_credentials_since");
+    assert!(
+        creds.iter().any(|c| c.meta.key_id == key),
+        "the revision-0 credential"
+    );
+}
