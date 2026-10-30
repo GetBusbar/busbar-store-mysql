@@ -4400,7 +4400,7 @@ fn a_parented_upserted_record_reads_back_by_its_own_id() {
         id: id.to_string(),
         parent: Some(ctx.to_string()),
         seq: 0,
-        ts: 0,
+        ts: TASK_LIVE_TS,
         disposition: PlaneDisposition::Active,
         body: body.to_vec(),
     };
