@@ -1954,13 +1954,34 @@ impl MysqlStore {
         })
     }
 
+    /// [`Self::put_usage_once`], retried when this transaction loses a deadlock (its delete and
+    /// insert hold the window's gap against a concurrent first write on the same window).
     pub(crate) async fn put_usage(
         conn: &mut Conn,
         bucket_id: &str,
         window_start: u64,
         ledger: &UsageLedger,
     ) -> RecordStoreResult<()> {
-        let mut tx = conn.start_transaction().await.map_err(store_err)?;
+        const ATTEMPTS: u32 = 3;
+        const ER_LOCK_DEADLOCK: u16 = 1213;
+        let mut attempt = 1;
+        loop {
+            match Self::put_usage_once(conn, bucket_id, window_start, ledger).await {
+                Err(e) if e.server_code == Some(ER_LOCK_DEADLOCK) && attempt < ATTEMPTS => {
+                    attempt += 1;
+                }
+                other => return other.map_err(|e| RecordStoreError(e.text)),
+            }
+        }
+    }
+
+    async fn put_usage_once(
+        conn: &mut Conn,
+        bucket_id: &str,
+        window_start: u64,
+        ledger: &UsageLedger,
+    ) -> Result<(), ApplyError> {
+        let mut tx = conn.start_transaction().await.map_err(apply_err)?;
         // `bucket_scope` is named EXPLICITLY even though this path only ever writes 'key'. The
         // primary key is (window_start, bucket_scope, bucket_id, model), so a predicate that skips
         // `bucket_scope` cannot use the key beyond its first column: InnoDB then takes a next-key
@@ -1974,7 +1995,7 @@ impl MysqlStore {
             params! { "b" => bucket_id, "w" => window_start },
         )
         .await
-        .map_err(store_err)?;
+        .map_err(apply_err)?;
         // The window's OPEN units are part of the same absolute set: a unit the new ledger no
         // longer carries must not survive it.
         tx.exec_drop(
@@ -1983,7 +2004,7 @@ impl MysqlStore {
             params! { "b" => bucket_id, "w" => window_start },
         )
         .await
-        .map_err(store_err)?;
+        .map_err(apply_err)?;
         // The request counters belong to the WINDOW, not to any one model, so they live on a single
         // reserved `model = ''` sentinel row and the per-model rows carry tokens only. Written onto
         // every per-model row instead, `get_usage`'s `SUM(requests)` returned the count multiplied by
@@ -2001,7 +2022,7 @@ impl MysqlStore {
             },
         )
         .await
-        .map_err(store_err)?;
+        .map_err(apply_err)?;
         // Insert the per-model rows in a DETERMINISTIC order. The primary key orders by model name,
         // so two transactions writing overlapping windows in caller order can acquire the same rows
         // in opposite orders and deadlock. Sorting makes the acquisition order identical for every
@@ -2022,7 +2043,7 @@ impl MysqlStore {
                 },
             )
             .await
-            .map_err(store_err)?;
+            .map_err(apply_err)?;
             // BTreeMap order, so the unit rows are acquired in one deterministic order too.
             for (unit, count) in open {
                 tx.exec_drop(
@@ -2035,10 +2056,10 @@ impl MysqlStore {
                     },
                 )
                 .await
-                .map_err(store_err)?;
+                .map_err(apply_err)?;
             }
         }
-        tx.commit().await.map_err(store_err)
+        tx.commit().await.map_err(apply_err)
     }
 
     pub(crate) async fn list_metering(
