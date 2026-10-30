@@ -1686,7 +1686,7 @@ impl MysqlStore {
                 "INSERT INTO plane_records (kind, ident, seq, id, parent, ts, terminal, body) \
                  VALUES (:kind, :ident, :seq, :id, :parent, :ts, :terminal, :body) \
                  ON DUPLICATE KEY UPDATE kind = kind",
-                plane_params(record, ident),
+                plane_params(record, ident, record.seq),
             )
             .await
             .map_err(apply_err)?;
@@ -2370,7 +2370,7 @@ impl MysqlStore {
              VALUES (:kind, :ident, :seq, :id, :parent, :ts, :terminal, :body) \
              ON DUPLICATE KEY UPDATE id = VALUES(id), parent = VALUES(parent), ts = VALUES(ts), \
                 terminal = VALUES(terminal), body = VALUES(body)",
-            plane_params(record, &record.id),
+            plane_params(record, &record.id, UPSERT_SEQ),
         )
         .await
         .map_err(store_err)
@@ -2385,8 +2385,8 @@ impl MysqlStore {
         // authorization check living in the backend is one an unauthorized reader bypasses by
         // configuring a different backend. An unknown id is `None`, never an error.
         conn.exec_first(
-            "SELECT body FROM plane_records WHERE kind = :kind AND ident = :id AND seq = 0",
-            params! { "kind" => kind, "id" => id },
+            "SELECT body FROM plane_records WHERE kind = :kind AND ident = :id AND seq = :seq",
+            params! { "kind" => kind, "id" => id, "seq" => UPSERT_SEQ },
         )
         .await
         .map_err(store_err)
@@ -2490,8 +2490,8 @@ impl MysqlStore {
             let candidates: Vec<String> = conn
                 .exec(
                     "SELECT ident FROM plane_records \
-                     WHERE kind = :kind AND seq = 0 AND ts < :before AND terminal ORDER BY ident",
-                    params! { "kind" => KIND_TASK, "before" => before },
+                     WHERE kind = :kind AND seq = :seq AND ts < :before AND terminal ORDER BY ident",
+                    params! { "kind" => KIND_TASK, "before" => before, "seq" => UPSERT_SEQ },
                 )
                 .await
                 .map_err(store_err)?;
@@ -2499,9 +2499,12 @@ impl MysqlStore {
             for ident in candidates {
                 let mut tx = conn.start_transaction().await.map_err(store_err)?;
                 tx.exec_drop(
-                    "DELETE FROM plane_records WHERE kind = :kind AND ident = :ident AND seq = 0 \
+                    "DELETE FROM plane_records WHERE kind = :kind AND ident = :ident AND seq = :seq \
                      AND ts < :before AND terminal",
-                    params! { "kind" => KIND_TASK, "ident" => &ident, "before" => before },
+                    params! {
+                        "kind" => KIND_TASK, "ident" => &ident, "before" => before,
+                        "seq" => UPSERT_SEQ,
+                    },
                 )
                 .await
                 .map_err(store_err)?;
@@ -2619,8 +2622,8 @@ impl MysqlStore {
         }
         let terminal: Option<bool> = conn
             .exec_first(
-                "SELECT terminal FROM plane_records WHERE kind = :kind AND ident = :token AND seq = 0",
-                params! { "kind" => kind, "token" => token },
+                "SELECT terminal FROM plane_records WHERE kind = :kind AND ident = :token AND seq = :seq",
+                params! { "kind" => kind, "token" => token, "seq" => UPSERT_SEQ },
             ).await
             .map_err(store_err)?;
         Ok(terminal == Some(false))
@@ -2639,11 +2642,15 @@ fn is_terminal(d: PlaneDisposition) -> bool {
 }
 
 /// A plane record's row at identity `ident` ([`plane_ident`] for an append, its id for an upsert).
-fn plane_params(record: &PlaneRecord, ident: &str) -> Params {
+/// The `seq` an UPSERTED record is stored at: the contract upserts by `(kind, id)`, so the record's
+/// own `seq` is not part of its identity.
+const UPSERT_SEQ: u64 = 0;
+
+fn plane_params(record: &PlaneRecord, ident: &str, seq: u64) -> Params {
     params! {
         "kind" => &record.kind,
         "ident" => ident,
-        "seq" => record.seq,
+        "seq" => seq,
         "id" => &record.id,
         "parent" => &record.parent,
         "ts" => record.ts,
