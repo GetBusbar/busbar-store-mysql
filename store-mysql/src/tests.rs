@@ -1023,7 +1023,7 @@ fn get_usage_ignores_usage_windows_rows_of_another_scope() {
             billable_requests: 1,
             models: vec![ModelTokensDelta {
                 model: "m-key-scope".to_string(),
-                usage_units: units(&[(UNIT_INPUT, 10), (UNIT_OUTPUT, 5)]),
+                usage_units: units(&[(UNIT_INPUT, 10), (UNIT_OUTPUT, 5), ("images", 4)]),
             }],
         },
     )
@@ -1035,9 +1035,23 @@ fn get_usage_ignores_usage_windows_rows_of_another_scope() {
         params! { "w" => window, "b" => bucket },
     )
     .unwrap();
+    // The open-unit table has its own scope column: a foreign-scope unit on the SAME model and unit
+    // names, and on another model, must not reach this bucket's ledger either.
+    conn.exec_drop(
+        "INSERT INTO usage_window_units (window_start, bucket_scope, bucket_id, model, unit, count) \
+         VALUES (:w, 'group', :b, 'm-key-scope', 'images', 99), \
+                (:w, 'group', :b, 'm-group-scope', 'images', 77)",
+        params! { "w" => window, "b" => bucket },
+    )
+    .unwrap();
     let back = s.get_usage(bucket, window).unwrap();
     conn.exec_drop(
         "DELETE FROM usage_windows WHERE window_start = :w AND bucket_id = :b",
+        params! { "w" => window, "b" => bucket },
+    )
+    .unwrap();
+    conn.exec_drop(
+        "DELETE FROM usage_window_units WHERE window_start = :w AND bucket_id = :b",
         params! { "w" => window, "b" => bucket },
     )
     .unwrap();
@@ -1045,6 +1059,11 @@ fn get_usage_ignores_usage_windows_rows_of_another_scope() {
     assert_eq!(back.models.len(), 1, "{back:?}");
     assert_eq!(back.models[0].model, "m-key-scope", "{back:?}");
     assert_eq!(back.models[0].tier(UNIT_INPUT), 10, "{back:?}");
+    assert_eq!(
+        back.models[0].usage_units.get("images"),
+        Some(&4),
+        "{back:?}"
+    );
 }
 
 /// `model`/`provider` in the metering tables are byte-exact keys (v11, D19), as in every other
