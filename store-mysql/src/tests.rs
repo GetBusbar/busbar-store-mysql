@@ -173,6 +173,68 @@ fn sample_credential(key_id: &str, public_id: &str, slot: u8) -> CredentialSecre
     }
 }
 
+/// A second `put_key` on the same id replaces every field it carries: name, group, labels,
+/// scopes, expiry, enabled, generation hash and the IdP fields all read back as the second write,
+/// and the creation time stays the first's.
+#[test]
+fn put_key_over_an_existing_key_replaces_every_field() {
+    let Some(s) = fresh_store() else { return };
+    let mut first = sample_key("vk_reput", "gen-1");
+    first.name = "first".into();
+    first.group = Some("g1".into());
+    first.labels = BTreeMap::from([("a".to_owned(), "1".to_owned())]);
+    first.allowed_scopes = Some(vec![ScopeRef::pool("p1")]);
+    first.expires_at = Some(5_000);
+    first.idp_subject = Some("sub-1".into());
+    first.binding_mode = Some("bound".into());
+    first.minted_by = Some("admin-1".into());
+    first.idp_provider = Some("idp-1".into());
+    s.put_key(&first).unwrap();
+
+    let mut second = sample_key("vk_reput", "gen-2");
+    second.name = "second".into();
+    second.group = Some("g2".into());
+    second.labels = BTreeMap::from([("b".to_owned(), "2".to_owned())]);
+    second.allowed_scopes = Some(vec![ScopeRef::pool("p2"), ScopeRef::pool("p3")]);
+    second.expires_at = Some(9_000);
+    second.enabled = false;
+    second.created_at = 2_000;
+    second.idp_subject = Some("sub-2".into());
+    second.binding_mode = Some("unbound".into());
+    second.minted_by = Some("admin-2".into());
+    second.idp_provider = Some("idp-2".into());
+    s.put_key(&second).unwrap();
+
+    let got = s.get_key("vk_reput").unwrap().unwrap();
+    assert_eq!(got.name, "second");
+    assert_eq!(got.generation_hash, "gen-2");
+    assert_eq!(got.group.as_deref(), Some("g2"));
+    assert_eq!(got.labels, second.labels);
+    assert_eq!(got.allowed_scopes, second.allowed_scopes);
+    assert_eq!(got.expires_at, Some(9_000));
+    assert!(!got.enabled);
+    assert_eq!(got.idp_subject.as_deref(), Some("sub-2"));
+    assert_eq!(got.binding_mode.as_deref(), Some("unbound"));
+    assert_eq!(got.minted_by.as_deref(), Some("admin-2"));
+    assert_eq!(got.idp_provider.as_deref(), Some("idp-2"));
+    assert_eq!(
+        got.created_at, 1000,
+        "the creation time is the first write's"
+    );
+
+    // Clearing the optional fields on a re-put clears them.
+    let mut cleared = sample_key("vk_reput", "gen-3");
+    cleared.created_at = 3_000;
+    s.put_key(&cleared).unwrap();
+    let got = s.get_key("vk_reput").unwrap().unwrap();
+    assert_eq!(got.group, None);
+    assert_eq!(got.expires_at, None);
+    assert_eq!(got.allowed_scopes, None);
+    assert!(got.labels.is_empty());
+    assert_eq!(got.idp_subject, None);
+    assert!(got.enabled);
+}
+
 #[test]
 fn put_get_roundtrips_a_key() {
     let Some(s) = fresh_store() else { return };
