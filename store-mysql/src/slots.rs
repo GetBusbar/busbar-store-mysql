@@ -7,11 +7,11 @@
 //! and records; money is a view on the ledger and the rate card, computed in core.
 //!
 //! DEDUPE (`abi::store` S1-S4), DURABLE: every `op_id` write runs in ONE transaction that first
-//! inserts the op's row into `store_ops` (its value fields), then applies the effect, then stores
-//! the answer, then commits. Two racing calls with one `op_id` serialise on that primary key: the
-//! second waits for the first, and reads its committed row (same value fields: the original
-//! answer, nothing applied; different: a conflict). A refused or failed op rolls back with its row,
-//! so nothing is recorded (S3). Rows older than [`OP_ID_RETENTION_SECS`] are swept (S4).
+//! inserts the op's row into `store_ops` (its [`Dedupe`] body), then applies the effect, then
+//! commits. Two racing calls with one `op_id` serialise on that primary key: the second waits for
+//! the first and reads its committed body (the same op's: done, nothing applied; another's: a
+//! conflict). A refused or failed op rolls back with its row, so nothing is recorded (S3). Rows
+//! older than [`OP_ID_RETENTION_SECS`] are swept (S4).
 //!
 //! CONNECTIONS: every slot runs on one of the instance's kept connections over the host's
 //! connector, as straight-line async code driven by the store SDK's `wire::drive_kept` (every call
@@ -21,7 +21,6 @@
 //! refusing server still fails the load at open, in the driver's words.
 
 use mysql_common::params;
-use serde_json::Value;
 
 use busbar_contract::abi::host::conn::connector::{
     Need, DIRECTION_OUTBOUND, EGRESS_OPERATOR_INFRASTRUCTURE, KEEP_NAMED,
@@ -29,6 +28,8 @@ use busbar_contract::abi::host::conn::connector::{
 use busbar_contract::abi::mechanism::call::{AbiStr, Blob, BLOB_ABSENT};
 use busbar_contract::abi::sdk::conn::Host;
 use busbar_contract::abi::sdk::door::abi_str;
+use busbar_contract::abi::sdk::store::column::prefix_end;
+use busbar_contract::abi::sdk::store::dedupe::{Body as DedupeBody, Dedupe};
 use busbar_contract::abi::sdk::store::wire::{drive_kept, Body};
 use busbar_contract::abi::sdk::store::{Op, OpRefused, OpResult, Scanned, Step, StoreSlots, Tail};
 use busbar_contract::abi::store::{OpId, OP_ID_RETENTION_SECS};
@@ -146,10 +147,15 @@ impl Write {
     }
 }
 
-/// One `op_id`-carrying write (module doc, DEDUPE) on `conn`: a replay answers the original
-/// answer, a conflict applies nothing, and a new op applies `write` in the op's transaction and is
-/// recorded only if it applied, at the server's isolation level.
-async fn deduped(conn: &mut Conn, op: OpId, body: String, write: Write) -> OpResult<()> {
+/// One `op_id`-carrying write (module doc, DEDUPE) on `conn`: `None` when it applied `write` and
+/// recorded `body` in one transaction, `Some(recorded)` when a body was already recorded under the
+/// op's id (nothing applied; [`Dedupe::answer`] tells a replay from a conflict).
+async fn deduped(
+    conn: &mut Conn,
+    op: OpId,
+    body: DedupeBody,
+    write: Write,
+) -> OpResult<Option<Vec<u8>>> {
     // The claim can find a row a concurrent sweep or rollback removes before it is read; the op is
     // then new again, so the claim is retried (bounded).
     for _ in 0..3 {
@@ -157,8 +163,8 @@ async fn deduped(conn: &mut Conn, op: OpId, body: String, write: Write) -> OpRes
         match tx
             .exec_drop(
                 "INSERT INTO store_ops (op_id, recorded_at, body, answer) \
-                 VALUES (:op, :at, :body, '')",
-                params! { "op" => &op.0[..], "at" => crate_now(), "body" => body.as_bytes() },
+                 VALUES (:op, :at, :body, 'null')",
+                params! { "op" => &op.0[..], "at" => crate_now(), "body" => &body[..] },
             )
             .await
         {
@@ -167,12 +173,6 @@ async fn deduped(conn: &mut Conn, op: OpId, body: String, write: Write) -> OpRes
                     .apply(&mut tx)
                     .await
                     .map_err(|e| OpRefused::Failed(e.0))?;
-                tx.exec_drop(
-                    "UPDATE store_ops SET answer = :answer WHERE op_id = :op",
-                    params! { "answer" => Value::Null.to_string(), "op" => &op.0[..] },
-                )
-                .await
-                .map_err(backend)?;
                 tx.commit().await.map_err(backend)?;
                 if op.counter().is_multiple_of(OPS_SWEEP_EVERY) {
                     // Best effort: a sweep that fails is retried by the next one.
@@ -183,26 +183,20 @@ async fn deduped(conn: &mut Conn, op: OpId, body: String, write: Write) -> OpRes
                         )
                         .await;
                 }
-                return Ok(());
+                return Ok(None);
             }
             // ER_DUP_ENTRY: the op is recorded (the insert waited for its writer to commit).
             Err(Error::MySqlError(e)) if e.code == 1062 => {
                 tx.rollback().await.map_err(backend)?;
-                let row: Option<(Vec<u8>, Vec<u8>)> = conn
+                let recorded: Option<Vec<u8>> = conn
                     .exec_first(
-                        "SELECT body, answer FROM store_ops WHERE op_id = :op",
+                        "SELECT body FROM store_ops WHERE op_id = :op",
                         params! { "op" => &op.0[..] },
                     )
                     .await
                     .map_err(backend)?;
-                match row {
-                    Some((b, _)) if b != body.as_bytes() => return Err(OpRefused::Conflict),
-                    Some((_, a)) => {
-                        return serde_json::from_slice::<Value>(&a)
-                            .map(drop)
-                            .map_err(backend)
-                    }
-                    None => continue,
+                if recorded.is_some() {
+                    return Ok(recorded);
                 }
             }
             Err(e) => return Err(backend(e)),
@@ -291,8 +285,8 @@ impl StoreSlots for MysqlStore {
         op: OpId,
         record: PlaneRecordRef<'_>,
     ) -> Step<OpResult<()>> {
-        let body = format!("append_plane_record:{record:?}");
-        let record = record.to_record();
+        let d = Dedupe::append(record);
+        let (body, record) = (*d.body(), record.to_record());
         on_conn!(self, cx, backend, |c| deduped(
             &mut c,
             op,
@@ -300,6 +294,7 @@ impl StoreSlots for MysqlStore {
             Write::Append(record)
         )
         .await)
+        .map(|r| d.answer(r))
     }
 
     /// `record_put` (slot 40): an upsert on `(schema, key)`. An EMPTY value removes the row:
@@ -383,7 +378,8 @@ impl StoreSlots for MysqlStore {
         op: OpId,
         cells: &[(&str, u64, UsageDelta)],
     ) -> Step<OpResult<()>> {
-        let body = format!("add_usage_batch:{cells:?}");
+        let d = Dedupe::usage(cells);
+        let body = *d.body();
         let cells: Vec<(String, u64, UsageDelta)> = cells
             .iter()
             .map(|(b, w, d)| ((*b).to_owned(), *w, d.clone()))
@@ -395,6 +391,7 @@ impl StoreSlots for MysqlStore {
             Write::Usage(cells)
         )
         .await)
+        .map(|r| d.answer(r))
     }
 
     fn add_metering_batch(
@@ -403,8 +400,8 @@ impl StoreSlots for MysqlStore {
         op: OpId,
         deltas: &[MeteringDelta],
     ) -> Step<OpResult<()>> {
-        let body = format!("add_metering_batch:{deltas:?}");
-        let deltas = deltas.to_vec();
+        let d = Dedupe::metering(deltas);
+        let (body, deltas) = (*d.body(), deltas.to_vec());
         on_conn!(self, cx, backend, |c| deduped(
             &mut c,
             op,
@@ -412,6 +409,7 @@ impl StoreSlots for MysqlStore {
             Write::Metering(deltas)
         )
         .await)
+        .map(|r| d.answer(r))
     }
 
     // The base op set (slots 0-32), each one body on the op's connection.
@@ -647,30 +645,4 @@ impl StoreSlots for MysqlStore {
 /// A stored record's bytes as a [`RecordBytes`] (the column is sized to the ceiling).
 fn record(v: Vec<u8>) -> Result<RecordBytes, String> {
     RecordBytes::new(v).map_err(|n| format!("a stored record of {n} bytes is over the ceiling"))
-}
-
-/// The smallest key above every key that starts with `prefix`, or `None` when there is none.
-fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
-    let mut end = prefix.to_vec();
-    while let Some(last) = end.pop() {
-        if last < u8::MAX {
-            end.push(last + 1);
-            return Some(end);
-        }
-    }
-    None
-}
-
-#[cfg(test)]
-mod prefix_end_tests {
-    use super::prefix_end;
-
-    #[test]
-    fn prefix_end_carries_past_trailing_0xff_and_has_no_successor_for_all_0xff_or_empty() {
-        assert_eq!(prefix_end(b"a"), Some(b"b".to_vec()));
-        assert_eq!(prefix_end(b"b\xff"), Some(b"c".to_vec()));
-        assert_eq!(prefix_end(b"b\xff\xff"), Some(b"c".to_vec()));
-        assert_eq!(prefix_end(b"\xff\xff"), None);
-        assert_eq!(prefix_end(b""), None);
-    }
 }
