@@ -188,6 +188,42 @@ use busbar_plugin_loader::dispatch::{
 };
 use busbar_plugin_loader::store_v3::LoadedStore;
 
+/// The cdylib freshness gate ignores the `cfg(test)` files under `src/` (the cdylib is built
+/// without them, so editing one never refreshes it) and still sees the real sources.
+#[test]
+fn the_freshness_gate_ignores_cfg_test_sources() {
+    use std::time::{Duration, SystemTime};
+    let root = std::env::temp_dir().join(format!("busbar-freshness-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let src = root.join("member/src");
+    std::fs::create_dir_all(src.join("tests")).unwrap();
+    let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let touch = |p: std::path::PathBuf, secs: u64| {
+        std::fs::write(&p, "").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&p)
+            .unwrap()
+            .set_modified(t0 + Duration::from_secs(secs))
+            .unwrap();
+    };
+    touch(src.join("lib.rs"), 10);
+    touch(src.join("tests.rs"), 500);
+    touch(src.join("tests_extra.rs"), 600);
+    touch(src.join("tests/case.rs"), 700);
+    assert_eq!(
+        common::newest_source_mtime_under(&root),
+        t0 + Duration::from_secs(10),
+        "a cfg(test) file must not make a current cdylib look stale"
+    );
+    touch(src.join("slots.rs"), 20);
+    assert_eq!(
+        common::newest_source_mtime_under(&root),
+        t0 + Duration::from_secs(20)
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// The live MySQL, under this repo's gate.
 fn mysql_url() -> Option<String> {
     match std::env::var("BUSBAR_TEST_MYSQL_URL") {

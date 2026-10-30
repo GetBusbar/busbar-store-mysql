@@ -73,14 +73,30 @@ pub fn mint() -> busbar_contract::abi::store::OpId {
 ///
 /// Deliberately ONLY `src/**/*.rs` of each workspace member: editing a `tests/` file or a
 /// `[dev-dependencies]` line recompiles the test binary but NOT the lib, so including those would
-/// fail a perfectly current cdylib.
+/// fail a perfectly current cdylib. The same holds for the `cfg(test)` files under `src/` (`tests.rs`,
+/// `tests/`, `tests_*.rs`): the cdylib is built without `cfg(test)`, so editing one never refreshes it.
 pub fn newest_source_mtime() -> std::time::SystemTime {
+    let ws_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the plugin crate always sits under the workspace root");
+    newest_source_mtime_under(ws_root)
+}
+
+/// [`newest_source_mtime`] for the workspace rooted at `ws_root`.
+pub fn newest_source_mtime_under(ws_root: &std::path::Path) -> std::time::SystemTime {
+    fn is_cfg_test_file(p: &std::path::Path) -> bool {
+        let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+        stem == "tests" || stem.starts_with("tests_")
+    }
     fn walk(dir: &std::path::Path, newest: &mut std::time::SystemTime) {
         let Ok(rd) = std::fs::read_dir(dir) else {
             return;
         };
         for e in rd.flatten() {
             let p = e.path();
+            if is_cfg_test_file(&p) {
+                continue;
+            }
             if p.is_dir() {
                 walk(&p, newest);
             } else if p.extension().is_some_and(|x| x == "rs") {
@@ -92,9 +108,6 @@ pub fn newest_source_mtime() -> std::time::SystemTime {
             }
         }
     }
-    let ws_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("the plugin crate always sits under the workspace root");
     let mut newest = std::time::SystemTime::UNIX_EPOCH;
     for e in std::fs::read_dir(ws_root).into_iter().flatten().flatten() {
         let src = e.path().join("src");
