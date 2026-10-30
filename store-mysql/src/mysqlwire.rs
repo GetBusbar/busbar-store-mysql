@@ -288,6 +288,9 @@ impl fmt::Debug for Opts {
     }
 }
 
+/// MySQL's largest `max_allowed_packet` (1 GiB).
+const MAX_PACKET_CEILING: usize = 1 << 30;
+
 /// The refusal of a URL parameter this store accepts nowhere because it could never apply.
 fn not_supported(key: &str, why: &str) -> UrlError {
     UrlError::Refused(format!(
@@ -463,7 +466,14 @@ impl Opts {
                     ));
                 }
                 "max_allowed_packet" => {
-                    opts.max_allowed_packet = Some(value.parse().map_err(|_| invalid())?);
+                    let n: usize = value.parse().map_err(|_| invalid())?;
+                    if !(1..=MAX_PACKET_CEILING).contains(&n) {
+                        return Err(UrlError::Refused(format!(
+                            "mysql store: URL parameter `max_allowed_packet` must be between 1 \
+                             and {MAX_PACKET_CEILING} bytes (MySQL's maximum)"
+                        )));
+                    }
+                    opts.max_allowed_packet = Some(n);
                 }
                 k if is_tls_parameter(k) => {
                     return Err(UrlError::Refused(format!(
