@@ -871,3 +871,23 @@ fn revision_zero_rows_are_listed_for_any_since() {
         "the revision-0 credential"
     );
 }
+
+/// M11: a revoked slot reclaimed by a new credential carries the NEW credential's `created_at`,
+/// not its predecessor's.
+#[test]
+fn a_reclaimed_slot_takes_the_new_credentials_created_at() {
+    let Some(s) = fresh_store() else { return };
+    let key = fresh("vk_reclaim");
+    s.put_key(&sample_key(&key, "g")).expect("put_key");
+    let old = super::sample_credential(&key, &fresh("AKIA_OLD"), 0);
+    s.put_credential(&old).expect("mint");
+    s.revoke_credential(&old.meta.id, "rotated")
+        .expect("revoke");
+    let mut new = super::sample_credential(&key, &fresh("AKIA_NEW"), 0);
+    new.meta.created_at = 5000;
+    new.meta.updated_at = 5000;
+    s.put_credential(&new).expect("re-mint");
+    let got = s.list_credentials(&key).expect("list");
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].created_at, 5000, "{got:?}");
+}
