@@ -386,10 +386,12 @@ fn lookup_credential_secret_returns_the_secret_and_meta_never_leaks_it_via_list(
     assert_eq!(meta.public_id, "AKIA_SEC");
 }
 
-/// The `ascii_bin` collation is what makes credential lookups case-SENSITIVE, matching Postgres/
-/// SQLite's default behavior -- MySQL's default collation is case-insensitive, which would let
-/// "AKIA_SEC" and "akia_sec" collide as the same credential (a real security property, not a
-/// cosmetic one).
+/// Credential lookups are case-SENSITIVE (the key columns are byte-exact `VARBINARY`), matching
+/// Postgres/SQLite's default behavior. MySQL's default collation is case-insensitive, which would
+/// let "AKIA_SEC" and "akia_sec" collide as the same credential (a real security property, not a
+/// cosmetic one). Proved in the SERVER's comparison, not by filtering in Rust: the verify lookup's
+/// own predicate (`kind` and `public_id`) is run as SQL, and the `uq_cred_public` unique key must
+/// accept two ids that differ only in case.
 #[test]
 fn public_id_lookup_is_case_sensitive() {
     let Some(s) = fresh_store() else { return };
@@ -397,16 +399,35 @@ fn public_id_lookup_is_case_sensitive() {
     let cred = sample_credential("vk_case", "AKIA_CASE", 0);
     s.put_key_with_credential(&k, &cred).unwrap();
 
+    let mut conn = s.conn().unwrap();
+    let lookup = |conn: &mut PooledConn, public_id: &str| -> Option<String> {
+        conn.exec_first(
+            "SELECT id FROM credentials WHERE kind = 'sigv4' AND public_id = :p",
+            params! { "p" => public_id },
+        )
+        .unwrap()
+    };
+    assert_eq!(lookup(&mut conn, "AKIA_CASE"), Some(cred.meta.id.clone()));
+    assert_eq!(
+        lookup(&mut conn, "akia_case"),
+        None,
+        "a case-different public_id must NOT resolve to the same credential"
+    );
     assert!(s
         .lookup_credential_secret("sigv4", "AKIA_CASE")
         .unwrap()
         .is_some());
-    assert!(
-        s.lookup_credential_secret("sigv4", "akia_case")
-            .unwrap()
-            .is_none(),
-        "a case-different public_id must NOT resolve to the same credential"
-    );
+    assert!(s
+        .lookup_credential_secret("sigv4", "akia_case")
+        .unwrap()
+        .is_none());
+
+    // The unique key is byte-exact too: the case variant is a different credential, not a 1062.
+    let k2 = sample_key("vk_case2", "g");
+    let cred2 = sample_credential("vk_case2", "akia_case", 0);
+    s.put_key_with_credential(&k2, &cred2)
+        .expect("a public_id differing only in case is its own credential");
+    assert_eq!(lookup(&mut conn, "akia_case"), Some(cred2.meta.id.clone()));
 }
 
 // ── Usage ledgers ────────────────────────────────────────────────────────────────────────────────
