@@ -21,7 +21,7 @@ use std::task::{Context, Poll, Wake, Waker};
 use busbar_contract::abi::sdk::store::{OpRefused, StoreSlots, Tail};
 use busbar_contract::abi::store::OpId;
 use busbar_contract::kinds::RecordBytes;
-use busbar_contract::records::{PlaneRecordRef, RecordStoreResult, UsageDelta};
+use busbar_contract::records::{MeteringDelta, PlaneRecordRef, RecordStoreResult, UsageDelta};
 use busbar_contract::store_calls::{StoreCalls, StoreFailure};
 use busbar_plugin_loader::dispatch::kinds::store::Store;
 use busbar_plugin_loader::dispatch::{
@@ -277,6 +277,14 @@ impl MysqlStore {
     ) -> Result<(), OpRefused> {
         let cells = [(bucket, window_start, delta.clone())];
         block_on(StoreCalls::add_usage_batch(&self.store, op, &cells)).map_err(op_refused)
+    }
+
+    pub(crate) fn add_metering_op(
+        &self,
+        op: OpId,
+        deltas: &[MeteringDelta],
+    ) -> Result<(), OpRefused> {
+        block_on(StoreCalls::add_metering_batch(&self.store, op, deltas)).map_err(op_refused)
     }
 
     pub(crate) fn append_plane_record_op(

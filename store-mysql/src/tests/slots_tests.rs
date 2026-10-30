@@ -216,6 +216,120 @@ fn an_op_id_plane_append_dedupes_and_still_refuses_a_fork() {
     assert_eq!(chain, vec![b"one".to_vec()]);
 }
 
+/// Put `body` under `op` in `store_ops`, as a build before the SDK body recorded it (the slot's
+/// name, `:`, its values' `{:?}`).
+fn record_older_body(conn: &mut mysql::PooledConn, op: OpId, body: &str) {
+    conn.exec_drop(
+        "UPDATE store_ops SET body = ? WHERE op_id = ?",
+        (body.as_bytes(), &op.0[..]),
+    )
+    .expect("rewrite the body");
+    let stored: Vec<u8> = conn
+        .exec_first("SELECT body FROM store_ops WHERE op_id = ?", (&op.0[..],))
+        .expect("read the body")
+        .expect("the op is recorded");
+    assert_eq!(stored, body.as_bytes());
+}
+
+/// ACROSS AN UPGRADE: an op an older build recorded in its `{:?}` body form replays (nothing
+/// applied) and a different op under its id is a conflict, for each of the three slots.
+#[test]
+fn an_op_recorded_in_the_older_body_form_replays_and_a_different_op_conflicts() {
+    use busbar_contract::records::{MeteringDelta, PlaneDisposition, PlaneRecord, PlaneSelector};
+    let Some(s) = fresh_store() else { return };
+    let mut c = s.conn().expect("a raw connection");
+
+    let bucket = fresh("older");
+    let delta = UsageDelta {
+        requests: 3,
+        billable_requests: 2,
+        models: Vec::new(),
+    };
+    let usage = op(31);
+    s.add_usage_op(usage, &bucket, 60, &delta).expect("applies");
+    let cells = [(bucket.as_str(), 60u64, delta.clone())];
+    record_older_body(&mut c, usage, &format!("add_usage_batch:{cells:?}"));
+    s.add_usage_op(usage, &bucket, 60, &delta)
+        .expect("the older body replays");
+    let other = UsageDelta {
+        requests: 4,
+        ..delta.clone()
+    };
+    assert_eq!(
+        s.add_usage_op(usage, &bucket, 60, &other),
+        Err(OpRefused::Conflict)
+    );
+    let ledger = s.get_usage(&bucket, 60).expect("get_usage");
+    assert_eq!(ledger.requests, 3, "applied exactly once: {ledger:?}");
+
+    let key = fresh("vk_older");
+    s.put_key(&sample_key(&key, "g")).expect("put_key");
+    let meter = MeteringDelta {
+        key_id: key.clone(),
+        bucket: 20_261_030,
+        model: "m".into(),
+        provider: "p".into(),
+        tokens_input: 10,
+        tokens_output: 5,
+        tokens_cache_read: 0,
+        tokens_cache_write: 0,
+        requests: 1,
+        billable_requests: 1,
+        key_group_at_use: "g".into(),
+        pricing_version: "v1".into(),
+        priced_from_ms: 0,
+        usage_units: Default::default(),
+    };
+    let metering = op(32);
+    let deltas = [meter.clone()];
+    s.add_metering_op(metering, &deltas).expect("applies");
+    record_older_body(&mut c, metering, &format!("add_metering_batch:{deltas:?}"));
+    s.add_metering_op(metering, &deltas)
+        .expect("the older body replays");
+    let more = [MeteringDelta {
+        tokens_input: 11,
+        ..meter.clone()
+    }];
+    assert_eq!(s.add_metering_op(metering, &more), Err(OpRefused::Conflict));
+    let rows: Vec<_> = s
+        .list_metering(meter.bucket)
+        .expect("list_metering")
+        .into_iter()
+        .filter(|r| r.key_id == key)
+        .collect();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].tokens_input, 10, "applied exactly once: {rows:?}");
+
+    let parent = fresh("older-chain");
+    let rec = |body: &[u8]| PlaneRecord {
+        kind: "slots_test".into(),
+        id: parent.clone(),
+        parent: Some(parent.clone()),
+        seq: 1,
+        ts: 1,
+        disposition: PlaneDisposition::Active,
+        body: body.to_vec(),
+    };
+    let append = op(33);
+    s.append_plane_record_op(append, rec(b"one").view())
+        .expect("applies");
+    record_older_body(
+        &mut c,
+        append,
+        &format!("append_plane_record:{:?}", rec(b"one").view()),
+    );
+    s.append_plane_record_op(append, rec(b"one").view())
+        .expect("the older body replays");
+    assert_eq!(
+        s.append_plane_record_op(append, rec(b"two").view()),
+        Err(OpRefused::Conflict)
+    );
+    let chain = s
+        .list_plane_records("slots_test", &PlaneSelector::Parent(parent.as_str().into()))
+        .expect("list");
+    assert_eq!(chain, vec![b"one".to_vec()], "appended exactly once");
+}
+
 // ── THE v10 UPGRADE ────────────────────────────────────────────────────────────────────────────
 
 /// A store in a DATABASE of its own, for a test that rewrites the schema. The database is dropped
@@ -284,8 +398,15 @@ fn the_v10_upgrade_drops_the_money_and_dead_slot_tables() {
         .expect("applies");
     let dead_op = op(3);
     let mut c = iso.db.conn();
-    // Put the database back to what a v9 build left: the dead slots' tables with rows in them, and
-    // their dedupe rows next to the kept ones.
+    // Put the database back to what a v9 build left: the kept ops' bodies in its `{:?}` form, the
+    // dead slots' tables with rows in them, and their dedupe rows next to the kept ones.
+    let cells = [(bucket.as_str(), 60u64, delta.clone())];
+    record_older_body(&mut c, usage_op, &format!("add_usage_batch:{cells:?}"));
+    record_older_body(
+        &mut c,
+        plane_op,
+        &format!("append_plane_record:{:?}", rec.view()),
+    );
     for stmt in [
         "CREATE TABLE store_caps (bucket VARCHAR(191) NOT NULL PRIMARY KEY, cap BIGINT UNSIGNED NOT NULL)",
         "CREATE TABLE store_slices (slice_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, \

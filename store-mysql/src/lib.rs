@@ -415,11 +415,12 @@ const SCHEMA: &[&str] = &[
     ) ENGINE=InnoDB",
     "CREATE INDEX idx_metering_units_bucket ON usage_metering_units (bucket)",
     // The durable `op_id` dedupe log (`abi::store` S1-S4). One row per op that APPLIED: its value
-    // fields (`body`, compared byte for byte on a replay) and what it answered (`answer`, replayed
-    // verbatim). The row is inserted FIRST in the op's own transaction, so two racing calls with
-    // one `op_id` serialise on its primary key: the second waits, then reads the first's committed
-    // row. A failed op rolls its row back with its effect: nothing is recorded (S3). Rows older
-    // than the retention are swept (`recorded_at`, epoch seconds).
+    // fields' `sdk::store::dedupe` body (`body`; an older build's `{:?}` form still replays) and
+    // `answer`, no longer read (written `null`). The row is inserted FIRST in the op's own
+    // transaction, so two racing calls with one `op_id` serialise on its primary key: the second
+    // waits, then reads the first's committed row. A failed op rolls its row back with its effect:
+    // nothing is recorded (S3). Rows older than the retention are swept (`recorded_at`, epoch
+    // seconds).
     "CREATE TABLE IF NOT EXISTS store_ops (
         op_id BINARY(16) PRIMARY KEY,
         recorded_at BIGINT UNSIGNED NOT NULL,
