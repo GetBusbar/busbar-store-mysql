@@ -1872,10 +1872,17 @@ fn a_replayed_call_is_idempotent_but_a_forked_one_is_refused() {
     let err = store
         .append_plane_record(forked.view())
         .expect_err("a different record at an occupied (principal, seq) is a fork and must error");
-    assert!(
-        !format!("{err}").contains("h2-second-writer"),
-        "the error must not echo stored or caller content back"
+    assert_eq!(
+        err.0,
+        busbar_contract::abi::sdk::store::fork::chain_fork("call", p, 1).0,
+        "the refusal is the SDK's chain_fork text"
     );
+    for echoed in ["h1", "h2-second-writer", "srv_read_file"] {
+        assert!(
+            !err.0.contains(echoed),
+            "the error must not echo stored or caller content back: {echoed}"
+        );
+    }
     assert_eq!(
         calls_of(&store, p)[0]["hash"],
         "h1",
@@ -2239,9 +2246,20 @@ fn a_replayed_task_event_is_idempotent_but_a_rewritten_one_is_refused() {
     );
 
     let rewritten = event_rec(t, 1, "task.submitted", "", "e1-rewritten");
-    store
+    let err = store
         .append_plane_record(rewritten.view())
         .expect_err("a DIFFERENT event at an occupied (task, seq) is a fork and must be refused");
+    assert_eq!(
+        err.0,
+        busbar_contract::abi::sdk::store::fork::chain_fork("task_event", t, 1).0,
+        "the refusal is the SDK's chain_fork text"
+    );
+    for echoed in ["e1", "e1-rewritten", "task.submitted"] {
+        assert!(
+            !err.0.contains(echoed),
+            "the error must not echo stored or caller content back: {echoed}"
+        );
+    }
     let got = events_of(&store, t);
     assert_eq!(got.len(), 1);
     assert_eq!(

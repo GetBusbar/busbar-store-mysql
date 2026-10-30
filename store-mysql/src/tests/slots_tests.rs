@@ -8,6 +8,7 @@
 //! parallel against the one shared database and leaves nothing another test reads.
 
 use super::{fresh_store, sample_key, test_url, MysqlStore};
+use busbar_contract::abi::sdk::store::fork::chain_fork;
 use busbar_contract::abi::sdk::store::OpRefused;
 use busbar_contract::abi::store::OpId;
 use busbar_contract::records::{RecordStore, UsageDelta};
@@ -98,10 +99,17 @@ fn a_refused_op_applies_nothing_and_records_nothing() {
         .expect("seed");
     // The same position with another body is a fork: refused, nothing stored.
     let id = op(3);
-    assert!(matches!(
-        s.append_plane_record_op(id, rec(1, b"forked").view()),
-        Err(OpRefused::Failed(_))
-    ));
+    let got = s.append_plane_record_op(id, rec(1, b"forked-content").view());
+    let Err(OpRefused::Failed(text)) = got else {
+        panic!("a fork is Failed: {got:?}")
+    };
+    assert_eq!(text, chain_fork("slots_test", &parent, 1).0);
+    for echoed in ["first", "forked-content"] {
+        assert!(
+            !text.contains(echoed),
+            "the refusal echoed {echoed}: {text}"
+        );
+    }
     // Not recorded: the same op id with a DIFFERENT (good) body is judged afresh, not a conflict.
     s.append_plane_record_op(id, rec(2, b"second").view())
         .expect("a retry after a failure is new");
@@ -534,10 +542,17 @@ fn an_op_id_plane_append_dedupes_and_still_refuses_a_fork() {
         .expect("append");
     s.append_plane_record_op(id, rec(b"one").view())
         .expect("replay");
-    assert!(matches!(
-        s.append_plane_record_op(op(23), rec(b"two").view()),
-        Err(OpRefused::Failed(_))
-    ));
+    let got = s.append_plane_record_op(op(23), rec(b"two-content").view());
+    let Err(OpRefused::Failed(text)) = got else {
+        panic!("a fork is Failed: {got:?}")
+    };
+    assert_eq!(text, chain_fork("slots_test", &parent, 1).0);
+    for echoed in ["one", "two-content"] {
+        assert!(
+            !text.contains(echoed),
+            "the refusal echoed {echoed}: {text}"
+        );
+    }
     let chain = s
         .list_plane_records("slots_test", &PlaneSelector::Parent(parent.as_str().into()))
         .expect("list");
