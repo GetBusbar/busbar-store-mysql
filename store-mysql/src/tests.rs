@@ -4358,3 +4358,109 @@ fn a_row_value_of_the_wrong_shape_is_an_error_not_a_panic() {
     let ok: Option<(u64,)> = h(c.query_first("SELECT 7")).expect("reads");
     assert_eq!(ok, Some((7,)));
 }
+
+/// M14: the three purge shapes (terminal tasks and their events, terminal-only for another kind,
+/// age for any kind) drain a backlog larger than one batch and return exactly the rows removed.
+#[test]
+fn purges_drain_more_than_one_batch_and_count_exactly() {
+    let Some(url) = test_url() else { return };
+    let _guard = lock_plane_purge();
+    let store = MysqlStore::connect(&url).expect("connect");
+    clear_purge_band(&store);
+    let mut conn = store.conn().expect("conn");
+    const N: u64 = 5003;
+    let fill =
+        |conn: &mut PooledConn, kind: &str, prefix: &str, ts: u64, terminal: bool, n: u64| {
+            for start in (0..n).step_by(1000) {
+                let rows: Vec<String> = (start..(start + 1000).min(n))
+                    .map(|i| {
+                        format!("('{kind}', '{prefix}{i}', 0, '{prefix}{i}', {ts}, {terminal}, '')")
+                    })
+                    .collect();
+                conn.query_drop(format!(
+                "INSERT INTO plane_records (kind, ident, seq, id, ts, terminal, body) VALUES {}",
+                rows.join(",")
+            ))
+                .expect("bulk insert");
+            }
+        };
+    let count = |conn: &mut PooledConn, kind: &str| -> u64 {
+        conn.exec_first(
+            "SELECT COUNT(*) FROM plane_records WHERE kind = :k",
+            params! { "k" => kind },
+        )
+        .unwrap()
+        .unwrap()
+    };
+    use busbar_contract::records::Retention;
+    let cutoff = 1_000_000_200;
+
+    // Tasks: terminal ones go with their events; an active old one and a newer terminal stay.
+    fill(&mut conn, "task", "t_batch_", 1_000_000_100, true, N);
+    fill(
+        &mut conn,
+        "task",
+        "t_batch_active_",
+        1_000_000_100,
+        false,
+        1,
+    );
+    fill(&mut conn, "task", "t_batch_new_", 1_000_000_300, true, 1);
+    fill(&mut conn, "task_event", "t_batch_", 1_000_000_100, false, 3);
+    assert_eq!(
+        store
+            .purge_plane_records("task", cutoff, Retention::TerminalOnly)
+            .unwrap(),
+        N
+    );
+    assert_eq!(
+        count(&mut conn, "task"),
+        2,
+        "the active and the newer task stay"
+    );
+    assert_eq!(
+        count(&mut conn, "task_event"),
+        0,
+        "their events went with them"
+    );
+
+    // Another kind, terminal-only: the terminal backlog goes, the active row stays.
+    let kind = "slots_purge_terminal";
+    conn.exec_drop(
+        "DELETE FROM plane_records WHERE kind = :k",
+        params! { "k" => kind },
+    )
+    .unwrap();
+    fill(&mut conn, kind, "p_", 100, true, N);
+    fill(&mut conn, kind, "pa_", 100, false, 1);
+    assert_eq!(
+        store
+            .purge_plane_records(kind, 200, Retention::TerminalOnly)
+            .unwrap(),
+        N
+    );
+    assert_eq!(count(&mut conn, kind), 1);
+
+    // Age: every row below the cutoff goes, the newer one stays.
+    let kind = "slots_purge_age";
+    conn.exec_drop(
+        "DELETE FROM plane_records WHERE kind = :k",
+        params! { "k" => kind },
+    )
+    .unwrap();
+    fill(&mut conn, kind, "a_", 100, false, N);
+    fill(&mut conn, kind, "an_", 300, false, 1);
+    assert_eq!(
+        store
+            .purge_plane_records(kind, 200, Retention::Age)
+            .unwrap(),
+        N
+    );
+    assert_eq!(count(&mut conn, kind), 1);
+    conn.exec_drop(
+        "DELETE FROM plane_records WHERE kind LIKE 'slots_purge_%'",
+        (),
+    )
+    .unwrap();
+    clear_purge_band(&store);
+}
