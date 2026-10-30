@@ -953,3 +953,55 @@ fn an_upsert_replaces_by_kind_and_id_whatever_its_seq() {
         Some(b"second".to_vec())
     );
 }
+
+/// M15: `put_usage`'s delete-then-insert deadlocks with a concurrent first write on the same
+/// window (both hold the window's gap, each waits to insert into it). The loser is retried, not
+/// surfaced as a raw 1213. The other writer is made the heavier transaction so InnoDB picks
+/// `put_usage` as the victim.
+#[test]
+fn put_usage_survives_a_gap_lock_deadlock_with_a_first_write() {
+    use busbar_contract::records::{ModelTokens, UsageLedger};
+    let Some(s) = fresh_store() else { return };
+    let bucket = fresh("gapdl");
+    let other = fresh("gapdl-weight");
+    let mut b = s.conn().expect("conn");
+    b.query_drop("START TRANSACTION").expect("begin");
+    for i in 0..40 {
+        b.exec_drop(
+            "INSERT INTO usage_windows (window_start, bucket_scope, bucket_id, model, requests) \
+             VALUES (?, 'key', ?, '', 1)",
+            (1000 + i, &other),
+        )
+        .expect("weight");
+    }
+    b.exec_drop(
+        "DELETE FROM usage_windows WHERE window_start = 60 AND bucket_scope = 'key' AND bucket_id = ?",
+        (&bucket,),
+    )
+    .expect("hold the window's gap");
+    let ledger = UsageLedger {
+        requests: 7,
+        billable_requests: 7,
+        models: vec![ModelTokens {
+            model: "m".into(),
+            usage_units: [("tokens_input".to_owned(), 3)].into_iter().collect(),
+        }],
+    };
+    let result = std::thread::scope(|sc| {
+        let a = sc.spawn(|| s.put_usage(&bucket, 60, &ledger));
+        // Give put_usage time to reach its insert and wait on the held gap (the test user has no
+        // PROCESS privilege to watch the lock wait).
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        // put_usage now waits on this window's gap; inserting into it closes the cycle.
+        b.exec_drop(
+            "INSERT INTO usage_windows (window_start, bucket_scope, bucket_id, model, requests) \
+             VALUES (60, 'key', ?, '', 1)",
+            (&bucket,),
+        )
+        .expect("the heavier transaction survives the deadlock");
+        b.query_drop("COMMIT").expect("commit");
+        a.join().expect("put_usage thread")
+    });
+    result.expect("put_usage is retried after losing the deadlock");
+    assert_eq!(s.get_usage(&bucket, 60).expect("read").requests, 7);
+}
