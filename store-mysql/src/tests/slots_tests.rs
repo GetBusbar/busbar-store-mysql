@@ -138,6 +138,105 @@ fn a_value_the_columns_cannot_hold_is_refused_and_records_nothing() {
         .expect("the same op_id with a valid body applies");
 }
 
+/// M7/TA4: a usage counter above `i64::MAX` adds without wrapping and pins at the `u64` ceiling,
+/// never an error; a negative delta still floors at zero.
+#[test]
+fn usage_counters_add_across_the_signed_boundary_and_pin_at_the_ceiling() {
+    use busbar_contract::records::{ModelTokens, ModelTokensDelta, UsageLedger};
+    let Some(s) = fresh_store() else { return };
+    let bucket = fresh("ceiling");
+    let big = i64::MAX as u64 + 10;
+    let units = |n: u64| -> std::collections::BTreeMap<String, u64> {
+        [("tokens_input".to_owned(), n), ("images".to_owned(), n)]
+            .into_iter()
+            .collect()
+    };
+    let seed = |n: u64| UsageLedger {
+        requests: n,
+        billable_requests: n,
+        models: vec![ModelTokens {
+            model: "m".into(),
+            usage_units: units(n),
+        }],
+    };
+    let delta = |d: i64| UsageDelta {
+        requests: d,
+        billable_requests: d,
+        models: vec![ModelTokensDelta {
+            model: "m".into(),
+            usage_units: [("tokens_input".to_owned(), d), ("images".to_owned(), d)]
+                .into_iter()
+                .collect(),
+        }],
+    };
+    let read = || s.get_usage(&bucket, 60).expect("get_usage");
+    let check = |want: u64, what: &str| {
+        let l = read();
+        assert_eq!((l.requests, l.billable_requests), (want, want), "{what}");
+        assert_eq!(l.models[0].usage_units["tokens_input"], want, "{what}");
+        assert_eq!(l.models[0].usage_units["images"], want, "{what}");
+    };
+    s.put_usage(&bucket, 60, &seed(big)).expect("seed");
+    s.add_usage_op(op(6), &bucket, 60, &delta(5)).expect("add above i64::MAX");
+    check(big + 5, "an add above i64::MAX does not wrap");
+    s.add_usage_op(op(7), &bucket, 60, &delta(-3)).expect("refund");
+    check(big + 2, "a refund above i64::MAX");
+    s.put_usage(&bucket, 60, &seed(u64::MAX - 2)).expect("seed");
+    s.add_usage_op(op(8), &bucket, 60, &delta(i64::MAX)).expect("pins");
+    check(u64::MAX, "pinned at the ceiling");
+    s.add_usage_op(op(9), &bucket, 60, &delta(1)).expect("stays pinned");
+    check(u64::MAX, "stays at the ceiling");
+    s.put_usage(&bucket, 60, &seed(4)).expect("seed");
+    s.add_usage_op(op(10), &bucket, 60, &delta(i64::MIN)).expect("floors");
+    check(0, "a negative delta floors at zero");
+}
+
+/// M7/TA4: a metering counter at the ceiling pins instead of erroring.
+#[test]
+fn metering_counters_pin_at_the_ceiling() {
+    use busbar_contract::records::MeteringDelta;
+    let Some(s) = fresh_store() else { return };
+    let key = fresh("vk_ceiling");
+    s.put_key(&sample_key(&key, "g")).expect("put_key");
+    let cell = |n: u64| MeteringDelta {
+        key_id: key.clone(),
+        bucket: 20_261_031,
+        model: "m".into(),
+        provider: "p".into(),
+        tokens_input: n,
+        tokens_output: n,
+        tokens_cache_read: n,
+        tokens_cache_write: n,
+        requests: n,
+        billable_requests: n,
+        key_group_at_use: "g".into(),
+        pricing_version: "v1".into(),
+        priced_from_ms: 0,
+        usage_units: [("images".to_owned(), n)].into_iter().collect(),
+    };
+    s.add_metering_op(op(11), &[cell(u64::MAX - 2)]).expect("seed");
+    s.add_metering_op(op(12), &[cell(10)]).expect("pins, no error");
+    let rows: Vec<_> = s
+        .list_metering(20_261_031)
+        .expect("list_metering")
+        .into_iter()
+        .filter(|r| r.key_id == key)
+        .collect();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let r = &rows[0];
+    for v in [
+        r.tokens_input,
+        r.tokens_output,
+        r.tokens_cache_read,
+        r.tokens_cache_write,
+        r.requests,
+        r.billable_requests,
+        r.usage_units["images"],
+    ] {
+        assert_eq!(v, u64::MAX, "{r:?}");
+    }
+}
+
 #[test]
 fn records_upsert_read_back_and_scan_a_prefix_in_key_order() {
     let Some(s) = fresh_store() else { return };
