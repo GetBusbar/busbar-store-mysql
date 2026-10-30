@@ -4332,3 +4332,31 @@ fn a_parented_upserted_record_reads_back_by_its_own_id() {
     );
     reset_plane(&store, "task", &[t1, t2, ctx]);
 }
+
+/// M6: a value the requested type cannot hold is an error naming the type, never a panic and never
+/// the value, on every row-reading call of the store's client.
+#[test]
+fn a_row_value_of_the_wrong_shape_is_an_error_not_a_panic() {
+    let Some(s) = fresh_store() else { return };
+    let mut raw = s.conn().expect("conn");
+    let mut c = harness::store_client(&mut raw);
+    use harness::block_on as h;
+    for sql in [
+        "SELECT NULL",
+        "SELECT -1",
+        "SELECT 'canary-text'",
+        "SELECT CAST(0xff AS BINARY)",
+    ] {
+        let e = h(c.query_first::<(u64,)>(sql)).expect_err(sql);
+        assert!(!e.to_string().contains("canary"), "{e}");
+        h(c.query::<(u64,)>(sql)).expect_err(sql);
+        let e = h(c.exec_first::<(u64,)>(sql, Params::Empty)).expect_err(sql);
+        assert!(!e.to_string().contains("canary"), "{e}");
+        h(c.exec::<(u64,)>(sql, Params::Empty)).expect_err(sql);
+    }
+    h(c.query_first::<(String,)>("SELECT CAST(0xff AS BINARY)")).expect_err("not UTF-8");
+    h(c.exec_first::<(String,)>("SELECT CAST(0xff AS BINARY)", Params::Empty)).expect_err("not UTF-8");
+    // A conforming row still reads.
+    let ok: Option<(u64,)> = h(c.query_first("SELECT 7")).expect("reads");
+    assert_eq!(ok, Some((7,)));
+}

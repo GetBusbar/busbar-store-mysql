@@ -194,6 +194,11 @@ fn own_client_like(conn: &mut mysql::PooledConn) -> mysqlwire::Conn {
     .expect("the store's client connects")
 }
 
+/// The store's own client on the database `conn` is connected to.
+pub(crate) fn store_client(conn: &mut mysql::PooledConn) -> mysqlwire::Conn {
+    own_client_like(conn)
+}
+
 impl MysqlStore {
     /// The store on `url`, as the host opens it (`{"url": url}`; the connect step runs).
     pub(crate) fn connect(url: &str) -> Result<Self, String> {
