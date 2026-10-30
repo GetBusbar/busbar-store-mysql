@@ -131,7 +131,21 @@ pub(crate) enum Write {
 impl Write {
     /// The cells in one global order, so two nodes flushing overlapping cells take their row locks
     /// in the same order (sums commute, so the order is free to choose).
-    pub(crate) fn ordered(self) -> Self {
+    pub(crate) fn ordered(mut self) -> Self {
+        match &mut self {
+            Write::Usage(cells) => cells.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1))),
+            // The primary key's order.
+            Write::Metering(ds) => ds.sort_by(|a, b| {
+                (a.bucket, &a.key_id, &a.provider, &a.model, a.priced_from_ms).cmp(&(
+                    b.bucket,
+                    &b.key_id,
+                    &b.provider,
+                    &b.model,
+                    b.priced_from_ms,
+                ))
+            }),
+            Write::Append(_) => {}
+        }
         self
     }
 
