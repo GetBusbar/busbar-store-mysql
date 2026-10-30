@@ -837,25 +837,19 @@ fn is_check_constraint_violation_accepts_only_the_two_real_engine_codes() {
 // existing direct-call tests above) remains open pending either a `connect()` variant testable with
 // injectable Opts, or the mysql crate exposing a per-connection init hook through URL parsing.
 
-/// `connect()` now ESTABLISHES strict sql_mode on every connection via `OptsBuilder::init(...)`
-/// (appended, not just verified once at boot) rather than trusting every future pooled/reconnected
-/// connection inherits the same session posture the one boot-time probe happened to see. Proves the
-/// exact init statement `connect()` uses actually WORKS even when the underlying default would be
-/// permissive -- self-contained (a throwaway pool this test builds itself, never the shared server
-/// global default), so no cross-test interference risk like the reverted GLOBAL-flip attempt above.
+/// The store ESTABLISHES strict sql_mode on every connection it opens (`INIT`, appended and not
+/// just verified once at boot). Driven through the store's own client (`Conn::open`'s handshake
+/// and init statements), from a session whose starting `sql_mode` is empty: the append must land.
 #[test]
-fn connect_establishes_strict_sql_mode_via_init_even_when_the_default_would_be_permissive() {
+fn the_stores_own_connection_establishes_strict_sql_mode_from_a_permissive_start() {
     let Some(url) = test_url() else { return };
-    let opts = Opts::from_url(&url).unwrap();
-    // Simulates a permissive starting session (as if the server's own default were empty) --
-    // then the SAME statements connect() itself runs (`crate::INIT`). All run, in order, on THIS
-    // pool's own connections only; never touches the real shared server default.
+    let opts = std::sync::Arc::new(mysqlwire::Opts::from_url(&url).unwrap());
     let mut init = vec!["SET SESSION sql_mode = ''"];
     init.extend(crate::INIT.iter().copied());
-    let opts = mysql::OptsBuilder::from_opts(opts).init(init);
-    let pool = Pool::new(opts).unwrap();
-    let mut conn = pool.get_conn().unwrap();
-    let sql_mode: String = conn.query_first("SELECT @@sql_mode").unwrap().unwrap();
+    let mut conn = harness::block_on(mysqlwire::Conn::open_tcp(&opts, &init)).expect("open");
+    let sql_mode: Option<String> =
+        harness::block_on(conn.query_first("SELECT @@SESSION.sql_mode")).expect("read");
+    let sql_mode = sql_mode.expect("a row");
     assert!(
         sql_mode.contains("STRICT_ALL_TABLES"),
         "the init-time append must land even starting from an empty sql_mode: got '{sql_mode}'"
