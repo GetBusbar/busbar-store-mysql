@@ -1715,6 +1715,23 @@ mod tests {
         server.join().unwrap();
     }
 
+    /// M17: `max_allowed_packet` outside MySQL's 1..=1 GiB is refused at parse, naming the parameter
+    /// (not truncated to a u32 or accepted as 0 and failed at connect).
+    #[test]
+    fn max_allowed_packet_outside_mysqls_range_is_refused_at_parse() {
+        for v in ["0", "4294967296", "1073741825"] {
+            let e = Opts::from_url(&format!("mysql://u@h/d?max_allowed_packet={v}"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains("`max_allowed_packet`") && e.contains("1073741824"),
+                "{v}: {e}"
+            );
+        }
+        assert!(Opts::from_url("mysql://u@h/d?max_allowed_packet=1").is_ok());
+        assert!(Opts::from_url("mysql://u@h/d?max_allowed_packet=1073741824").is_ok());
+    }
+
     #[test]
     fn a_url_parses_as_the_driver_parsed_it() {
         let o =
