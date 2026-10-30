@@ -4197,7 +4197,8 @@ const V10_PADDED_TWINS: &[&str] = &[
     "INSERT INTO store_records (schema_id, rkey, value) VALUES ('abc ', 'k', 'v-twin')",
 ];
 
-/// Every column, constraint and index of `db`'s tables, as `information_schema` reports them.
+/// Every column, constraint (with its foreign keys' referential actions and each CHECK's clause)
+/// and index of `db`'s tables, as `information_schema` reports them.
 fn schema_shape(db: &ScratchDb) -> Vec<String> {
     let mut c = db.conn();
     let mut out: Vec<String> = c
@@ -4219,6 +4220,27 @@ fn schema_shape(db: &ScratchDb) -> Vec<String> {
              ORDER BY table_name, constraint_name",
             (),
             |(t, n, ty): (String, String, String)| format!("constraint {t}.{n} {ty}"),
+        )
+        .unwrap(),
+    );
+    out.extend(
+        c.exec_map(
+            "SELECT table_name, constraint_name, update_rule, delete_rule FROM \
+             information_schema.referential_constraints WHERE constraint_schema = DATABASE() \
+             ORDER BY table_name, constraint_name",
+            (),
+            |(t, n, up, del): (String, String, String, String)| {
+                format!("foreign key {t}.{n} on_update={up} on_delete={del}")
+            },
+        )
+        .unwrap(),
+    );
+    out.extend(
+        c.exec_map(
+            "SELECT constraint_name, check_clause FROM information_schema.check_constraints \
+             WHERE constraint_schema = DATABASE() ORDER BY constraint_name",
+            (),
+            |(n, clause): (String, String)| format!("check {n} {clause}"),
         )
         .unwrap(),
     );
