@@ -919,3 +919,37 @@ fn a_repeat_denylist_add_keeps_the_first_row() {
     assert_eq!(first.0, "a");
     assert_eq!(after, ("a".to_owned(), 1), "the repeat changed the row");
 }
+
+/// M13: an upsert is keyed by `(kind, id)` whatever `seq` the record carries: a second write for
+/// the id replaces the first and `get_plane_record` reads it.
+#[test]
+fn an_upsert_replaces_by_kind_and_id_whatever_its_seq() {
+    use busbar_contract::records::{PlaneDisposition, PlaneRecord};
+    let Some(s) = fresh_store() else { return };
+    let id = fresh("upsert-seq");
+    let rec = |seq: u64, body: &[u8]| PlaneRecord {
+        kind: "slots_upsert".into(),
+        id: id.clone(),
+        parent: None,
+        seq,
+        ts: 10_000_000_000,
+        disposition: PlaneDisposition::Active,
+        body: body.to_vec(),
+    };
+    s.upsert_plane_record(rec(3, b"first").view())
+        .expect("first");
+    s.upsert_plane_record(rec(4, b"second").view())
+        .expect("second");
+    let mut c = s.conn().expect("conn");
+    let rows: Option<u64> = c
+        .exec_first(
+            "SELECT COUNT(*) FROM plane_records WHERE kind = 'slots_upsert' AND ident = ?",
+            (&id,),
+        )
+        .expect("count");
+    assert_eq!(rows, Some(1), "one row per (kind, id)");
+    assert_eq!(
+        s.get_plane_record("slots_upsert", &id).expect("get"),
+        Some(b"second".to_vec())
+    );
+}
