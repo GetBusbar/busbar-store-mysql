@@ -197,6 +197,23 @@ env:
       fi
       printf '%s\n' "$red" | grep -q "crossing(s), pinned" || { printf '%s\n' "$red" >&2; echo "RED: the moved count failed for another reason"; exit 1; }
     }
+    # [net-ban] (busbar .github/fleet/deps.toml at the pin; BUSBAR-1.6.0.md line 3980): no plugin opens its
+    # own socket, dials, binds or does TLS. busbar's scripts/fleet/net-ban.sh at the pin, or, at a pin from
+    # before the gate, the gate at NET_BAN_SHA (the policy is always the pin's). Its selftest first: a
+    # fixture plugin calling std::net::TcpStream::connect must fail it before its verdict is trusted.
+    NET_BAN_SHA=d68d39cd409a60797b540bff42747bd67cc03879
+    s_netban() {
+      nb="$W/busbar/scripts/fleet/net-ban.sh"
+      if [ ! -f "$nb" ]; then
+        git init -q "$W/netban" && git -C "$W/netban" remote add origin https://github.com/GetBusbar/busbar.git
+        git -C "$W/netban" sparse-checkout set scripts/fleet
+        git -C "$W/netban" fetch -q --depth 1 --no-tags origin "$NET_BAN_SHA"
+        git -C "$W/netban" -c advice.detachedHead=false checkout -q FETCH_HEAD
+        nb="$W/netban/scripts/fleet/net-ban.sh"
+      fi
+      bash "$nb" --selftest
+      NET_BAN_REPO="$REPO" bash "$nb" plugin "$PLUGIN_CRATE" "plugin/target/release/lib${PLUGIN_CRATE//-/_}.so" "$W/busbar/.github/fleet/deps.toml"
+    }
     s_deny() {
       cd plugin
       fetch "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-$DENY.tar.gz" "$DENYSHA" "$T/deny-$DENY.tgz"
@@ -234,6 +251,7 @@ env:
       step ok test s_test
       [ -n "$PLUGIN_EXTRA_TEST" ] && step ok "extra test command" s_extra
       step always "the published conformance suite at the pin" s_conformance
+      [ "$PLUGIN_LANG" = rust ] && step always "net-ban: no socket, dial or TLS of the plugin's own" s_netban
       step always "cargo deny" s_deny
     fi
     [ "$PLUGIN_LANG" = c ] && step always "C: the kind's conformance through load_dropped" s_cconf
