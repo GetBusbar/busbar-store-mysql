@@ -1638,6 +1638,28 @@ mod tests {
         server.join().unwrap();
     }
 
+    /// M2: a key the server sends that is not a PEM public key is refused, not a panic in the
+    /// RSA encrypt.
+    #[test]
+    fn full_auth_over_tcp_with_a_non_pem_key_is_refused_not_a_panic() {
+        for key in [&b"k"[..], b"", b"-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----\n"] {
+            let key = key.to_vec();
+            let (mut conn, server) = fake_server(move |mut s| {
+                s.write_all(&packet(0, &[0x01, 0x04])).unwrap();
+                let mut buf = [0_u8; 5];
+                if s.read(&mut buf).unwrap_or(0) > 0 {
+                    let mut p = vec![0x01];
+                    p.extend_from_slice(&key);
+                    let _ = s.write_all(&packet(2, &p));
+                }
+            });
+            conn.st.nonce = vec![7; 20];
+            assert!(run(conn.continue_caching_sha2(true)).is_err());
+            drop(conn);
+            server.join().unwrap();
+        }
+    }
+
     #[test]
     fn a_url_parses_as_the_driver_parsed_it() {
         let o =
