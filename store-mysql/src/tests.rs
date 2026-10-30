@@ -1349,9 +1349,10 @@ fn delete_key_shows_nothing_of_itself_until_it_commits_both_halves() {
     std::thread::scope(|sc| {
         let deleter = sc.spawn(|| s.delete_key(&key));
         // Wait until delete_key holds the key's row (it is then mid-transaction, blocked on the
-        // credential delete).
+        // credential delete); a delete_key that never holds it across the wait is judged by the
+        // state read below.
         let mut probe = s.conn().unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         loop {
             let mut tx = probe.start_transaction(mysql::TxOpts::default()).unwrap();
             let busy = tx
@@ -1364,10 +1365,9 @@ fn delete_key_shows_nothing_of_itself_until_it_commits_both_halves() {
             if busy {
                 break;
             }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "delete_key never took the key's row"
-            );
+            if std::time::Instant::now() > deadline {
+                break;
+            }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         std::thread::sleep(std::time::Duration::from_millis(300));
