@@ -1301,6 +1301,88 @@ fn put_credential_rejects_an_id_collision_against_a_different_key_or_slot() {
     assert_eq!(untouched.meta.slot, 0);
 }
 
+/// DETERMINISTIC: `delete_key` is held mid-transaction by a lock on the key's credential row (it
+/// takes the `api_keys` row lock first and reaches the credential delete second), and a third
+/// connection reads while it waits. Nothing it has done is visible yet (no tombstone, the
+/// credential still there); once the lock is released both halves appear together. A `delete_key`
+/// that committed the tombstone before destroying the credentials would show `tombstoned` with the
+/// credential still present while it waits.
+#[test]
+fn delete_key_shows_nothing_of_itself_until_it_commits_both_halves() {
+    let Some(s) = fresh_store() else { return };
+    let (key, public_id) = (
+        format!("vk_pause_{}", std::process::id()),
+        format!("AKIA_PAUSE_{}", std::process::id()),
+    );
+    s.put_key_with_credential(
+        &sample_key(&key, "g"),
+        &sample_credential(&key, &public_id, 0),
+    )
+    .unwrap();
+
+    let mut holder = s.conn().unwrap();
+    holder.query_drop("START TRANSACTION").unwrap();
+    holder
+        .exec_drop(
+            "SELECT id FROM credentials WHERE key_id = :k FOR UPDATE",
+            params! { "k" => &key },
+        )
+        .unwrap();
+
+    let mut reader = s.conn().unwrap();
+    let state = |reader: &mut PooledConn| -> (Option<u64>, i64) {
+        let tombstone: Option<Option<u64>> = reader
+            .exec_first(
+                "SELECT deleted_at FROM api_keys WHERE id = :k",
+                params! { "k" => &key },
+            )
+            .unwrap();
+        let creds: i64 = reader
+            .exec_first(
+                "SELECT COUNT(*) FROM credentials WHERE key_id = :k",
+                params! { "k" => &key },
+            )
+            .unwrap()
+            .unwrap();
+        (tombstone.unwrap(), creds)
+    };
+    std::thread::scope(|sc| {
+        let deleter = sc.spawn(|| s.delete_key(&key));
+        // Wait until delete_key holds the key's row (it is then mid-transaction, blocked on the
+        // credential delete).
+        let mut probe = s.conn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let mut tx = probe.start_transaction(mysql::TxOpts::default()).unwrap();
+            let busy = tx
+                .exec_first::<Option<u64>, _, _>(
+                    "SELECT deleted_at FROM api_keys WHERE id = :k FOR UPDATE NOWAIT",
+                    params! { "k" => &key },
+                )
+                .is_err();
+            let _ = tx.rollback();
+            if busy {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "delete_key never took the key's row"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(
+            state(&mut reader),
+            (None, 1),
+            "while delete_key waits, none of it is visible"
+        );
+        holder.query_drop("COMMIT").unwrap();
+        deleter.join().unwrap().unwrap();
+    });
+    let (tombstone, creds) = state(&mut reader);
+    assert!(tombstone.is_some() && creds == 0, "{tombstone:?} {creds}");
+}
+
 /// Real proof that `delete_key`'s tombstone-write and credential-destroy are ONE atomic
 /// transaction, not two: a concurrent connection contends for the SAME row lock `delete_key`
 /// holds for its whole transaction. InnoDB row locks are held for the full transaction, not
@@ -1309,6 +1391,10 @@ fn put_credential_rejects_an_id_collision_against_a_different_key_or_slot() {
 /// not the other. If `delete_key` were split into two transactions, the row lock would release
 /// after the first commits, letting a racer that lands in that gap observe the broken
 /// intermediate state, which the assertion below would then catch.
+///
+/// PROBABILISTIC EVIDENCE: whether the racer lands in a split transaction's gap depends on timing,
+/// so a pass is weaker than a failure. The deterministic companion above holds `delete_key`
+/// mid-transaction on purpose.
 #[test]
 fn tombstone_and_credential_destruction_are_never_observed_apart() {
     let Some(s) = fresh_store() else { return };
