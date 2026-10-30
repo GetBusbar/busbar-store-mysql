@@ -238,21 +238,10 @@ fn mysql_url() -> Option<String> {
     }
 }
 
-/// This crate's built cdylib (uplifted or under `deps`, newest wins). A missing artifact is a
-/// failure, never a skip.
+/// This crate's built cdylib: the one `cargo test` just built into `deps/`, asserted fresh against
+/// the sources (`common::plugin_path`). A missing or stale artifact is a failure, never a skip.
 fn cdylib() -> PathBuf {
-    let exe = std::env::current_exe().expect("the test binary has a path");
-    let profile = exe
-        .parent()
-        .and_then(|d| d.parent())
-        .expect("target/<profile>");
-    let file = busbar_plugin_loader::plugin_library_filename("busbar_store_mysql_plugin");
-    [profile.join(&file), profile.join("deps").join(&file)]
-        .into_iter()
-        .filter_map(|p| Some((std::fs::metadata(&p).ok()?.modified().ok()?, p)))
-        .max()
-        .map(|(_, p)| p)
-        .unwrap_or_else(|| panic!("the busbar-store-mysql-plugin cdylib ({file}) is not built"))
+    common::plugin_path()
 }
 
 /// What a door is bound to: its own dispatcher's adopter, no envelope sink, and the loader's test
