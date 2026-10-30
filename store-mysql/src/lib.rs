@@ -1439,6 +1439,28 @@ fn split_units<V: Copy + Default>(units: &BTreeMap<String, V>) -> (V, V, V, V, V
     )
 }
 
+/// A signed delta as `(up, down)`: the amount to add and the amount to take off, one of them zero.
+fn split_delta(d: i64) -> (u64, u64) {
+    if d >= 0 {
+        (d.unsigned_abs(), 0)
+    } else {
+        (0, d.unsigned_abs())
+    }
+}
+
+/// SQL for `col` + a signed delta, over a `BIGINT UNSIGNED` column: floored at zero and pinned at
+/// `u64::MAX`, never wrapping and never an out-of-range error. `up` and `down` name the
+/// [`split_delta`] parameters.
+fn sat_add(col: &str, up: &str, down: &str) -> String {
+    let floored = format!("(GREATEST({col}, :{down}) - :{down})");
+    format!("{floored} + LEAST(:{up}, 18446744073709551615 - {floored})")
+}
+
+/// SQL for `col` + the inserted row's `col`, pinned at `u64::MAX` instead of erroring.
+fn sat_values(col: &str) -> String {
+    format!("{col} + LEAST(VALUES({col}), 18446744073709551615 - {col})")
+}
+
 fn is_reserved_unit(k: &str) -> bool {
     k == UNIT_INPUT || k == UNIT_OUTPUT || k == UNIT_CACHE_READ || k == UNIT_CACHE_WRITE
 }
@@ -1475,26 +1497,31 @@ impl MysqlStore {
         window_start: u64,
         delta: &UsageDelta,
     ) -> Result<(), ApplyError> {
-        // Pre-dedupe by (bucket_id, window_start, model) — a batch with duplicate PKs in one
-        // multi-row upsert would hit "cannot affect row a second time" on Postgres and undefined
-        // last-writer-wins on MySQL; the caller is trusted to flush one model at most once per
-        // call here (this is the per-delta path, not a batch upsert), so this loop just applies
-        // each model delta as its own upsert.
         // The window's request counters accumulate ONCE, on the reserved `model = ''` sentinel row,
         // not once per model. Applied inside the per-model loop instead, a single delta added its
         // request count once for every model it carried, and a delta with no models recorded
         // nothing. This is the fleet flush primitive, so both errors compounded permanently across
         // every node and every flush interval.
+        let ((req_up, req_down), (breq_up, breq_down)) = (
+            split_delta(delta.requests),
+            split_delta(delta.billable_requests),
+        );
         tx.exec_drop(
-            "INSERT INTO usage_windows
-                (window_start, bucket_scope, bucket_id, model, requests, billable_requests)
-             VALUES (:w, 'key', :b, '', GREATEST(0, :req), GREATEST(0, :breq))
-             ON DUPLICATE KEY UPDATE
-                requests = GREATEST(0, CAST(requests AS SIGNED) + :req),
-                billable_requests = GREATEST(0, CAST(billable_requests AS SIGNED) + :breq)",
+            format!(
+                "INSERT INTO usage_windows
+                    (window_start, bucket_scope, bucket_id, model, requests, billable_requests)
+                 VALUES (:w, 'key', :b, '', GREATEST(0, :req), GREATEST(0, :breq))
+                 ON DUPLICATE KEY UPDATE
+                    requests = {},
+                    billable_requests = {}",
+                sat_add("requests", "req_up", "req_down"),
+                sat_add("billable_requests", "breq_up", "breq_down"),
+            ),
             params! {
                 "w" => window_start, "b" => bucket_id,
                 "req" => delta.requests, "breq" => delta.billable_requests,
+                "req_up" => req_up, "req_down" => req_down,
+                "breq_up" => breq_up, "breq_down" => breq_down,
             },
         )
         .await
@@ -1513,20 +1540,36 @@ impl MysqlStore {
             // brand-new, never-charged row is nonsensical anyway); the UPDATE arithmetic below still
             // uses the RAW (possibly negative) bound value, which is where the real floor-at-0 signed
             // accumulation happens.
+            let (ti_s, to_s, cr_s, cw_s) = (
+                split_delta(ti),
+                split_delta(to),
+                split_delta(cr),
+                split_delta(cw),
+            );
             tx.exec_drop(
-                "INSERT INTO usage_windows
-                    (window_start, bucket_scope, bucket_id, model,
-                     tokens_input, tokens_output, tokens_cache_read, tokens_cache_write)
-                 VALUES (:w, 'key', :b, :model,
-                         GREATEST(0, :ti), GREATEST(0, :to_), GREATEST(0, :cr), GREATEST(0, :cw))
-                 ON DUPLICATE KEY UPDATE
-                    tokens_input = GREATEST(0, CAST(tokens_input AS SIGNED) + :ti),
-                    tokens_output = GREATEST(0, CAST(tokens_output AS SIGNED) + :to_),
-                    tokens_cache_read = GREATEST(0, CAST(tokens_cache_read AS SIGNED) + :cr),
-                    tokens_cache_write = GREATEST(0, CAST(tokens_cache_write AS SIGNED) + :cw)",
+                format!(
+                    "INSERT INTO usage_windows
+                        (window_start, bucket_scope, bucket_id, model,
+                         tokens_input, tokens_output, tokens_cache_read, tokens_cache_write)
+                     VALUES (:w, 'key', :b, :model,
+                             GREATEST(0, :ti), GREATEST(0, :to_), GREATEST(0, :cr), GREATEST(0, :cw))
+                     ON DUPLICATE KEY UPDATE
+                        tokens_input = {},
+                        tokens_output = {},
+                        tokens_cache_read = {},
+                        tokens_cache_write = {}",
+                    sat_add("tokens_input", "ti_up", "ti_down"),
+                    sat_add("tokens_output", "to_up", "to_down"),
+                    sat_add("tokens_cache_read", "cr_up", "cr_down"),
+                    sat_add("tokens_cache_write", "cw_up", "cw_down"),
+                ),
                 params! {
                     "w" => window_start, "b" => bucket_id, "model" => &m.model,
                     "ti" => ti, "to_" => to, "cr" => cr, "cw" => cw,
+                    "ti_up" => ti_s.0, "ti_down" => ti_s.1,
+                    "to_up" => to_s.0, "to_down" => to_s.1,
+                    "cr_up" => cr_s.0, "cr_down" => cr_s.1,
+                    "cw_up" => cw_s.0, "cw_down" => cw_s.1,
                 },
             )
             .await
@@ -1534,14 +1577,18 @@ impl MysqlStore {
             // Every OPEN unit accumulates the same way, floored at 0, one atomic upsert per unit
             // (BTreeMap order, so concurrent flushes take the rows in one order).
             for (unit, d) in open {
+                let (up, down) = split_delta(d);
                 tx.exec_drop(
-                    "INSERT INTO usage_window_units
-                        (window_start, bucket_scope, bucket_id, model, unit, count)
-                     VALUES (:w, 'key', :b, :model, :unit, GREATEST(0, :d))
-                     ON DUPLICATE KEY UPDATE count = GREATEST(0, CAST(count AS SIGNED) + :d)",
+                    format!(
+                        "INSERT INTO usage_window_units
+                            (window_start, bucket_scope, bucket_id, model, unit, count)
+                         VALUES (:w, 'key', :b, :model, :unit, GREATEST(0, :d))
+                         ON DUPLICATE KEY UPDATE count = {}",
+                        sat_add("count", "up", "down"),
+                    ),
                     params! {
                         "w" => window_start, "b" => bucket_id, "model" => &m.model,
-                        "unit" => unit, "d" => d,
+                        "unit" => unit, "d" => d, "up" => up, "down" => down,
                     },
                 )
                 .await
@@ -1558,22 +1605,30 @@ impl MysqlStore {
         tx: &mut Conn,
         delta: &MeteringDelta,
     ) -> Result<(), ApplyError> {
-        let bucket = format!("{:010}", delta.bucket); // matches the CHAR(10) 'YYYY-MM-DD'-shaped bucket
-                                                      // `priced_from_ms` is part of the KEY: a rate-card edit inside the UTC day
-                                                      // opens a SECOND cell for that day, so each half keeps the card it was earned under rather
-                                                      // than one card repricing the whole day.
+        let bucket = format!("{:010}", delta.bucket);
+        // `priced_from_ms` is part of the KEY: a rate-card edit inside the UTC day opens a SECOND
+        // cell for that day, so each half keeps the card it was earned under rather than one card
+        // repricing the whole day.
         tx.exec_drop(
+            format!(
             "INSERT INTO usage_metering
                 (bucket, key_id, provider, model, key_group_at_use, pricing_version, priced_from_ms,
                  requests, billable_requests, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write)
              VALUES (:bucket, :key, :provider, :model, :grp, :pv, :pfm, :req, :breq, :ti, :to_, :cr, :cw)
              ON DUPLICATE KEY UPDATE
-                requests = requests + VALUES(requests),
-                billable_requests = billable_requests + VALUES(billable_requests),
-                tokens_input = tokens_input + VALUES(tokens_input),
-                tokens_output = tokens_output + VALUES(tokens_output),
-                tokens_cache_read = tokens_cache_read + VALUES(tokens_cache_read),
-                tokens_cache_write = tokens_cache_write + VALUES(tokens_cache_write)",
+                requests = {r},
+                billable_requests = {br},
+                tokens_input = {ti},
+                tokens_output = {to},
+                tokens_cache_read = {cr},
+                tokens_cache_write = {cw}",
+            r = sat_values("requests"),
+            br = sat_values("billable_requests"),
+            ti = sat_values("tokens_input"),
+            to = sat_values("tokens_output"),
+            cr = sat_values("tokens_cache_read"),
+            cw = sat_values("tokens_cache_write"),
+            ),
             params! {
                 "bucket" => &bucket, "key" => &delta.key_id, "provider" => &delta.provider,
                 "model" => &delta.model, "grp" => &delta.key_group_at_use, "pv" => &delta.pricing_version,
@@ -1588,10 +1643,10 @@ impl MysqlStore {
         // so concurrent writers take the unit rows in one order).
         for (unit, n) in &delta.usage_units {
             tx.exec_drop(
-                "INSERT INTO usage_metering_units
+                format!("INSERT INTO usage_metering_units
                     (bucket, key_id, provider, model, priced_from_ms, unit, count)
                  VALUES (:bucket, :key, :provider, :model, :pfm, :unit, :n)
-                 ON DUPLICATE KEY UPDATE count = count + VALUES(count)",
+                 ON DUPLICATE KEY UPDATE count = {}", sat_values("count")),
                 params! {
                     "bucket" => &bucket, "key" => &delta.key_id, "provider" => &delta.provider,
                     "model" => &delta.model, "pfm" => delta.priced_from_ms, "unit" => unit, "n" => *n,
@@ -1658,7 +1713,9 @@ impl MysqlStore {
                 return Ok(());
             }
             // Names the position and nothing else -- it must not echo stored (or caller) content.
-            return Err(ApplyError::text(fork::chain_fork(&record.kind, ident, record.seq).0));
+            return Err(ApplyError::text(
+                fork::chain_fork(&record.kind, ident, record.seq).0,
+            ));
         }
         Err(ApplyError::text(format!(
             "append_plane_record: kind '{}' seq {} kept being freed between the insert and the \

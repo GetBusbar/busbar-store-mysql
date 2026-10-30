@@ -1672,7 +1672,11 @@ mod tests {
     /// RSA encrypt.
     #[test]
     fn full_auth_over_tcp_with_a_non_pem_key_is_refused_not_a_panic() {
-        for key in [&b"k"[..], b"", b"-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----\n"] {
+        for key in [
+            &b"k"[..],
+            b"",
+            b"-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----\n",
+        ] {
             let key = key.to_vec();
             let (mut conn, server) = fake_server(move |mut s| {
                 s.write_all(&packet(0, &[0x01, 0x04])).unwrap();
@@ -1724,11 +1728,14 @@ mod tests {
     #[test]
     fn a_cleartext_switch_with_the_plugin_off_is_named_as_disabled() {
         let (mut conn, server) = fake_server(|_| {});
-        let req = AuthSwitchRequest::new("mysql_clear_password".as_bytes(), &[1_u8; 20][..])
-            .into_owned();
+        let req =
+            AuthSwitchRequest::new("mysql_clear_password".as_bytes(), &[1_u8; 20][..]).into_owned();
         let got = run(conn.auth_switch(req));
         assert!(
-            matches!(got, Err(Error::DriverError(DriverError::CleartextPluginDisabled))),
+            matches!(
+                got,
+                Err(Error::DriverError(DriverError::CleartextPluginDisabled))
+            ),
             "{got:?}"
         );
         drop(conn);

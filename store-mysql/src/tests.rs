@@ -4355,7 +4355,8 @@ fn a_row_value_of_the_wrong_shape_is_an_error_not_a_panic() {
         h(c.exec::<(u64,)>(sql, Params::Empty)).expect_err(sql);
     }
     h(c.query_first::<(String,)>("SELECT CAST(0xff AS BINARY)")).expect_err("not UTF-8");
-    h(c.exec_first::<(String,)>("SELECT CAST(0xff AS BINARY)", Params::Empty)).expect_err("not UTF-8");
+    h(c.exec_first::<(String,)>("SELECT CAST(0xff AS BINARY)", Params::Empty))
+        .expect_err("not UTF-8");
     // A conforming row still reads.
     let ok: Option<(u64,)> = h(c.query_first("SELECT 7")).expect("reads");
     assert_eq!(ok, Some((7,)));

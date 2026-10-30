@@ -131,7 +131,10 @@ fn a_value_the_columns_cannot_hold_is_refused_and_records_nothing() {
     assert!(matches!(got, Err(OpRefused::Refused(_))), "{got:?}");
     let mut c = s.pool.get_conn().expect("conn");
     let rows: Option<u64> = c
-        .exec_first("SELECT COUNT(*) FROM store_ops WHERE op_id = ?", (&id.0[..],))
+        .exec_first(
+            "SELECT COUNT(*) FROM store_ops WHERE op_id = ?",
+            (&id.0[..],),
+        )
         .expect("count");
     assert_eq!(rows, Some(0), "a refused op records nothing");
     s.add_usage_op(id, &bucket, 60, &delta("ok".into()))
@@ -173,21 +176,28 @@ fn usage_counters_add_across_the_signed_boundary_and_pin_at_the_ceiling() {
     let check = |want: u64, what: &str| {
         let l = read();
         assert_eq!((l.requests, l.billable_requests), (want, want), "{what}");
-        assert_eq!(l.models[0].usage_units["tokens_input"], want, "{what}");
-        assert_eq!(l.models[0].usage_units["images"], want, "{what}");
+        for unit in ["tokens_input", "images"] {
+            let got = l.models[0].usage_units.get(unit).copied().unwrap_or(0);
+            assert_eq!(got, want, "{what}: {unit}");
+        }
     };
     s.put_usage(&bucket, 60, &seed(big)).expect("seed");
-    s.add_usage_op(op(6), &bucket, 60, &delta(5)).expect("add above i64::MAX");
+    s.add_usage_op(op(6), &bucket, 60, &delta(5))
+        .expect("add above i64::MAX");
     check(big + 5, "an add above i64::MAX does not wrap");
-    s.add_usage_op(op(7), &bucket, 60, &delta(-3)).expect("refund");
+    s.add_usage_op(op(7), &bucket, 60, &delta(-3))
+        .expect("refund");
     check(big + 2, "a refund above i64::MAX");
     s.put_usage(&bucket, 60, &seed(u64::MAX - 2)).expect("seed");
-    s.add_usage_op(op(8), &bucket, 60, &delta(i64::MAX)).expect("pins");
+    s.add_usage_op(op(8), &bucket, 60, &delta(i64::MAX))
+        .expect("pins");
     check(u64::MAX, "pinned at the ceiling");
-    s.add_usage_op(op(9), &bucket, 60, &delta(1)).expect("stays pinned");
+    s.add_usage_op(op(9), &bucket, 60, &delta(1))
+        .expect("stays pinned");
     check(u64::MAX, "stays at the ceiling");
     s.put_usage(&bucket, 60, &seed(4)).expect("seed");
-    s.add_usage_op(op(10), &bucket, 60, &delta(i64::MIN)).expect("floors");
+    s.add_usage_op(op(10), &bucket, 60, &delta(i64::MIN))
+        .expect("floors");
     check(0, "a negative delta floors at zero");
 }
 
@@ -214,8 +224,10 @@ fn metering_counters_pin_at_the_ceiling() {
         priced_from_ms: 0,
         usage_units: [("images".to_owned(), n)].into_iter().collect(),
     };
-    s.add_metering_op(op(11), &[cell(u64::MAX - 2)]).expect("seed");
-    s.add_metering_op(op(12), &[cell(10)]).expect("pins, no error");
+    s.add_metering_op(op(11), &[cell(u64::MAX - 2)])
+        .expect("seed");
+    s.add_metering_op(op(12), &[cell(10)])
+        .expect("pins, no error");
     let rows: Vec<_> = s
         .list_metering(20_261_031)
         .expect("list_metering")
