@@ -25,6 +25,7 @@ use std::sync::Arc;
 use busbar_contract::abi::sdk::store::fork;
 use busbar_contract::abi::sdk::store::wire::Pool;
 use mysql_common::params;
+use mysql_common::value::Value;
 
 pub(crate) mod mysqlwire;
 use mysqlwire::{Conn, Error, Opts, Params, Row, Transaction};
@@ -2461,89 +2462,122 @@ impl MysqlStore {
         // one the DELETE actually performed (`affected_rows`), never an estimate. WHICH rows go is
         // the rule the call carries, never one inferred from the kind's name.
         let terminal_only = retention == Retention::TerminalOnly;
-        if terminal_only && kind != KIND_TASK {
-            // A terminal-only sweep of any other kind: its TERMINAL rows older than the cutoff, in
-            // bounded batches (the typed `terminal` column, never the body); an ACTIVE row stays.
-            const BATCH: u64 = 5000;
-            let mut total = 0u64;
-            loop {
-                conn.exec_drop(
-                    "DELETE FROM plane_records WHERE kind = :kind AND ts < :before AND terminal \
-                     LIMIT 5000",
+        if terminal_only && kind == KIND_TASK {
+            return Self::purge_terminal_tasks(conn, before).await;
+        }
+        // Every other kind: a batch of primary keys is read (no locks), then deleted by primary
+        // key with the predicate re-checked, so concurrent writers and sweeps take record locks
+        // only and never deadlock on each other's ranges. Terminal-only keeps an ACTIVE row (the
+        // typed `terminal` column, never the body). Looped until the backlog is gone.
+        let mut total = 0u64;
+        loop {
+            let terminal = if terminal_only { " AND terminal" } else { "" };
+            let keys: Vec<(Vec<u8>, u64)> = conn
+                .exec(
+                    format!(
+                        "SELECT ident, seq FROM plane_records \
+                         WHERE kind = :kind AND ts < :before{terminal} \
+                         ORDER BY ident, seq LIMIT {PURGE_BATCH}"
+                    ),
                     params! { "kind" => kind, "before" => before },
                 )
                 .await
                 .map_err(store_err)?;
-                let n = conn.affected_rows();
-                total += n;
-                if n < BATCH {
-                    break;
-                }
+            if keys.is_empty() {
+                break;
             }
-            return Ok(total);
-        }
-        if terminal_only {
-            // TERMINAL ONLY: an interrupted task waiting on a human must survive. Its event chain
-            // goes with it in the same transaction. Candidates come from a non-locking read and
-            // each is deleted by primary key with the predicate re-checked, so concurrent sweeps
-            // take record locks only and never deadlock on each other's ranges.
-            let candidates: Vec<String> = conn
-                .exec(
-                    "SELECT ident FROM plane_records \
-                     WHERE kind = :kind AND seq = :seq AND ts < :before AND terminal ORDER BY ident",
-                    params! { "kind" => KIND_TASK, "before" => before, "seq" => UPSERT_SEQ },
-                )
-                .await
-                .map_err(store_err)?;
-            let mut removed = 0u64;
-            for ident in candidates {
-                let mut tx = conn.start_transaction().await.map_err(store_err)?;
-                tx.exec_drop(
-                    "DELETE FROM plane_records WHERE kind = :kind AND ident = :ident AND seq = :seq \
-                     AND ts < :before AND terminal",
-                    params! {
-                        "kind" => KIND_TASK, "ident" => &ident, "before" => before,
-                        "seq" => UPSERT_SEQ,
-                    },
-                )
-                .await
-                .map_err(store_err)?;
-                // Read BEFORE the next statement: `affected_rows` reports the LAST statement on
-                // this connection. 0 = a concurrent sweep took it first, or it is no longer
-                // eligible; either way its chain is not this sweep's to touch.
-                if tx.affected_rows() == 1 {
-                    tx.exec_drop(
-                        "DELETE FROM plane_records WHERE kind = :event_kind AND ident = :ident",
-                        params! { "event_kind" => KIND_TASK_EVENT, "ident" => &ident },
-                    )
-                    .await
-                    .map_err(store_err)?;
-                    removed += 1;
-                }
-                tx.commit().await.map_err(store_err)?;
+            let mut args: Vec<Value> = vec![kind.into()];
+            for (ident, seq) in &keys {
+                args.push(ident.as_slice().into());
+                args.push((*seq).into());
             }
-            return Ok(removed);
-        }
-        // Every other kind drops ALL of its rows older than the cutoff. Batched and looped, like
-        // the other retention sweeps: the batch bound keeps any one DELETE's lock footprint small, and
-        // the loop makes the contract -- every row below the cutoff -- actually hold for a backlog
-        // larger than one batch.
-        const BATCH: u64 = 5000;
-        let mut total = 0u64;
-        loop {
+            args.push(before.into());
             conn.exec_drop(
-                "DELETE FROM plane_records WHERE kind = :kind AND ts < :before LIMIT 5000",
-                params! { "kind" => kind, "before" => before },
+                format!(
+                    "DELETE /*+ INDEX(plane_records PRIMARY) */ FROM plane_records \
+                     WHERE kind = ? AND (ident, seq) IN ({}) \
+                     AND ts < ?{terminal}",
+                    vec!["(?, ?)"; keys.len()].join(", ")
+                ),
+                Params::Positional(args),
             )
             .await
             .map_err(store_err)?;
             let n = conn.affected_rows();
             total += n;
-            if n < BATCH {
+            if keys.len() < PURGE_BATCH || n == 0 {
                 break;
             }
         }
         Ok(total)
+    }
+
+    /// (The statements that lock by primary key carry an `INDEX(.. PRIMARY)` hint: left to itself the
+    /// optimizer can pick the `(kind, ts)` index and lock its range, which is what this avoids.)
+    ///
+    /// The terminal `task` rows strictly older than `before`, each with its `task_event` chain, in
+    /// batches: an interrupted task waiting on a human must survive. A batch's candidates come
+    /// from a non-locking read; the transaction then locks them by primary key with the predicate
+    /// re-checked (a concurrent sweep may have taken some) and deletes those, so concurrent sweeps
+    /// take record locks only. Returns the tasks removed.
+    async fn purge_terminal_tasks(conn: &mut Conn, before: u64) -> RecordStoreResult<u64> {
+        let mut removed = 0u64;
+        loop {
+            let candidates: Vec<Vec<u8>> = conn
+                .exec(
+                    format!(
+                        "SELECT ident FROM plane_records WHERE kind = :kind AND seq = :seq \
+                         AND ts < :before AND terminal ORDER BY ident LIMIT {PURGE_BATCH}"
+                    ),
+                    params! { "kind" => KIND_TASK, "before" => before, "seq" => UPSERT_SEQ },
+                )
+                .await
+                .map_err(store_err)?;
+            if candidates.is_empty() {
+                break;
+            }
+            let marks = vec!["?"; candidates.len()].join(", ");
+            let mut tx = conn.start_transaction().await.map_err(store_err)?;
+            let mut args: Vec<Value> = vec![KIND_TASK.into(), UPSERT_SEQ.into()];
+            args.extend(candidates.iter().map(|c| Value::from(c.as_slice())));
+            args.push(before.into());
+            let eligible: Vec<Vec<u8>> = tx
+                .exec(
+                    format!(
+                        "SELECT /*+ INDEX(plane_records PRIMARY) */ ident FROM plane_records \
+                         WHERE kind = ? AND seq = ? \
+                         AND ident IN ({marks}) AND ts < ? AND terminal FOR UPDATE"
+                    ),
+                    Params::Positional(args),
+                )
+                .await
+                .map_err(store_err)?;
+            if !eligible.is_empty() {
+                let marks = vec!["?"; eligible.len()].join(", ");
+                for (kind, seq_clause) in [(KIND_TASK, " AND seq = ?"), (KIND_TASK_EVENT, "")] {
+                    let mut args: Vec<Value> = vec![kind.into()];
+                    args.extend(eligible.iter().map(|c| Value::from(c.as_slice())));
+                    if !seq_clause.is_empty() {
+                        args.push(UPSERT_SEQ.into());
+                    }
+                    tx.exec_drop(
+                        format!(
+                            "DELETE /*+ INDEX(plane_records PRIMARY) */ FROM plane_records \
+                             WHERE kind = ? AND ident IN ({marks}){seq_clause}"
+                        ),
+                        Params::Positional(args),
+                    )
+                    .await
+                    .map_err(store_err)?;
+                }
+            }
+            tx.commit().await.map_err(store_err)?;
+            removed += eligible.len() as u64;
+            if candidates.len() < PURGE_BATCH || eligible.is_empty() {
+                break;
+            }
+        }
+        Ok(removed)
     }
 
     pub(crate) async fn delete_plane_record(
@@ -2645,6 +2679,9 @@ fn is_terminal(d: PlaneDisposition) -> bool {
 /// The `seq` an UPSERTED record is stored at: the contract upserts by `(kind, id)`, so the record's
 /// own `seq` is not part of its identity.
 const UPSERT_SEQ: u64 = 0;
+
+/// Rows a retention sweep reads and deletes per round trip.
+const PURGE_BATCH: usize = if cfg!(test) { 7 } else { 1000 };
 
 fn plane_params(record: &PlaneRecord, ident: &str, seq: u64) -> Params {
     params! {

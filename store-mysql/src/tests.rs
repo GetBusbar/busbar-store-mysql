@@ -4368,7 +4368,8 @@ fn purges_drain_more_than_one_batch_and_count_exactly() {
     let store = MysqlStore::connect(&url).expect("connect");
     clear_purge_band(&store);
     let mut conn = store.conn().expect("conn");
-    const N: u64 = 5003;
+    // Several batches (a test build sweeps `PURGE_BATCH` = 7 rows at a time).
+    const N: u64 = 53;
     let fill =
         |conn: &mut PooledConn, kind: &str, prefix: &str, ts: u64, terminal: bool, n: u64| {
             for start in (0..n).step_by(1000) {
@@ -4384,10 +4385,10 @@ fn purges_drain_more_than_one_batch_and_count_exactly() {
                 .expect("bulk insert");
             }
         };
-    let count = |conn: &mut PooledConn, kind: &str| -> u64 {
+    let count = |conn: &mut PooledConn, kind: &str, like: &str| -> u64 {
         conn.exec_first(
-            "SELECT COUNT(*) FROM plane_records WHERE kind = :k",
-            params! { "k" => kind },
+            "SELECT COUNT(*) FROM plane_records WHERE kind = :k AND ident LIKE :like",
+            params! { "k" => kind, "like" => like },
         )
         .unwrap()
         .unwrap()
@@ -4414,12 +4415,12 @@ fn purges_drain_more_than_one_batch_and_count_exactly() {
         N
     );
     assert_eq!(
-        count(&mut conn, "task"),
+        count(&mut conn, "task", "t\\_batch\\_%"),
         2,
         "the active and the newer task stay"
     );
     assert_eq!(
-        count(&mut conn, "task_event"),
+        count(&mut conn, "task_event", "t\\_batch\\_%"),
         0,
         "their events went with them"
     );
@@ -4439,7 +4440,7 @@ fn purges_drain_more_than_one_batch_and_count_exactly() {
             .unwrap(),
         N
     );
-    assert_eq!(count(&mut conn, kind), 1);
+    assert_eq!(count(&mut conn, kind, "%"), 1);
 
     // Age: every row below the cutoff goes, the newer one stays.
     let kind = "slots_purge_age";
@@ -4456,7 +4457,7 @@ fn purges_drain_more_than_one_batch_and_count_exactly() {
             .unwrap(),
         N
     );
-    assert_eq!(count(&mut conn, kind), 1);
+    assert_eq!(count(&mut conn, kind, "%"), 1);
     conn.exec_drop(
         "DELETE FROM plane_records WHERE kind LIKE 'slots_purge_%'",
         (),
