@@ -75,6 +75,34 @@ fn store_err<E: std::fmt::Display>(e: E) -> RecordStoreError {
     RecordStoreError(e.to_string())
 }
 
+/// Why an `op_id` write's effect failed: the text, and the server's error code when the server
+/// refused a statement (so the slot can tell a refusal from a failure without matching text).
+#[derive(Debug)]
+pub(crate) struct ApplyError {
+    pub(crate) text: String,
+    pub(crate) server_code: Option<u16>,
+}
+
+impl ApplyError {
+    fn text(text: String) -> Self {
+        Self {
+            text,
+            server_code: None,
+        }
+    }
+}
+
+fn apply_err(e: Error) -> ApplyError {
+    let server_code = match &e {
+        Error::MySqlError(m) => Some(m.code),
+        _ => None,
+    };
+    ApplyError {
+        text: e.to_string(),
+        server_code,
+    }
+}
+
 /// The schema version this build creates and migrates to. An older released database is v3.
 /// v4..v6 never shipped (per-protocol tables); v7 is the neutral `plane_records` /
 /// `plane_tokens` and open usage units (`run_v7_*`); v8/v9 added the store v3 door's tables; v10
@@ -1425,7 +1453,7 @@ impl MysqlStore {
         bucket_id: &str,
         window_start: u64,
         delta: &UsageDelta,
-    ) -> RecordStoreResult<()> {
+    ) -> Result<(), ApplyError> {
         // Pre-dedupe by (bucket_id, window_start, model) — a batch with duplicate PKs in one
         // multi-row upsert would hit "cannot affect row a second time" on Postgres and undefined
         // last-writer-wins on MySQL; the caller is trusted to flush one model at most once per
@@ -1449,7 +1477,7 @@ impl MysqlStore {
             },
         )
         .await
-        .map_err(store_err)?;
+        .map_err(apply_err)?;
         // Deterministic order, same reason as `put_usage`: the primary key orders by model name, so
         // caller-order inserts from two concurrent flushes can deadlock on overlapping windows.
         let mut models: Vec<&ModelTokensDelta> = delta.models.iter().collect();
@@ -1481,7 +1509,7 @@ impl MysqlStore {
                 },
             )
             .await
-            .map_err(store_err)?;
+            .map_err(apply_err)?;
             // Every OPEN unit accumulates the same way, floored at 0, one atomic upsert per unit
             // (BTreeMap order, so concurrent flushes take the rows in one order).
             for (unit, d) in open {
@@ -1496,7 +1524,7 @@ impl MysqlStore {
                     },
                 )
                 .await
-                .map_err(store_err)?;
+                .map_err(apply_err)?;
             }
         }
         Ok(())
@@ -1508,7 +1536,7 @@ impl MysqlStore {
     pub(crate) async fn add_metering_on(
         tx: &mut Conn,
         delta: &MeteringDelta,
-    ) -> RecordStoreResult<()> {
+    ) -> Result<(), ApplyError> {
         let bucket = format!("{:010}", delta.bucket); // matches the CHAR(10) 'YYYY-MM-DD'-shaped bucket
                                                       // `priced_from_ms` is part of the KEY: a rate-card edit inside the UTC day
                                                       // opens a SECOND cell for that day, so each half keeps the card it was earned under rather
@@ -1534,7 +1562,7 @@ impl MysqlStore {
                 "cr" => delta.tokens_cache_read, "cw" => delta.tokens_cache_write,
             },
         ).await
-        .map_err(store_err)?;
+        .map_err(apply_err)?;
         // Every ledgered class the token columns do not hold, additive like them (BTreeMap order,
         // so concurrent writers take the unit rows in one order).
         for (unit, n) in &delta.usage_units {
@@ -1548,7 +1576,7 @@ impl MysqlStore {
                     "model" => &delta.model, "pfm" => delta.priced_from_ms, "unit" => unit, "n" => *n,
                 },
             ).await
-            .map_err(store_err)?;
+            .map_err(apply_err)?;
         }
         Ok(())
     }
@@ -1557,7 +1585,7 @@ impl MysqlStore {
     pub(crate) async fn append_plane_record_on(
         q: &mut Conn,
         record: &PlaneRecord,
-    ) -> RecordStoreResult<()> {
+    ) -> Result<(), ApplyError> {
         // APPEND-ONLY at a chain position `(parent, seq)`. A record arriving on a position that
         // already holds one is settled by comparing the two, exactly as `append_audit` settles a
         // duplicate `seq`:
@@ -1585,7 +1613,7 @@ impl MysqlStore {
                 plane_params(record, ident),
             )
             .await
-            .map_err(store_err)?;
+            .map_err(apply_err)?;
             if q.affected_rows() == 1 {
                 return Ok(());
             }
@@ -1596,7 +1624,7 @@ impl MysqlStore {
                     params! { "kind" => &record.kind, "ident" => ident, "seq" => record.seq },
                 )
                 .await
-                .map_err(store_err)?;
+                .map_err(apply_err)?;
             let Some((id, parent, ts, terminal, body)) = existing else {
                 continue; // purged between the insert and the read: the position is free, retry
             };
@@ -1609,9 +1637,9 @@ impl MysqlStore {
                 return Ok(());
             }
             // Names the position and nothing else -- it must not echo stored (or caller) content.
-            return Err(fork::chain_fork(&record.kind, ident, record.seq));
+            return Err(ApplyError::text(fork::chain_fork(&record.kind, ident, record.seq).0));
         }
-        Err(store_err(format!(
+        Err(ApplyError::text(format!(
             "append_plane_record: kind '{}' seq {} kept being freed between the insert and the \
              read-back after {MAX_ATTEMPTS} attempts; the record was NOT stored",
             record.kind, record.seq

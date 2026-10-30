@@ -40,7 +40,7 @@ use busbar_contract::records::{
 };
 
 use crate::mysqlwire::{Conn, Error};
-use crate::{crate_now, store_err, MysqlStore, INIT, NAME};
+use crate::{crate_now, store_err, ApplyError, MysqlStore, INIT, NAME};
 
 const NO_TEXT: AbiStr = AbiStr {
     ptr: std::ptr::null(),
@@ -129,7 +129,7 @@ enum Write {
 }
 
 impl Write {
-    async fn apply(&self, tx: &mut Conn) -> RecordStoreResult<()> {
+    async fn apply(&self, tx: &mut Conn) -> Result<(), ApplyError> {
         match self {
             Write::Usage(cells) => {
                 for (bucket, window, delta) in cells {
@@ -169,10 +169,15 @@ async fn deduped(
             .await
         {
             Ok(()) => {
-                write
-                    .apply(&mut tx)
-                    .await
-                    .map_err(|e| OpRefused::Failed(e.0))?;
+                if let Err(e) = write.apply(&mut tx).await {
+                    // Rolled back with the op's row: nothing applied, nothing recorded.
+                    let _ = tx.rollback().await;
+                    return Err(if e.server_code.is_some_and(is_refusal) {
+                        OpRefused::Refused(e.text)
+                    } else {
+                        OpRefused::Failed(e.text)
+                    });
+                }
                 tx.commit().await.map_err(backend)?;
                 if op.counter().is_multiple_of(OPS_SWEEP_EVERY) {
                     // Best effort: a sweep that fails is retried by the next one.
@@ -205,6 +210,20 @@ async fn deduped(
     Err(OpRefused::Failed(
         "store_ops: the op's row kept vanishing between its claim and its read".into(),
     ))
+}
+
+/// The server errors that are deterministic refusals of the statement's values (S5): the same
+/// write can never apply, and nothing did.
+fn is_refusal(code: u16) -> bool {
+    matches!(
+        code,
+        1264 // ER_WARN_DATA_OUT_OF_RANGE
+        | 1292 // ER_TRUNCATED_WRONG_VALUE
+        | 1406 // ER_DATA_TOO_LONG
+        | 1452 // ER_NO_REFERENCED_ROW_2
+        | 1690 // ER_DATA_OUT_OF_RANGE
+        | 3819 // ER_CHECK_CONSTRAINT_VIOLATED
+    )
 }
 
 /// One op in `OPS_SWEEP_EVERY` (by the minting node's counter) sweeps expired dedupe rows.
