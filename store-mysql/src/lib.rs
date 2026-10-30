@@ -2187,14 +2187,16 @@ impl MysqlStore {
             tx.exec_drop(
                 "UPDATE credentials SET
                     id = :id, public_id = :pub, secret = :secret, secret_form = :form,
-                    updated_at = :updated, expires_at = :expires, revoked_at = NULL,
+                    created_at = :created, updated_at = :updated, expires_at = :expires,
+                    revoked_at = NULL,
                     revoke_reason = NULL, revision = :rev
                  WHERE key_id = :key AND kind = :kind AND slot = :slot",
                 params! {
                     "id" => &m.id, "key" => &m.key_id, "kind" => &m.kind, "slot" => m.slot,
                     "pub" => &m.public_id, "secret" => &secret.secret,
                     "form" => secret_form_str(&m.secret_form),
-                    "updated" => m.updated_at, "expires" => m.expires_at, "rev" => rev,
+                    "created" => m.created_at, "updated" => m.updated_at,
+                    "expires" => m.expires_at, "rev" => rev,
                 },
             )
             .await
