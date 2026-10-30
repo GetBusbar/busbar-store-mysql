@@ -1703,6 +1703,34 @@ mod tests {
         server.join().unwrap();
     }
 
+    /// M4: `mysql_old_password` with an empty (or short) nonce is refused, not a panic in the scramble.
+    #[test]
+    fn an_old_password_switch_with_no_nonce_is_refused_not_a_panic() {
+        let (mut conn, server) =
+            fake_server_at("mysql://u:p@127.0.0.1:1/d?secure_auth=false", |_| {});
+        for nonce in [&[][..], &[1, 2, 3][..]] {
+            let req = AuthSwitchRequest::new("mysql_old_password".as_bytes(), nonce).into_owned();
+            assert!(run(conn.auth_switch(req)).is_err());
+        }
+        drop(conn);
+        server.join().unwrap();
+    }
+
+    /// M5: a switch to `mysql_clear_password` with the cleartext plugin off says so.
+    #[test]
+    fn a_cleartext_switch_with_the_plugin_off_is_named_as_disabled() {
+        let (mut conn, server) = fake_server(|_| {});
+        let req = AuthSwitchRequest::new("mysql_clear_password".as_bytes(), &[1_u8; 20][..])
+            .into_owned();
+        let got = run(conn.auth_switch(req));
+        assert!(
+            matches!(got, Err(Error::DriverError(DriverError::CleartextPluginDisabled))),
+            "{got:?}"
+        );
+        drop(conn);
+        server.join().unwrap();
+    }
+
     #[test]
     fn a_url_parses_as_the_driver_parsed_it() {
         let o =
