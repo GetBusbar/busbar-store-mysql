@@ -313,6 +313,132 @@ fn a_batch_applies_in_one_global_order() {
     );
 }
 
+/// Run `write` on a raw connection in a loop while `read` runs on this thread up to `rounds`
+/// times; the first `Err` from `read` fails the test. Probabilistic evidence: the reader and the
+/// writer race, so a missing snapshot shows as a torn read within a few thousand rounds.
+fn race(
+    s: &MysqlStore,
+    rounds: usize,
+    write: impl Fn(&mut mysql::PooledConn) + Sync,
+    read: impl Fn() -> Result<(), String>,
+) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let stop = AtomicBool::new(false);
+    let mut c = s.conn().expect("conn");
+    let outcome = std::thread::scope(|sc| {
+        sc.spawn(|| {
+            while !stop.load(Ordering::Relaxed) {
+                write(&mut c);
+            }
+        });
+        let r = (0..rounds).try_for_each(|_| read());
+        stop.store(true, Ordering::Relaxed);
+        r
+    });
+    outcome.expect("a torn read");
+}
+
+/// M9: `get_usage` reads the window's three tables in one snapshot, so a writer that moves the
+/// request counter and a token counter together is never seen half-applied.
+#[test]
+fn get_usage_reads_one_snapshot() {
+    use busbar_contract::records::{ModelTokens, UsageLedger};
+    let Some(s) = fresh_store() else { return };
+    let bucket = fresh("snap");
+    let seed = UsageLedger {
+        requests: 0,
+        billable_requests: 0,
+        models: vec![ModelTokens {
+            model: "m".into(),
+            usage_units: [("tokens_input".to_owned(), 0), ("images".to_owned(), 0)]
+                .into_iter()
+                .collect(),
+        }],
+    };
+    s.put_usage(&bucket, 60, &seed).expect("seed");
+    race(
+        &s,
+        3000,
+        |c| {
+            let mut tx = c.start_transaction(mysql::TxOpts::default()).expect("tx");
+            for sql in [
+                "UPDATE usage_windows SET requests = requests + 1 WHERE bucket_id = ? AND model = ''",
+                "UPDATE usage_windows SET tokens_input = tokens_input + 1 WHERE bucket_id = ? AND model = 'm'",
+                "UPDATE usage_window_units SET count = count + 1 WHERE bucket_id = ?",
+            ] {
+                tx.exec_drop(sql, (&bucket,)).expect("update");
+            }
+            tx.commit().expect("commit");
+        },
+        || {
+            let l = s.get_usage(&bucket, 60).map_err(|e| e.to_string())?;
+            let m = &l.models[0].usage_units;
+            let (t, i) = (
+                m.get("tokens_input").copied().unwrap_or(0),
+                m.get("images").copied().unwrap_or(0),
+            );
+            if l.requests == t && t == i {
+                Ok(())
+            } else {
+                Err(format!("{l:?}"))
+            }
+        },
+    );
+}
+
+/// M9: `list_metering` reads a cell and its open units in one snapshot.
+#[test]
+fn list_metering_reads_one_snapshot() {
+    use busbar_contract::records::MeteringDelta;
+    let Some(s) = fresh_store() else { return };
+    let key = fresh("vk_snap");
+    s.put_key(&sample_key(&key, "g")).expect("put_key");
+    let delta = MeteringDelta {
+        key_id: key.clone(),
+        bucket: 20_261_032,
+        model: "m".into(),
+        provider: "p".into(),
+        tokens_input: 0,
+        tokens_output: 0,
+        tokens_cache_read: 0,
+        tokens_cache_write: 0,
+        requests: 0,
+        billable_requests: 0,
+        key_group_at_use: "g".into(),
+        pricing_version: "v1".into(),
+        priced_from_ms: 0,
+        usage_units: [("images".to_owned(), 1)].into_iter().collect(),
+    };
+    s.add_metering_op(op(13), &[delta]).expect("seed");
+    race(
+        &s,
+        3000,
+        |c| {
+            let mut tx = c.start_transaction(mysql::TxOpts::default()).expect("tx");
+            tx.exec_drop(
+                "UPDATE usage_metering SET requests = requests + 1 WHERE key_id = ?",
+                (&key,),
+            )
+            .expect("update");
+            tx.exec_drop(
+                "UPDATE usage_metering_units SET count = count + 1 WHERE key_id = ?",
+                (&key,),
+            )
+            .expect("update");
+            tx.commit().expect("commit");
+        },
+        || {
+            let rows = s.list_metering(20_261_032).map_err(|e| e.to_string())?;
+            let r = rows.iter().find(|r| r.key_id == key).expect("the cell");
+            if r.requests + 1 == r.usage_units.get("images").copied().unwrap_or(0) {
+                Ok(())
+            } else {
+                Err(format!("{r:?}"))
+            }
+        },
+    );
+}
+
 #[test]
 fn records_upsert_read_back_and_scan_a_prefix_in_key_order() {
     let Some(s) = fresh_store() else { return };
