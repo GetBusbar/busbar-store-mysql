@@ -719,3 +719,15 @@ fn ta12_redeem_plane_token_near_i64_max_stores_and_sweeps_correctly() {
     );
     assert!(!s.redeem_plane_token(&kind, "fresh", top, 11).unwrap());
 }
+
+#[test]
+fn w4_a_connect_failure_is_one_prefix_then_the_driver_words() {
+    let e = MysqlStore::connect("mysql://u:CANARYpw9@127.0.0.1:1/definitely_not_a_real_db")
+        .err()
+        .expect("nothing listens on port 1");
+    assert!(
+        e.contains("mysql store: failed to connect: Could not connect"),
+        "{e}"
+    );
+    assert!(!e.contains("CANARYpw9"), "{e}");
+}
