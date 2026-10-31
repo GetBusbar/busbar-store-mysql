@@ -2919,6 +2919,18 @@ fn crate_now() -> u64 {
 // (`LinkedRow::of(door)`), and the sibling `busbar-store-mysql-plugin` cdylib exports the same
 // `door` as the image's one symbol (`export_door!`). One source, both doors.
 
+/// The JSON type of `v`, for a refusal that names a type and never the value.
+fn json_type(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
 /// The store's package name: the name its Statement states and its signed tarball carries.
 pub const NAME: &str = "busbar-store-mysql";
 
@@ -2932,30 +2944,35 @@ impl MysqlStore {
     /// # Errors
     /// A text naming why the settings do not name a store.
     pub(crate) fn settings_url(settings: &[u8]) -> Result<String, String> {
+        const BAD: &str = "invalid mysql plugin config";
         let v: serde_json::Value = if settings.iter().all(u8::is_ascii_whitespace) {
-            serde_json::Value::Object(Default::default())
+            serde_json::Value::Null
         } else {
-            serde_json::from_slice(settings)
-                .map_err(|e| format!("invalid mysql plugin config: {e}"))?
+            serde_json::from_slice(settings).map_err(|e| format!("{BAD}: {e}"))?
         };
-        if let Some(map) = v.as_object() {
-            if let Some(k) = map.keys().find(|k| k.as_str() != "url") {
+        let map = match v {
+            serde_json::Value::Null => serde_json::Map::new(),
+            serde_json::Value::Object(map) => map,
+            other => {
                 return Err(format!(
-                    "invalid mysql plugin config: unknown setting `{k}` (accepted: url)"
-                ));
+                    "{BAD}: expected a JSON object, got {}",
+                    json_type(&other)
+                ))
             }
+        };
+        if let Some(k) = map.keys().find(|k| k.as_str() != "url") {
+            return Err(format!("{BAD}: unknown setting `{k}` (accepted: url)"));
         }
-        let url = match v.get("url") {
-            Some(serde_json::Value::String(s)) => Some(s.trim()).filter(|s| !s.is_empty()),
-            Some(_) => {
-                return Err("invalid mysql plugin config: `url` must be a string".to_string())
-            }
-            None => None,
+        match map.get("url") {
+            Some(serde_json::Value::String(s)) if !s.trim().is_empty() => Ok(s.trim().to_owned()),
+            Some(serde_json::Value::String(_)) | None => Err(format!(
+                "{BAD}: requires a \"url\" (a mysql:// connection string)"
+            )),
+            Some(other) => Err(format!(
+                "{BAD}: `url` must be a string, got {}",
+                json_type(other)
+            )),
         }
-        .ok_or_else(|| {
-            "mysql plugin config requires a \"url\" (a mysql:// connection string)".to_string()
-        })?;
-        Ok(url.to_owned())
     }
 
     /// A MySQL/MariaDB store from the settings JSON the host hands `open`: parsed here (the same
