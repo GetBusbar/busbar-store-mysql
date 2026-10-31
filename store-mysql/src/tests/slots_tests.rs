@@ -149,14 +149,14 @@ fn a_value_the_columns_cannot_hold_is_refused_and_records_nothing() {
         .expect("the same op_id with a valid body applies");
 }
 
-/// M7/TA4: a usage counter above `i64::MAX` adds without wrapping and pins at the `u64` ceiling,
-/// never an error; a negative delta still floors at zero.
+/// M7/TA4/R17: usage counters pin at `i64::MAX` (the family's ceiling), never wrap or error; a
+/// `put_usage` above it clamps; a negative delta still floors at zero.
 #[test]
-fn usage_counters_add_across_the_signed_boundary_and_pin_at_the_ceiling() {
+fn usage_counters_pin_at_i64_max() {
     use busbar_contract::records::{ModelTokens, ModelTokensDelta, UsageLedger};
     let Some(s) = fresh_store() else { return };
     let bucket = fresh("ceiling");
-    let big = i64::MAX as u64 + 10;
+    let top = i64::MAX as u64;
     let units = |n: u64| -> std::collections::BTreeMap<String, u64> {
         [("tokens_input".to_owned(), n), ("images".to_owned(), n)]
             .into_iter()
@@ -189,29 +189,45 @@ fn usage_counters_add_across_the_signed_boundary_and_pin_at_the_ceiling() {
             assert_eq!(got, want, "{what}: {unit}");
         }
     };
-    s.put_usage(&bucket, 60, &seed(big)).expect("seed");
+    s.put_usage(&bucket, 60, &seed(u64::MAX)).expect("seed");
+    check(top, "put_usage clamps a counter above i64::MAX");
+    s.put_usage(&bucket, 60, &seed(top - 2)).expect("seed");
     s.add_usage_op(op(6), &bucket, 60, &delta(5))
-        .expect("add above i64::MAX");
-    check(big + 5, "an add above i64::MAX does not wrap");
+        .expect("add across the ceiling");
+    check(top, "an add across i64::MAX pins");
     s.add_usage_op(op(7), &bucket, 60, &delta(-3))
         .expect("refund");
-    check(big + 2, "a refund above i64::MAX");
-    s.put_usage(&bucket, 60, &seed(u64::MAX - 2)).expect("seed");
+    check(top - 3, "a refund off the ceiling");
+    s.put_usage(&bucket, 60, &seed(top - 2)).expect("seed");
     s.add_usage_op(op(8), &bucket, 60, &delta(i64::MAX))
         .expect("pins");
-    check(u64::MAX, "pinned at the ceiling");
+    check(top, "pinned at the ceiling");
     s.add_usage_op(op(9), &bucket, 60, &delta(1))
         .expect("stays pinned");
-    check(u64::MAX, "stays at the ceiling");
+    check(top, "stays at the ceiling");
+    // A row an earlier build left above i64::MAX adds without an error and pins.
+    {
+        let mut c = s.pool.get_conn().expect("conn");
+        c.exec_drop(
+            "UPDATE usage_windows SET requests = 18446744073709551615, \
+             billable_requests = 18446744073709551615 WHERE bucket_id = ? AND model = ''",
+            (&bucket,),
+        )
+        .expect("legacy row");
+    }
+    s.add_usage_op(op(13), &bucket, 60, &delta(1))
+        .expect("a legacy row above the ceiling adds");
+    assert_eq!(read().requests, top);
     s.put_usage(&bucket, 60, &seed(4)).expect("seed");
     s.add_usage_op(op(10), &bucket, 60, &delta(i64::MIN))
         .expect("floors");
     check(0, "a negative delta floors at zero");
 }
 
-/// M7/TA4: a metering counter at the ceiling pins instead of erroring.
+/// M7/TA4/R17: a metering counter at the ceiling pins at `i64::MAX` instead of erroring; a first
+/// write above it clamps.
 #[test]
-fn metering_counters_pin_at_the_ceiling() {
+fn metering_counters_pin_at_i64_max() {
     use busbar_contract::records::MeteringDelta;
     let Some(s) = fresh_store() else { return };
     let key = fresh("vk_ceiling");
@@ -253,7 +269,7 @@ fn metering_counters_pin_at_the_ceiling() {
         r.billable_requests,
         r.usage_units["images"],
     ] {
-        assert_eq!(v, u64::MAX, "{r:?}");
+        assert_eq!(v, i64::MAX as u64, "{r:?}");
     }
 }
 
