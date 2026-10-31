@@ -749,7 +749,7 @@ impl MysqlStore {
     /// v11 schema upgrade (D19): every key and identity column becomes `VARBINARY`. Gated on each
     /// column's `DATA_TYPE`, so it converges after a crash. No existing row can collide: the old
     /// collations' equality is coarser than byte equality. Child keys first take their parent's
-    /// spelling (`V11_RESPELL`) so nothing is orphaned; the two foreign keys onto `api_keys.id` are
+    /// spelling (`V11_RESPELL`) so nothing is orphaned; the foreign key onto `api_keys.id` is
     /// dropped and re-added around the retype, which MySQL requires.
     pub(crate) async fn run_v11_exact_keys(conn: &mut Conn) -> RecordStoreResult<()> {
         let mut pending: Vec<(&str, Vec<(&str, &str)>)> = Vec::new();

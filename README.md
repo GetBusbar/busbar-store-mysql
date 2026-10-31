@@ -77,24 +77,76 @@ attacker on the path can substitute their own key and recover the password. Use 
   MCP demotions, push-callback capabilities, and any kind a plane registers later) live in ONE
   `plane_records` table keyed by `(kind, identity, seq)`, with the record body stored opaquely and
   byte-for-byte; single-use tokens (`redeem_plane_token`) live in `plane_tokens`. Retention for the
-  `task` kind drops only terminal rows and takes their event chain with it.
+  `task` kind takes each purged task's event chain with it (a terminal-only sweep drops only terminal
+  tasks; an age sweep drops every task older than the cutoff), and deleting a task deletes its chain.
+- Counters (usage and metering) pin at `i64::MAX`, the largest value every store of the family can
+  hold; a `u64` the other stores' signed columns could not hold (an append's `seq`/`ts`, an upsert's
+  `seq`/`ts`, a metering `priced_from_ms`, a redemption's `expires_at`/`now`) is refused, never
+  clamped or wrapped.
+- A revoked credential's secret is destroyed with the revoke (the column is NULL, the form `none`).
+- Metering is accepted for any `key_id`: there is no foreign key from `usage_metering` to
+  `api_keys`, as in the other stores.
 - The store v3 tables are `store_ops` (the durable op-id dedupe log) and `store_records` (the
   kernel's records). The store keeps ledger counts, not money: busbar derives money from the counts
   and its rate card. Schema v10 drops the tables a pre-release v8/v9 build created for the deleted
   store slots (`store_caps`, `store_slices`, `store_epoch`, `store_journal`, `store_sessions`) and
   prunes `store_ops` to the rows of the three op-id writes that remain; schema v11 retypes every key
-  column to `VARBINARY` (exact keys).
-- Upgrades are IN PLACE on boot. A database written by busbar 1.5.x's `store-mysql` plugin (schema v3) gains
-  five nullable `api_keys` columns (`allowed_scopes_ext`, `idp_subject`, `binding_mode`,
-  `minted_by`, `idp_provider`), `usage_metering.priced_from_ms` (default 0, and part of the metering key, so a
-  rate-card change inside a day opens a second cell), and the new tables, and v10/v11 above run
-  after. No existing row is dropped or rewritten (v10's prune removes only dedupe rows of deleted
-  slots; v11 changes column types, not values).
+  column to `VARBINARY` (exact keys); schema v12 lets a revoked credential lose its secret and drops
+  `fk_metering_key`.
+
+### Column width limits
+
+A value wider than its column is refused by the server (the store runs `STRICT_ALL_TABLES`), naming
+the column and never the value. Widths are in bytes for `VARBINARY`/`TEXT` and characters for
+`VARCHAR`:
+
+| column | limit |
+|---|---|
+| `api_keys.id`, `credentials.id`, `credentials.key_id`, `denylist.sub`, `usage_metering.key_id` | 64 |
+| `api_keys.key_group`, `usage_*.bucket_id`, `usage_metering.key_group_at_use`, `credentials.kind` | 128 |
+| `api_keys.name`, `plane_records.kind`, `plane_tokens.kind`, `credentials.public_id` | 256 |
+| `credentials.revoke_reason`, `denylist.reason`, `usage_*.provider`, `usage_*.unit` | 512 |
+| `usage_*.model` | 1024 |
+| `plane_records.ident`/`id`/`parent`, `plane_tokens.token`, `store_records.schema_id` | 764 |
+| `store_records.rkey` / `value` | 2048 / 512 |
+| `api_keys.generation_hash`, `usage_metering.pricing_version` | 128 / 64 |
+
+## Versioning
+
+This is v1.6.0, built against busbar 1.6.0 (pinned in `.busbar-ref`). The crates
+`busbar-store-mysql` and `busbar-store-mysql-plugin` carry the same version, and the database schema
+version this build creates is **12** (`store_meta.schema_version`).
+
+## Upgrading an existing database
+
+Upgrades are IN PLACE on boot, under a server-wide `GET_LOCK` named for the database: exactly one
+connection migrates, every other open waits (30 s) and is then refused naming the holder rather than
+serve a half-migrated schema. A migration marker (`store_meta.migrating_to`) makes a crashed migration
+resume on the next open. A database stamped with a NEWER schema than this build is refused.
+
+- From busbar 1.5.x's `store-mysql` plugin (schema v3): five nullable `api_keys` columns
+  (`allowed_scopes_ext`, `idp_subject`, `binding_mode`, `minted_by`, `idp_provider`),
+  `usage_metering.priced_from_ms` (default 0, and part of the metering key, so a rate-card change
+  inside a day opens a second cell) and the new tables; then v10 to v12 below.
+- v10 drops the tables of the deleted store slots and prunes `store_ops` to the rows of the three
+  op-id writes that remain.
+- v11 retypes every key and identity column to `VARBINARY` (types, not values).
+- v12 replaces `ck_cred_sigv4_recov` with `ck_cred_sigv4_secret` (a revoked sigv4 row may hold no
+  secret), scrubs the secret of every already-revoked credential, and drops `fk_metering_key`.
+  No row is deleted.
 
 ## Config
 
-Configured under the `mysql` module name. The only setting is `url`; any other key is refused
-(`invalid mysql plugin config: unknown setting ... (accepted: url)`), as is a non-string `url`.
+Configured under the `mysql` module name. Every settings refusal starts
+`invalid mysql plugin config: `.
+
+| setting | type | default | meaning |
+|---|---|---|---|
+| `url` | string | none (required) | `mysql://user:pass@host:3306/db`, or `socket=` for a unix socket; accepts `{env:}`/`{file:}` references |
+
+Any other key is refused (`unknown setting `k` (accepted: url)`); a settings value that is not a
+JSON object, or a `url` that is not a string, is refused naming the JSON type it is (never its
+value). A server that cannot be reached fails the load as `mysql store: failed to connect: ...`.
 
 URL parameters honoured: `user`, `password`, `host`, `port`, `socket`, `db_name`, `compress`,
 `secure_auth`, `enable_cleartext_plugin`, `tcp_connect_timeout_ms`, `max_allowed_packet`.
@@ -122,10 +174,12 @@ docker run -d -p 3306:3306 \
 BUSBAR_TEST_MYSQL_URL=mysql://busbar:busbar@127.0.0.1:3306/busbar_test cargo test
 ```
 
-Most tests skip cleanly when `BUSBAR_TEST_MYSQL_URL` is unset locally. The trust-state cases (MCP
-demotions and the single-use token ledger, in-crate and over the plugin ABI) deliberately FAIL
-instead, because their unimplemented form is silently green. CI always sets the URL via the
-`mysql:8` service container in the shared `plugin-ci.yml` workflow.
+The tests read the server from `BUSBAR_TEST_MYSQL_URL`. Policy: locally, with the variable unset,
+most tests skip cleanly; in CI (`CI` set) an unset variable FAILS the run, and the trust-state cases
+(MCP demotions and the single-use token ledger, in-crate and over the plugin ABI) fail even locally,
+because their unimplemented form is silently green. CI always sets the URL via the `mysql:8` service
+container in the shared `plugin-ci.yml` workflow. The migration tests also need the server's `root`
+account (`BUSBAR_TEST_MYSQL_ROOT_PASSWORD`, default `busbar`).
 
 ### Status
 
