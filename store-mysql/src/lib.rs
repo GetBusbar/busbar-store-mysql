@@ -2818,8 +2818,6 @@ impl MysqlStore {
         expires_at: u64,
         now: u64,
     ) -> RecordStoreResult<bool> {
-        storable_i64("redeem_plane_token", "expires_at", expires_at)?;
-        storable_i64("redeem_plane_token", "now", now)?;
         // THE EVICTION SWEEP the redemption carries (its OWN kind's lapsed entries), so the ledger
         // is bounded by one validity window rather than growing forever: an entry recording a token that can no longer be
         // presented protects nothing. STRICTLY less-than, so an entry expiring exactly at `now` is
