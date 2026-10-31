@@ -1297,14 +1297,24 @@ const KEY_COLUMNS: &str = "id, generation_hash, name, allowed_pools, allowed_sco
      enabled, created_at, key_group, expires_at, deleted_at, revision, idp_subject, binding_mode, \
      minted_by, idp_provider";
 
-const KEY_INSERT: &str = "INSERT INTO api_keys
+/// The key write: a new id inserts, an existing one has every field but the id and its creation
+/// time replaced.
+const KEY_UPSERT: &str = "INSERT INTO api_keys
     (id, name, key_group, allowed_pools, allowed_scopes_ext, labels, enabled, generation_hash,
      created_at, updated_at, expires_at, deleted_at, revision, idp_subject, binding_mode, minted_by,
      idp_provider)
     VALUES (:id, :name, :key_group, :pools, :ext, :labels, :enabled, :gen, :created, :updated,
-     :expires, :deleted, :rev, :idp, :binding, :minted_by, :idp_provider)";
+     :expires, :deleted, :rev, :idp, :binding, :minted_by, :idp_provider)
+    ON DUPLICATE KEY UPDATE
+     name = VALUES(name), key_group = VALUES(key_group), allowed_pools = VALUES(allowed_pools),
+     allowed_scopes_ext = VALUES(allowed_scopes_ext),
+     labels = VALUES(labels), enabled = VALUES(enabled), generation_hash = VALUES(generation_hash),
+     updated_at = VALUES(updated_at), expires_at = VALUES(expires_at),
+     deleted_at = VALUES(deleted_at), revision = VALUES(revision),
+     idp_subject = VALUES(idp_subject), binding_mode = VALUES(binding_mode),
+     minted_by = VALUES(minted_by), idp_provider = VALUES(idp_provider)";
 
-/// `KEY_INSERT`'s parameters: `key` at revision `rev`, its tombstone `deleted`.
+/// `KEY_UPSERT`'s parameters: `key` at revision `rev`, its tombstone `deleted`.
 fn key_params(key: &VirtualKey, deleted: Option<u64>, rev: u64) -> RecordStoreResult<Params> {
     let (pools_json, ext_json) = partition_scopes(&key.allowed_scopes)?;
     let labels_json = serde_json::to_string(&key.labels).map_err(store_err)?;
@@ -1857,21 +1867,9 @@ impl MysqlStore {
             }
         }
 
-        tx.exec_drop(
-            format!(
-                "{KEY_INSERT} ON DUPLICATE KEY UPDATE
-                name = VALUES(name), key_group = VALUES(key_group), allowed_pools = VALUES(allowed_pools),
-                allowed_scopes_ext = VALUES(allowed_scopes_ext),
-                labels = VALUES(labels), enabled = VALUES(enabled), generation_hash = VALUES(generation_hash),
-                updated_at = VALUES(updated_at), expires_at = VALUES(expires_at),
-                deleted_at = VALUES(deleted_at), revision = VALUES(revision),
-                idp_subject = VALUES(idp_subject), binding_mode = VALUES(binding_mode),
-                minted_by = VALUES(minted_by), idp_provider = VALUES(idp_provider)"
-            ),
-            key_params(key, key.deleted_at, rev)?,
-        )
-        .await
-        .map_err(store_err)?;
+        tx.exec_drop(KEY_UPSERT, key_params(key, key.deleted_at, rev)?)
+            .await
+            .map_err(store_err)?;
 
         tx.commit().await.map_err(store_err)
     }
@@ -2283,12 +2281,40 @@ impl MysqlStore {
         key: &VirtualKey,
         secret: &CredentialSecret,
     ) -> RecordStoreResult<()> {
+        const OP: &str = "put_key_with_credential";
+        // Everything that needs no read is refused before a transaction opens.
+        if key.deleted_at.is_some() {
+            return Err(store_err(format!(
+                "{OP}: key '{}' is tombstoned; a credential is never minted onto it",
+                key.id
+            )));
+        }
+        if secret.meta.key_id != key.id {
+            return Err(store_err(format!(
+                "{OP}: the credential names key '{}', not the key '{}' being minted with it",
+                secret.meta.key_id, key.id
+            )));
+        }
         let mut tx = conn.start_transaction().await.map_err(store_err)?;
         let rev = Self::bump_revision(&mut tx).await?;
-        tx.exec_drop(KEY_INSERT, key_params(key, None, rev)?)
+        let stored: Option<(Option<u64>,)> = tx
+            .exec_first(
+                "SELECT deleted_at FROM api_keys WHERE id = :id FOR UPDATE",
+                params! { "id" => &key.id },
+            )
             .await
             .map_err(store_err)?;
-        if let Err(e) = write_credential(&mut tx, "put_key_with_credential", secret, rev).await {
+        if let Some((Some(_),)) = stored {
+            tx.rollback().await.map_err(store_err)?;
+            return Err(store_err(format!(
+                "{OP}: '{}' is tombstoned and its id is never reissued",
+                key.id
+            )));
+        }
+        tx.exec_drop(KEY_UPSERT, key_params(key, None, rev)?)
+            .await
+            .map_err(store_err)?;
+        if let Err(e) = write_credential(&mut tx, OP, secret, rev).await {
             tx.rollback().await.map_err(store_err)?;
             return Err(e);
         }
