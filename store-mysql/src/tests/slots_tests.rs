@@ -1020,3 +1020,58 @@ fn put_usage_survives_a_gap_lock_deadlock_with_a_first_write() {
     result.expect("put_usage is retried after losing the deadlock");
     assert_eq!(s.get_usage(&bucket, 60).expect("read").requests, 7);
 }
+
+/// TB1 (S4): one op in `OPS_SWEEP_EVERY` sweeps dedupe rows older than the retention window; rows
+/// inside it survive, and so do the op's own row and an old row's neighbours it is not entitled to.
+#[test]
+fn the_ops_sweep_drops_aged_dedupe_rows_and_keeps_fresh_ones() {
+    use busbar_contract::abi::store::OP_ID_RETENTION_SECS;
+    let Some(s) = fresh_store() else { return };
+    let mut c = s.conn().expect("conn");
+    let now: u64 = c
+        .query_first("SELECT UNIX_TIMESTAMP()")
+        .expect("now")
+        .expect("a row");
+    let node = ulid::Ulid::new().random() as u64 | 1;
+    let seed = |counter: u64, at: u64, c: &mut mysql::PooledConn| {
+        let id = OpId::from_parts(node, counter);
+        c.exec_drop(
+            "INSERT INTO store_ops (op_id, recorded_at, body, answer) VALUES (?, ?, 'x', 'null')",
+            (&id.0[..], at),
+        )
+        .expect("seed");
+        id
+    };
+    let aged = seed(3, now - OP_ID_RETENTION_SECS - 100, &mut c);
+    let ancient = seed(5, 1, &mut c);
+    let fresh = seed(7, now, &mut c);
+    let near_edge = seed(9, now - OP_ID_RETENTION_SECS + 600, &mut c);
+    let present = |id: OpId, c: &mut mysql::PooledConn| -> bool {
+        c.exec_first::<u8, _, _>("SELECT 1 FROM store_ops WHERE op_id = ?", (&id.0[..],))
+            .expect("read")
+            .is_some()
+    };
+    // An ordinary op does not sweep.
+    s.add_usage_op(op(40), &fresh_bucket(), 60, &UsageDelta::default())
+        .expect("applies");
+    assert!(present(aged, &mut c), "only the sweeping op sweeps");
+    // The op whose counter is a multiple of the cadence does.
+    let sweeper = OpId::from_parts(node, 256 * 4);
+    s.add_usage_op(sweeper, &fresh_bucket(), 60, &UsageDelta::default())
+        .expect("applies");
+    assert!(!present(aged, &mut c), "an aged row is swept");
+    assert!(!present(ancient, &mut c), "an ancient row is swept");
+    assert!(present(fresh, &mut c), "a fresh row survives");
+    assert!(
+        present(near_edge, &mut c),
+        "a row inside the window survives"
+    );
+    assert!(
+        present(sweeper, &mut c),
+        "the sweeping op's own row survives"
+    );
+}
+
+fn fresh_bucket() -> String {
+    fresh("sweep")
+}
