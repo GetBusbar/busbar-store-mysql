@@ -697,3 +697,25 @@ fn redeem_plane_token_sweeps_only_its_own_kind() {
         .unwrap();
     assert_eq!(swept, None);
 }
+
+/// TA12: a redemption at the top of the signed range stores and sweeps correctly. The kind is this
+/// test's own, so no other test's ledger rows can be swept by (or sweep) these.
+#[test]
+fn ta12_redeem_plane_token_near_i64_max_stores_and_sweeps_correctly() {
+    let Some(s) = fresh_store() else { return };
+    let kind = fresh("ta12");
+    let top = i64::MAX as u64;
+    assert!(s.redeem_plane_token(&kind, "high", top, 10).unwrap());
+    assert!(s.redeem_plane_token(&kind, "low", 50, 10).unwrap());
+    // now == i64::MAX: the entry expiring AT now is kept, the lapsed one is swept.
+    assert!(s.redeem_plane_token(&kind, "fresh", top, top).unwrap());
+    assert!(
+        !s.redeem_plane_token(&kind, "high", top, top).unwrap(),
+        "an entry expiring exactly at now is still spent"
+    );
+    assert!(
+        s.redeem_plane_token(&kind, "low", 50, 10).unwrap(),
+        "the lapsed entry was swept, so its token redeems afresh"
+    );
+    assert!(!s.redeem_plane_token(&kind, "fresh", top, 11).unwrap());
+}
