@@ -164,3 +164,84 @@ fn r4_re_putting_a_live_credential_with_different_content_is_refused() {
     assert!(err.to_string().contains(&want), "{err}");
     assert_eq!(stored(&s, &cred.meta.id).unwrap().secret, cred.secret);
 }
+
+#[test]
+fn r5_put_key_with_credential_refuses_a_key_carrying_deleted_at() {
+    let Some(s) = fresh_store() else { return };
+    let id = fresh("vk_r5_dead");
+    let mut key = sample_key(&id, "g");
+    key.enabled = false;
+    key.deleted_at = Some(5);
+    let err = s
+        .put_key_with_credential(&key, &sample_credential(&id, &fresh("AKIA"), 0))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains(&format!(
+            "put_key_with_credential: key '{id}' is tombstoned; a credential is never minted onto it"
+        )),
+        "{err}"
+    );
+    assert!(s.get_key(&id).unwrap().is_none(), "nothing was written");
+}
+
+#[test]
+fn r5_put_key_with_credential_refuses_a_stored_tombstone_at_that_id() {
+    let Some(s) = fresh_store() else { return };
+    let id = fresh("vk_r5_stone");
+    s.put_key(&sample_key(&id, "g")).unwrap();
+    s.delete_key(&id).unwrap();
+    let err = s
+        .put_key_with_credential(
+            &sample_key(&id, "g2"),
+            &sample_credential(&id, &fresh("AKIA"), 0),
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string().contains(&format!(
+            "put_key_with_credential: '{id}' is tombstoned and its id is never reissued"
+        )),
+        "{err}"
+    );
+    assert!(s.get_key(&id).unwrap().unwrap().deleted_at.is_some());
+    assert!(s.list_credentials(&id).unwrap().is_empty());
+}
+
+#[test]
+fn r5_put_key_with_credential_refuses_a_credential_of_another_key() {
+    let Some(s) = fresh_store() else { return };
+    let (id, other) = (fresh("vk_r5_own"), fresh("vk_r5_other"));
+    s.put_key(&sample_key(&other, "g")).unwrap();
+    let err = s
+        .put_key_with_credential(
+            &sample_key(&id, "g"),
+            &sample_credential(&other, &fresh("AKIA"), 0),
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string().contains(&format!(
+            "put_key_with_credential: the credential names key '{other}', not the key '{id}' \
+             being minted with it"
+        )),
+        "{err}"
+    );
+    assert!(s.get_key(&id).unwrap().is_none(), "nothing was written");
+    assert!(s.list_credentials(&other).unwrap().is_empty());
+}
+
+#[test]
+fn r5_put_key_with_credential_over_an_existing_live_key_id_upserts() {
+    let Some(s) = fresh_store() else { return };
+    let id = fresh("vk_r5_live");
+    s.put_key(&sample_key(&id, "g1")).unwrap();
+    let mut key = sample_key(&id, "g2");
+    key.name = "renamed".to_string();
+    let cred = sample_credential(&id, &fresh("AKIA"), 0);
+    s.put_key_with_credential(&key, &cred)
+        .expect("a live key id is upserted, as put_key does");
+    let got = s.get_key(&id).unwrap().unwrap();
+    assert_eq!(
+        (got.name.as_str(), got.generation_hash.as_str()),
+        ("renamed", "g2")
+    );
+    assert_eq!(s.list_credentials(&id).unwrap().len(), 1);
+}
