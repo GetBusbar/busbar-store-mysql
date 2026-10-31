@@ -253,7 +253,7 @@ fn put_get_roundtrips_a_key() {
 /// is 35 characters, wider than `CHAR(26)` (sized, incorrectly, for a 26-char ULID). A real mint
 /// against this schema failed with `MySqlError 1406: Data too long for column 'id'` -- reproduced
 /// directly against a live MySQL 8 container outside this crate's own suite before the fix. Widened
-/// `id`/`key_id`/`sub` to `VARCHAR(64)` for headroom against any future id-format change, not just
+/// `id`/`key_id`/`sub` (now byte-exact `VARBINARY(64)`) for headroom against any future id-format change, not just
 /// today's 35 chars.
 #[test]
 fn put_get_roundtrips_a_key_with_the_real_35_char_mint_format() {
@@ -689,7 +689,7 @@ fn add_metering_upserts_and_accumulates() {
     s.put_key(&sample_key("vk_meter", "g")).unwrap();
     let d = MeteringDelta {
         key_id: "vk_meter".to_string(),
-        // A bucket no other test uses: the purge tests wipe whole buckets.
+        // A bucket no other test uses.
         bucket: 20260915,
         model: "m".to_string(),
         provider: "p".to_string(),
@@ -2001,11 +2001,10 @@ fn a_replayed_call_is_idempotent_but_a_forked_one_is_refused() {
 }
 
 /// THE CROSS-PRINCIPAL READ. The identity column is half of the PRIMARY KEY and the only predicate
-/// a scoped read filters on, and this schema's default collation is `utf8mb4_0900_ai_ci` — case- AND
-/// accent-insensitive. Under that collation two key ids differing only in case are the SAME key: one
-/// principal's read hands back another principal's tool-call evidence, and the second principal's
-/// first append collides and is reported as a "fork" of a chain it never wrote. `utf8mb4_bin` on the
-/// key columns is what stops it.
+/// a scoped read filters on. Under a case-insensitive collation two key ids differing only in case
+/// would be the SAME key: one principal's read would hand back another principal's tool-call
+/// evidence, and the second principal's first append would collide and be reported as a "fork" of a
+/// chain it never wrote. The key columns are byte-exact `VARBINARY`, which is what stops it.
 #[test]
 fn principals_differing_only_in_case_are_distinct_chains() {
     let Some(url) = test_url() else { return };
@@ -2566,7 +2565,7 @@ fn the_plane_store_round_trips_the_full_u64_range() {
 }
 
 /// Two task ids differing only in CASE are two different tasks, and the primary key has to agree.
-/// Under this schema's default collation they compare EQUAL, so the second upsert would land on the
+/// Under a case-insensitive collation they would compare EQUAL, so the second upsert would land on the
 /// first one's row and one of the two tasks would simply be gone — silently, with the write
 /// reporting success.
 #[test]
@@ -3286,7 +3285,7 @@ fn metering_delta(key: &str, bucket: u64, priced_from_ms: u64) -> MeteringDelta 
 
 /// DECISION #79: `priced_from_ms` JOINS THE ACCRUAL KEY. A rate-card edit inside the UTC day opens
 /// a SECOND cell for that day, so each half keeps the card it was earned under; the same instant
-/// accumulates into one cell. Open units accumulate per cell, and the purge takes them with it.
+/// accumulates into one cell. Open units accumulate per cell.
 #[test]
 fn metering_cells_split_on_priced_from_ms_and_carry_open_units() {
     let Some(s) = fresh_store() else { return };
@@ -3942,7 +3941,7 @@ fn migrate_over_the_1_5_5_rows_is_idempotent() {
     assert_eq!(read_everything_1_5_5(&store), first);
 }
 
-// ── settings, redaction, newer schema, purge bucket: the alignment refusals ─────────────────────
+// ── settings, redaction, newer schema: the alignment refusals ──────────────────────────────────────
 
 /// `open`/`validate` judge the settings the same way, and every refusal is in the plugin's words.
 #[test]
@@ -4066,7 +4065,7 @@ fn a_pre_release_schema_is_refused_at_open() {
 // ── D19: store keys are EXACT ──────────────────────────────────────────────────────────────────
 
 /// D19, RED BEFORE GREEN: `'abc'` and `'abc '` are TWO keys, as they are in every other store
-/// (postgres, sqlite, valkey, memory). MySQL's `ascii_bin`/`utf8mb4_bin` collations are PAD SPACE,
+/// (postgres, sqlite, valkey, memory). MySQL's `ascii_bin`/`utf8mb4_bin` collations (v10's) are PAD SPACE,
 /// so under them the trailing space vanished from every comparison: a key minted as `'abc '`
 /// overwrote `'abc'`, a spent token's space-padded twin was refused as already spent, and a record
 /// schema read back another schema's rows. Each surface below writes both spellings and reads
