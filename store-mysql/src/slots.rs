@@ -28,7 +28,7 @@ use busbar_contract::abi::host::conn::connector::{
 use busbar_contract::abi::mechanism::call::{AbiStr, Blob, BLOB_ABSENT};
 use busbar_contract::abi::sdk::conn::Host;
 use busbar_contract::abi::sdk::door::abi_str;
-use busbar_contract::abi::sdk::store::column::prefix_end;
+use busbar_contract::abi::sdk::store::column::{prefix_end, storable_i64};
 use busbar_contract::abi::sdk::store::dedupe::{Body as DedupeBody, Dedupe};
 use busbar_contract::abi::sdk::store::wire::{drive_kept, Body};
 use busbar_contract::abi::sdk::store::{Op, OpRefused, OpResult, Scanned, Step, StoreSlots, Tail};
@@ -325,6 +325,12 @@ impl StoreSlots for MysqlStore {
         op: OpId,
         record: PlaneRecordRef<'_>,
     ) -> Step<OpResult<()>> {
+        // Refused before any write: the dedupe row included.
+        for (field, v) in [("seq", record.seq), ("ts", record.ts)] {
+            if let Err(e) = storable_i64("append_plane_record", field, v) {
+                return Step::Ready(Err(OpRefused::Refused(e.0)));
+            }
+        }
         let d = Dedupe::append(record);
         let (body, record) = (*d.body(), record.to_record());
         on_conn!(self, cx, backend, |c| deduped(
@@ -430,6 +436,11 @@ impl StoreSlots for MysqlStore {
         op: OpId,
         deltas: &[MeteringDelta],
     ) -> Step<OpResult<()>> {
+        for d in deltas {
+            if let Err(e) = storable_i64("add_metering_batch", "priced_from_ms", d.priced_from_ms) {
+                return Step::Ready(Err(OpRefused::Refused(e.0)));
+            }
+        }
         let d = Dedupe::metering(deltas);
         let (body, deltas) = (*d.body(), deltas.to_vec());
         on_conn!(self, cx, backend, |c| deduped(

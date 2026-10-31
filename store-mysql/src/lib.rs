@@ -22,6 +22,7 @@
 
 use std::sync::Arc;
 
+use busbar_contract::abi::sdk::store::column::storable_i64;
 use busbar_contract::abi::sdk::store::fork;
 use busbar_contract::abi::sdk::store::wire::Pool;
 use mysql_common::params;
@@ -2527,6 +2528,8 @@ impl MysqlStore {
         conn: &mut Conn,
         record: &PlaneRecord,
     ) -> RecordStoreResult<()> {
+        storable_i64("upsert_plane_record", "seq", record.seq)?;
+        storable_i64("upsert_plane_record", "ts", record.ts)?;
         // UPSERT by identity: a second write for one `(kind, id)` REPLACES the row -- the engine
         // writes a task through on every state transition, and the boot read must find one row per
         // id, holding the last state.
@@ -2793,6 +2796,8 @@ impl MysqlStore {
         expires_at: u64,
         now: u64,
     ) -> RecordStoreResult<bool> {
+        storable_i64("redeem_plane_token", "expires_at", expires_at)?;
+        storable_i64("redeem_plane_token", "now", now)?;
         // THE EVICTION SWEEP the redemption carries, so the ledger is bounded by one validity
         // window rather than growing forever: an entry recording a token that can no longer be
         // presented protects nothing. STRICTLY less-than, so an entry expiring exactly at `now` is
