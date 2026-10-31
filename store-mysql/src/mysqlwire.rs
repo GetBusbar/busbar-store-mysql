@@ -59,9 +59,46 @@ pub struct MySqlError {
     pub code: u16,
 }
 
+impl MySqlError {
+    /// The server's text with any stored or offered VALUE left out: a duplicate entry names the
+    /// key it hit (`duplicate credentials.uq_cred_public`), an incorrect-value error the column.
+    /// Every other error's text carries names and no values and is passed through.
+    pub(crate) fn rendered(&self) -> String {
+        match self.code {
+            // ER_DUP_ENTRY: `Duplicate entry '<value>' for key '<key>'`. The value is arbitrary
+            // text, so the key is read from the END of the message.
+            1062 => match self
+                .message
+                .strip_suffix('\'')
+                .and_then(|m| m.rfind('\'').map(|at| &m[at + 1..]))
+            {
+                Some(key) => format!("duplicate {key}"),
+                None => "duplicate key".to_owned(),
+            },
+            // ER_TRUNCATED_WRONG_VALUE / ER_TRUNCATED_WRONG_VALUE_FOR_FIELD:
+            // `Incorrect ... value: '<value>' for column '<column>' at row N`.
+            1292 | 1366 => match self.message.rfind(" for column ") {
+                Some(at) => {
+                    let column = &self.message[at + " for column ".len()..];
+                    let column = column.split(" at row ").next().unwrap_or(column);
+                    format!("invalid value for column {column}")
+                }
+                None => "invalid value".to_owned(),
+            },
+            _ => self.message.clone(),
+        }
+    }
+}
+
 impl fmt::Display for MySqlError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ERROR {} ({}): {}", self.code, self.state, self.message)
+        write!(
+            f,
+            "ERROR {} ({}): {}",
+            self.code,
+            self.state,
+            self.rendered()
+        )
     }
 }
 

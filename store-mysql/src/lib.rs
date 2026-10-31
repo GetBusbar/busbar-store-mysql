@@ -77,6 +77,17 @@ fn store_err<E: std::fmt::Display>(e: E) -> RecordStoreError {
     RecordStoreError(e.to_string())
 }
 
+/// A write's failure for the op named `op`: a duplicate key reads `<op>: duplicate <constraint>`
+/// (no value), every other error as [`store_err`] renders it.
+fn write_err(op: &str, e: Error) -> RecordStoreError {
+    match &e {
+        Error::MySqlError(m) if m.code == 1062 => {
+            RecordStoreError(format!("{op}: {}", m.rendered()))
+        }
+        _ => store_err(e),
+    }
+}
+
 /// Why an `op_id` write's effect failed: the text, and the server's error code when the server
 /// refused a statement (so the slot can tell a refusal from a failure without matching text).
 #[derive(Debug)]
@@ -1397,6 +1408,7 @@ fn key_params(key: &VirtualKey, deleted: Option<u64>, rev: u64) -> RecordStoreRe
 /// Insert `secret` as a new credential row at revision `rev`, in the caller's transaction.
 async fn insert_credential(
     tx: &mut Conn,
+    op: &str,
     secret: &CredentialSecret,
     rev: u64,
 ) -> RecordStoreResult<()> {
@@ -1416,7 +1428,7 @@ async fn insert_credential(
         },
     )
     .await
-    .map_err(store_err)
+    .map_err(|e| write_err(op, e))
 }
 
 /// Write `secret` as a credential row at revision `rev`, in the caller's transaction, for the op
@@ -1524,7 +1536,7 @@ async fn write_credential(
         .map_err(store_err)?;
         Ok(())
     } else {
-        insert_credential(tx, secret, rev).await
+        insert_credential(tx, op, secret, rev).await
     }
 }
 
