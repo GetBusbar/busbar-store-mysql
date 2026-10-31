@@ -2815,8 +2815,8 @@ impl MysqlStore {
     ) -> RecordStoreResult<bool> {
         storable_i64("redeem_plane_token", "expires_at", expires_at)?;
         storable_i64("redeem_plane_token", "now", now)?;
-        // THE EVICTION SWEEP the redemption carries, so the ledger is bounded by one validity
-        // window rather than growing forever: an entry recording a token that can no longer be
+        // THE EVICTION SWEEP the redemption carries (its OWN kind's lapsed entries), so the ledger
+        // is bounded by one validity window rather than growing forever: an entry recording a token that can no longer be
         // presented protects nothing. STRICTLY less-than, so an entry expiring exactly at `now` is
         // kept -- the boundary convention every retention method in this crate uses. It runs
         // BEFORE the insert, so it can never delete the row this very call is about to write.
@@ -2828,8 +2828,8 @@ impl MysqlStore {
         // independent, idempotent statement; a crash between the two leaves a ledger that is
         // correct and merely one sweep behind.
         conn.exec_drop(
-            "DELETE FROM plane_tokens WHERE expires_at < :now",
-            params! { "now" => now },
+            "DELETE FROM plane_tokens WHERE kind = :kind AND expires_at < :now",
+            params! { "kind" => kind, "now" => now },
         )
         .await
         .map_err(store_err)?;
