@@ -289,14 +289,18 @@ fn load_and_exercise_mysql_plugin_bad_config_fails_over_abi() {
 
     let err = load(
         &path,
-        &cfg("mysql://u:p@127.0.0.1:1/definitely_not_a_real_db"),
+        &cfg("mysql://u:CANARYpw9@127.0.0.1:1/definitely_not_a_real_db"),
     )
     .err()
     .expect("an unreachable mysql target must fail to load");
+    eprintln!("connect failure: {err}");
     assert!(
-        !err.is_empty(),
-        "expected the underlying mysql crate's own connect-failure message to survive the ABI \
-         crossing, got an empty error"
+        err.contains("Could not connect") && err.contains("127.0.0.1:1"),
+        "expected the driver's own connect-failure text to survive the ABI crossing, got: {err}"
+    );
+    assert!(
+        !err.contains("CANARYpw9"),
+        "the URL password must never reach the refusal: {err}"
     );
 }
 
