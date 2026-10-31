@@ -83,11 +83,15 @@ busbar_contract::statement_extensions!(EXTENSIONS: [
     (busbar_contract::abi::mechanism::extensions::EXT_REFERENCE_FIELDS, br#"["url"]"#),
 ]);
 
+/// The most ops in flight at once, as the door states it: one per kept connection and then some
+/// waiting on a free one.
+pub const MAX_INFLIGHT: u32 = 64;
+
 busbar_contract::store_door!(
     MysqlStore,
     NAME,
     env!("CARGO_PKG_VERSION"),
-    64,
+    MAX_INFLIGHT,
     needs: NEEDS,
     extensions: EXTENSIONS
 );
