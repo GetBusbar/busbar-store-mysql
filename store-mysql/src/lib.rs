@@ -1359,6 +1359,44 @@ async fn write_credential(
     rev: u64,
 ) -> RecordStoreResult<()> {
     let m = &secret.meta;
+    // The credential's own id first. A REVOKED row under it is never re-minted (its id was
+    // retired with its secret); a LIVE one in this very slot is a retry when the content is the
+    // same (nothing is written) and a conflict when it is not.
+    let own: Option<Row> = tx
+        .exec_first(
+            "SELECT id, key_id, kind, slot, public_id, secret_form, created_at, updated_at, \
+             expires_at, revoked_at, revoke_reason, revision, secret FROM credentials \
+             WHERE id = :id FOR UPDATE",
+            params! { "id" => &m.id },
+        )
+        .await
+        .map_err(store_err)?;
+    if let Some(mut row) = own {
+        let held: Option<String> = opt_col(&mut row, "secret")?;
+        let meta = MysqlStore::row_to_cred_meta(row)?;
+        if meta.revoked_at.is_some() {
+            return Err(store_err(format!(
+                "{op}: credential '{}' is revoked; a revoked credential is never re-minted",
+                m.id
+            )));
+        }
+        if (meta.key_id.as_str(), meta.kind.as_str(), meta.slot)
+            == (m.key_id.as_str(), m.kind.as_str(), m.slot)
+        {
+            let same_content = CredentialMeta {
+                revision: m.revision,
+                ..meta
+            } == *m
+                && held.unwrap_or_default() == secret.secret;
+            if same_content {
+                return Ok(());
+            }
+            return Err(store_err(format!(
+                "{op}: slot {} for key '{}' kind '{}' holds a live credential; revoke it first",
+                m.slot, m.key_id, m.kind
+            )));
+        }
+    }
     let occupied: Option<(Option<u64>,)> = tx
         .exec_first(
             "SELECT revoked_at FROM credentials \
