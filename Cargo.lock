@@ -418,13 +418,11 @@ dependencies = [
  "busbar-plugin-loader",
  "busbar-test-kit",
  "bytes",
- "flate2",
  "mysql",
  "mysql_common 0.35.5",
  "percent-encoding",
  "serde",
  "serde_json",
- "tracing",
  "ulid",
  "url",
 ]

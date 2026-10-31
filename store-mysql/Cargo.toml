@@ -28,16 +28,11 @@ busbar-contract = { workspace = true }
 # every parameter and column converts exactly as it did over the driver. `src/mysqlwire.rs` is the
 # driver's connection logic, every byte over the op's wire.
 mysql_common = { workspace = true }
-# The compressed protocol's deflate (`compress=` in the URL), pure Rust (busbar's own flate2 row).
-flate2 = { workspace = true }
 bytes = { workspace = true }
 # The 1.5.5 driver's URL reading (`mysql://...`): pure parsing, no socket.
 url = { workspace = true }
 percent-encoding = { workspace = true }
 serde_json = { workspace = true }
-# `reserve`'s `Unavailable` carries no text across the ABI: its reason is logged (the door captures
-# tracing into the plugin's own log).
-tracing = { workspace = true }
 [dev-dependencies]
 # The `Store` contract conformance suite used to arrive here as `busbar-plugin-testkit`; the owner
 # ruled that crate DELETED on 2026-09-22 and #2/#31 forbid a shared test util between plugins, so
