@@ -1226,7 +1226,8 @@ fn revoke_credential_rejects_an_unknown_id() {
         .revoke_credential("cred_does_not_exist_anywhere", "cleanup")
         .unwrap_err();
     assert!(
-        err.to_string().contains("unknown credential id"),
+        err.to_string()
+            .contains("revoke_credential: unknown id 'cred_does_not_exist_anywhere'"),
         "must name the real reason: {err}"
     );
 }
@@ -1251,13 +1252,11 @@ fn put_credential_rejects_a_public_id_collision_against_a_different_credential()
     let mut colliding = sample_credential("vk_pubcol_b", "AKIA_SHARED_PUBID", 0);
     colliding.meta.id = "cred_genuinely_different_id".to_string();
     let err = s.put_credential(&colliding).unwrap_err();
-    // A real MySQL duplicate-key rejection on `uq_cred_public` -- dropping the blanket
-    // `ON DUPLICATE KEY UPDATE` (see put_credential's own comment) means MySQL's own constraint
-    // now catches this collision directly, same as the PRIMARY KEY case below.
     assert!(
-        (err.to_string().contains("Duplicate entry") || err.to_string().contains("1062"))
-            && err.to_string().contains("uq_cred_public"),
-        "must be a real duplicate-key rejection on the public_id unique key: {err}"
+        err.to_string().contains(
+            "put_credential: public_id 'AKIA_SHARED_PUBID' is already in use for kind 'sigv4'"
+        ),
+        "must name the public_id clash in the family's words: {err}"
     );
 
     // The FIRST credential must be completely untouched by the rejected attempt.
@@ -4714,3 +4713,5 @@ fn purges_drain_more_than_one_batch_and_count_exactly() {
     .unwrap();
     clear_purge_band(&store);
 }
+
+mod align;
