@@ -3960,12 +3960,35 @@ fn settings_are_judged_strictly() {
     );
     assert_eq!(
         open(r#"{"url":5}"#).as_deref(),
-        Some("invalid mysql plugin config: `url` must be a string")
+        Some("invalid mysql plugin config: `url` must be a string, got a number")
     );
     assert_eq!(
         open(r#"{"url":null}"#).as_deref(),
-        Some("invalid mysql plugin config: `url` must be a string")
+        Some("invalid mysql plugin config: `url` must be a string, got null")
     );
+    assert_eq!(
+        open(r#"{"url":["mysql://u:s3cret@h/d"]}"#).as_deref(),
+        Some("invalid mysql plugin config: `url` must be a string, got an array"),
+        "a type error names the type and never the value"
+    );
+    for (settings, ty) in [
+        (r#""mysql://u:s3cret@h/d""#, "a string"),
+        ("[1]", "an array"),
+        ("7", "a number"),
+        ("true", "a boolean"),
+    ] {
+        assert_eq!(
+            open(settings).as_deref(),
+            Some(format!("invalid mysql plugin config: expected a JSON object, got {ty}").as_str())
+        );
+    }
+    for settings in ["", "{}", "null", r#"{"url":"  "}"#] {
+        assert_eq!(
+            open(settings).as_deref(),
+            Some("invalid mysql plugin config: requires a \"url\" (a mysql:// connection string)"),
+            "{settings:?}"
+        );
+    }
     let e = open(r#"{"url":"mysql://u@h/d?pool_max=5"}"#).unwrap();
     assert!(
         e.starts_with("invalid mysql plugin config: url: mysql store: URL parameter `pool_max`"),
