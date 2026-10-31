@@ -2630,14 +2630,18 @@ impl MysqlStore {
         // one the DELETE actually performed (`affected_rows`), never an estimate. WHICH rows go is
         // the rule the call carries, never one inferred from the kind's name.
         let terminal_only = retention == Retention::TerminalOnly;
-        if terminal_only && kind == KIND_TASK {
-            return Self::purge_terminal_tasks(conn, before).await;
+        // A purged task takes its event chain with it, under either retention.
+        let mut total = 0u64;
+        if kind == KIND_TASK {
+            total = Self::purge_tasks(conn, before, terminal_only).await?;
+            if terminal_only {
+                return Ok(total);
+            }
         }
         // Every other kind: a batch of primary keys is read (no locks), then deleted by primary
         // key with the predicate re-checked, so concurrent writers and sweeps take record locks
         // only and never deadlock on each other's ranges. Terminal-only keeps an ACTIVE row (the
         // typed `terminal` column, never the body). Looped until the backlog is gone.
-        let mut total = 0u64;
         loop {
             let terminal = if terminal_only { " AND terminal" } else { "" };
             let keys: Vec<(Vec<u8>, u64)> = conn
@@ -2683,19 +2687,25 @@ impl MysqlStore {
     /// (The statements that lock by primary key carry an `INDEX(.. PRIMARY)` hint: left to itself the
     /// optimizer can pick the `(kind, ts)` index and lock its range, which is what this avoids.)
     ///
-    /// The terminal `task` rows strictly older than `before`, each with its `task_event` chain, in
-    /// batches: an interrupted task waiting on a human must survive. A batch's candidates come
+    /// The `task` rows strictly older than `before` (the TERMINAL ones only when `terminal_only`),
+    /// each with its `task_event` chain, in batches: an interrupted task waiting on a human must
+    /// survive a terminal-only sweep. A batch's candidates come
     /// from a non-locking read; the transaction then locks them by primary key with the predicate
     /// re-checked (a concurrent sweep may have taken some) and deletes those, so concurrent sweeps
     /// take record locks only. Returns the tasks removed.
-    async fn purge_terminal_tasks(conn: &mut Conn, before: u64) -> RecordStoreResult<u64> {
+    async fn purge_tasks(
+        conn: &mut Conn,
+        before: u64,
+        terminal_only: bool,
+    ) -> RecordStoreResult<u64> {
+        let terminal = if terminal_only { " AND terminal" } else { "" };
         let mut removed = 0u64;
         loop {
             let candidates: Vec<Vec<u8>> = conn
                 .exec(
                     format!(
                         "SELECT ident FROM plane_records WHERE kind = :kind AND seq = :seq \
-                         AND ts < :before AND terminal ORDER BY ident LIMIT {PURGE_BATCH}"
+                         AND ts < :before{terminal} ORDER BY ident LIMIT {PURGE_BATCH}"
                     ),
                     params! { "kind" => KIND_TASK, "before" => before, "seq" => UPSERT_SEQ },
                 )
@@ -2714,7 +2724,7 @@ impl MysqlStore {
                     format!(
                         "SELECT /*+ INDEX(plane_records PRIMARY) */ ident FROM plane_records \
                          WHERE kind = ? AND seq = ? \
-                         AND ident IN ({marks}) AND ts < ? AND terminal FOR UPDATE"
+                         AND ident IN ({marks}) AND ts < ?{terminal} FOR UPDATE"
                     ),
                     Params::Positional(args),
                 )
@@ -2757,12 +2767,23 @@ impl MysqlStore {
         // agrees with the approval rather than tracking whether it had demoted, so the common call
         // is one against no row at all. Every `seq` under the identity goes, so deleting a parent's
         // record can never leave part of a chain behind.
-        conn.exec_drop(
+        // A task's event chain is deleted with it.
+        let mut tx = conn.start_transaction().await.map_err(store_err)?;
+        if kind == KIND_TASK {
+            tx.exec_drop(
+                "DELETE FROM plane_records WHERE kind = :kind AND ident = :id",
+                params! { "kind" => KIND_TASK_EVENT, "id" => id },
+            )
+            .await
+            .map_err(store_err)?;
+        }
+        tx.exec_drop(
             "DELETE FROM plane_records WHERE kind = :kind AND ident = :id",
             params! { "kind" => kind, "id" => id },
         )
         .await
-        .map_err(store_err)
+        .map_err(store_err)?;
+        tx.commit().await.map_err(store_err)
     }
 
     pub(crate) async fn redeem_plane_token(
