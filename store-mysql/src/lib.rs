@@ -1973,7 +1973,9 @@ impl MysqlStore {
 
     pub(crate) async fn list_keys(conn: &mut Conn) -> RecordStoreResult<Vec<VirtualKey>> {
         let rows: Vec<Row> = conn
-            .query(format!("SELECT {KEY_COLUMNS} FROM api_keys"))
+            .query(format!(
+                "SELECT {KEY_COLUMNS} FROM api_keys ORDER BY created_at, id"
+            ))
             .await
             .map_err(store_err)?;
         rows.into_iter().map(Self::row_to_key).collect()
@@ -1986,7 +1988,8 @@ impl MysqlStore {
         let rows: Vec<Row> = conn
             .exec(
                 format!(
-                    "SELECT {KEY_COLUMNS} FROM api_keys WHERE revision > :since OR revision = 0"
+                    "SELECT {KEY_COLUMNS} FROM api_keys WHERE revision > :since OR revision = 0 \
+                     ORDER BY revision, id"
                 ),
                 params! { "since" => since },
             )
@@ -2411,7 +2414,8 @@ impl MysqlStore {
         let rows: Vec<Row> = conn
             .exec(
                 "SELECT id, key_id, kind, slot, public_id, secret_form, created_at, updated_at, \
-                 expires_at, revoked_at, revoke_reason, revision FROM credentials WHERE key_id = :k",
+                 expires_at, revoked_at, revoke_reason, revision FROM credentials WHERE key_id = :k \
+                 ORDER BY kind, slot",
                 params! { "k" => key_id },
             ).await
             .map_err(store_err)?;
