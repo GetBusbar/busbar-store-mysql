@@ -138,13 +138,13 @@ impl Write {
     pub(crate) fn ordered(mut self) -> Self {
         match &mut self {
             Write::Usage(cells) => cells.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1))),
-            // The primary key's order.
+            // The primary key's order: `(key_id, bucket, model, provider, priced_from_ms)`.
             Write::Metering(ds) => ds.sort_by(|a, b| {
-                (a.bucket, &a.key_id, &a.provider, &a.model, a.priced_from_ms).cmp(&(
-                    b.bucket,
+                (&a.key_id, a.bucket, &a.model, &a.provider, a.priced_from_ms).cmp(&(
                     &b.key_id,
-                    &b.provider,
+                    b.bucket,
                     &b.model,
+                    &b.provider,
                     b.priced_from_ms,
                 ))
             }),
