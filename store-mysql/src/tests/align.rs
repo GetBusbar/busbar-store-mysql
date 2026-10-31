@@ -245,3 +245,134 @@ fn r5_put_key_with_credential_over_an_existing_live_key_id_upserts() {
     );
     assert_eq!(s.list_credentials(&id).unwrap().len(), 1);
 }
+
+/// `(secret IS NULL, secret_form, revoked_at, revoke_reason, revision)` of credential `id`, by raw SQL.
+fn raw_credential(s: &MysqlStore, id: &str) -> (bool, String, Option<u64>, Option<String>, u64) {
+    s.conn()
+        .unwrap()
+        .exec_first(
+            "SELECT secret IS NULL, secret_form, revoked_at, revoke_reason, revision \
+             FROM credentials WHERE id = :id",
+            params! { "id" => id },
+        )
+        .unwrap()
+        .expect("the credential row")
+}
+
+#[test]
+fn r7_revoke_destroys_the_secret_and_a_repeat_is_a_no_op() {
+    let (s, _key, cred) = seeded("vk_r7", 0);
+    let before = raw_credential(&s, &cred.meta.id);
+    assert!(!before.0, "a live credential holds its secret");
+    s.revoke_credential(&cred.meta.id, "leaked").unwrap();
+
+    let (null, form, revoked_at, reason, rev) = raw_credential(&s, &cred.meta.id);
+    assert!(null, "the secret column is NULL after a revoke");
+    assert_eq!(form, "none");
+    assert!(revoked_at.is_some());
+    assert_eq!(reason.as_deref(), Some("leaked"));
+    assert!(rev > before.4, "the revision is bumped");
+
+    let delta = stored(&s, &cred.meta.id).expect("the delta carries the revoked row");
+    assert_eq!(delta.secret, "");
+    assert_eq!(delta.meta.secret_form, SecretForm::None);
+    assert!(delta.meta.revoked_at.is_some());
+
+    s.revoke_credential(&cred.meta.id, "again").unwrap();
+    assert_eq!(
+        raw_credential(&s, &cred.meta.id),
+        (null, form, revoked_at, reason, rev),
+        "a repeat revoke changes nothing"
+    );
+}
+
+/// A v11 database: this build's schema with the v11 `ck_cred_sigv4_recov` check and the v11
+/// `fk_metering_key`, stamped 11, holding a revoked credential that still carries its secret.
+fn build_v11_database(db: &ScratchDb) -> String {
+    {
+        let _store = MysqlStore::connect(&db.url).expect("open");
+    }
+    let mut c = db.conn();
+    let checks: Vec<String> = c
+        .query(
+            "SELECT constraint_name FROM information_schema.table_constraints \
+             WHERE table_schema = DATABASE() AND table_name = 'credentials' \
+             AND constraint_type = 'CHECK' AND constraint_name LIKE 'ck_cred_sigv4%'",
+        )
+        .unwrap();
+    for name in checks {
+        if c.query_drop(format!("ALTER TABLE credentials DROP CHECK {name}"))
+            .is_err()
+        {
+            c.query_drop(format!("ALTER TABLE credentials DROP CONSTRAINT {name}"))
+                .unwrap();
+        }
+    }
+    c.query_drop(
+        "ALTER TABLE credentials ADD CONSTRAINT ck_cred_sigv4_recov \
+         CHECK (kind <> 'sigv4' OR secret_form = 'recoverable')",
+    )
+    .unwrap();
+    let fks: Vec<String> = c
+        .query(
+            "SELECT constraint_name FROM information_schema.table_constraints \
+             WHERE table_schema = DATABASE() AND table_name = 'usage_metering' \
+             AND constraint_type = 'FOREIGN KEY'",
+        )
+        .unwrap();
+    if fks.is_empty() {
+        c.query_drop(
+            "ALTER TABLE usage_metering ADD CONSTRAINT fk_metering_key \
+             FOREIGN KEY (key_id) REFERENCES api_keys(id) ON DELETE RESTRICT",
+        )
+        .unwrap();
+    }
+    let key = fresh("vk_v11");
+    c.query_drop(format!(
+        "INSERT INTO api_keys (id, name, labels, created_at, updated_at, revision) \
+         VALUES ('{key}', 'k', '{{}}', 1000, 1000, 3)"
+    ))
+    .unwrap();
+    for (id, public, revoked) in [
+        ("cred_v11_dead", "AKIA_V11_DEAD", "2000"),
+        ("cred_v11_live", "AKIA_V11_LIVE", "NULL"),
+    ] {
+        let slot = u8::from(revoked == "NULL");
+        c.query_drop(format!(
+            "INSERT INTO credentials (id, key_id, kind, slot, public_id, secret, secret_form, \
+             created_at, updated_at, revoked_at, revoke_reason, revision) VALUES ('{id}_{key}', \
+             '{key}', 'sigv4', {slot}, '{public}_{key}', 'v1:plain:old', 'recoverable', 1000, 1000, \
+             {revoked}, IF({revoked} IS NULL, NULL, 'old'), 4)"
+        ))
+        .unwrap();
+    }
+    c.query_drop("UPDATE store_meta SET v = '11' WHERE k = 'schema_version'")
+        .unwrap();
+    key
+}
+
+#[test]
+fn r7_the_schema_step_lets_a_v11_database_destroy_secrets_and_keeps_its_rows() {
+    let _ddl_guard = lock_fresh_database_ddl();
+    let Some(db) = ScratchDb::new("r7mig") else {
+        return;
+    };
+    let key = build_v11_database(&db);
+    let s = MysqlStore::connect(&db.url).expect("a v11 database opens and migrates");
+    assert_eq!(schema_version_of(&db), SCHEMA_VERSION.to_string());
+
+    let rows = s.list_credentials(&key).unwrap();
+    assert_eq!(rows.len(), 2, "no row is lost");
+    let dead = stored(&s, &format!("cred_v11_dead_{key}")).unwrap();
+    assert_eq!(dead.secret, "", "a revoked row's secret is scrubbed");
+    assert_eq!(dead.meta.secret_form, SecretForm::None);
+    assert_eq!(dead.meta.revoke_reason.as_deref(), Some("old"));
+
+    s.revoke_credential(&format!("cred_v11_live_{key}"), "now")
+        .expect("the migrated check lets a sigv4 credential lose its secret");
+    let live = stored(&s, &format!("cred_v11_live_{key}")).unwrap();
+    assert_eq!(live.secret, "");
+    drop(s);
+    let again = MysqlStore::connect(&db.url).expect("a second open");
+    assert_eq!(again.list_credentials(&key).unwrap().len(), 2);
+}
