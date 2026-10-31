@@ -144,6 +144,9 @@ fn cleanup_guard_removes_the_row_even_when_the_scope_holding_it_panics() {
             .as_nanos()
     );
 
+    // The schema is the store's to create: open it first, so the raw INSERT below never depends on
+    // an earlier test having done so.
+    drop(common::connect_linked(&url).expect("the store creates its schema"));
     let pool = mysql::Pool::new(mysql::Opts::from_url(&url).unwrap()).unwrap();
     let mut conn = pool.get_conn().unwrap();
     conn.exec_drop(

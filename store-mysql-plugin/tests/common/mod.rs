@@ -260,3 +260,29 @@ pub const E2E_RELEASE_PUBKEY: &str =
     "9209607c315f66473c8cca8bf9a7b8031115d01bb47341613cebf57f0e4f271c";
 pub const E2E_RELEASE_PRIVKEY: &str =
     "290f2453f236650ab21b85a95d49b9dab088518e829e4d524b01e441636ab327";
+
+/// Open the store through its COMPILED-IN door (`busbar_store_mysql::door`) on `url`, the way the
+/// host opens a store: the connect step creates the schema on an empty database. Dropping the
+/// handle closes the instance.
+pub fn connect_linked(url: &str) -> Result<busbar_plugin_loader::store_v3::LoadedStore, String> {
+    use busbar_plugin_loader::dispatch::kinds::store::Store;
+    use busbar_plugin_loader::dispatch::{
+        load_linked, Bind, ConnTable, DispatchConfig, Dispatcher, LinkedRow, NoSink,
+    };
+    use std::sync::Arc;
+    let dispatcher = Arc::new(Dispatcher::new(DispatchConfig::default()));
+    let conns: Arc<dyn busbar_contract::conn::DeclaredConns> = Arc::new(
+        busbar_test_kit::tcp_conns::TcpConns::new(dispatcher.conn_waker()),
+    );
+    let bind = Bind {
+        instance: Arc::from("store-mysql-common-direct"),
+        max_inflight_cap: 64,
+        sink: Arc::new(NoSink),
+        dispatcher: dispatcher.adopter(),
+        conns: ConnTable::Host(conns),
+    };
+    let row = LinkedRow::of(busbar_store_mysql::door).map_err(|e| e.to_string())?;
+    let plugin = load_linked::<Store>(&row, bind).map_err(|e| e.to_string())?;
+    let cfg = serde_json::json!({ "url": url }).to_string();
+    busbar_plugin_loader::store_v3::LoadedStore::open(plugin, dispatcher, cfg.as_bytes(), mint)
+}
