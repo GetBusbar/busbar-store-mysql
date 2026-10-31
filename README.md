@@ -40,8 +40,18 @@ Drop the built `.so`/`.dll`/`.dylib` into busbar's `plugins_dir`, or install it 
 - MySQL **>= 8.0.16** (older 8.x releases and Aurora MySQL 2.x parse `CHECK` constraints but do not
   enforce them — this plugin boot-probes for real enforcement and refuses to start if it's missing,
   rather than silently accepting unvalidated data), or MariaDB, or Aurora MySQL 3.x.
-- `sql_mode` must include `STRICT_ALL_TABLES` or `STRICT_TRANS_TABLES` — also boot-probed. Set it
-  server-wide (`SET GLOBAL sql_mode='STRICT_ALL_TABLES';`) before pointing busbar at the server.
+- `sql_mode`: the store appends `STRICT_ALL_TABLES` to every connection's session it opens (an
+  operator's other modes survive), so a truncating write errors instead of silently corrupting data
+  whatever the server default is; the boot probe then checks the session really is strict and refuses
+  to start if it is not. Setting it server-wide is no longer required.
+
+### Security: the network path to the server
+
+TLS is not supported by this store. With `mysql_native_password` the password is never sent in the
+clear, but with `caching_sha2_password` (the MySQL 8 default) a full authentication over plaintext TCP
+RSA-encrypts the password to the public key the SERVER sends, and that key is not authenticated: an
+attacker on the path can substitute their own key and recover the password. Use a trusted network or a
+`socket=` (unix socket) URL, or an account that authenticates with `mysql_native_password`.
 
 ### Design notes
 
@@ -50,9 +60,10 @@ Drop the built `.so`/`.dll`/`.dylib` into busbar's `plugins_dir`, or install it 
 - A single-row `store_sequence` revision counter is bumped FIRST in every control-plane transaction,
   before `api_keys`/`credentials`/`denylist` — a fixed lock order that makes deadlock across the
   admin plane structurally impossible.
-- `ascii_bin` collation on every opaque identifier column (credential lookup handles, key ids, group
-  names): MySQL's default collation is case-insensitive, which would be a real security-relevant
-  footgun for a credential handle. Byte-exact comparison, matching Postgres/SQLite's default.
+- Every opaque identifier column (credential lookup handles, key ids, group names, plane-record
+  identities, token and unit names) is `VARBINARY`: MySQL's default collation is case-insensitive and
+  its `_bin` collations are PAD SPACE, either a real security-relevant footgun for a credential
+  handle. Byte-exact comparison, matching Postgres/SQLite's default.
 - Every conditional mutation does an explicit `SELECT ... FOR UPDATE` existence/state check before
   acting — MySQL's `rows_affected()` reports rows *changed*, not rows *matched*, so an idempotent
   no-op can't be distinguished from "not found" by row count alone.
@@ -71,12 +82,14 @@ Drop the built `.so`/`.dll`/`.dylib` into busbar's `plugins_dir`, or install it 
   kernel's records). The store keeps ledger counts, not money: busbar derives money from the counts
   and its rate card. Schema v10 drops the tables a pre-release v8/v9 build created for the deleted
   store slots (`store_caps`, `store_slices`, `store_epoch`, `store_journal`, `store_sessions`) and
-  their op-id dedupe rows.
-- Upgrades are IN PLACE on boot. A database written by the 1.5.x plugin (v1.0.x, schema v3) gains
+  prunes `store_ops` to the rows of the three op-id writes that remain; schema v11 retypes every key
+  column to `VARBINARY` (exact keys).
+- Upgrades are IN PLACE on boot. A database written by busbar 1.5.x's `store-mysql` plugin (schema v3) gains
   five nullable `api_keys` columns (`allowed_scopes_ext`, `idp_subject`, `binding_mode`,
   `minted_by`, `idp_provider`), `usage_metering.priced_from_ms` (default 0, and part of the metering key, so a
-  rate-card change inside a day opens a second cell), and the new tables. No existing row is
-  dropped or rewritten.
+  rate-card change inside a day opens a second cell), and the new tables, and v10/v11 above run
+  after. No existing row is dropped or rewritten (v10's prune removes only dedupe rows of deleted
+  slots; v11 changes column types, not values).
 
 ## Config
 
