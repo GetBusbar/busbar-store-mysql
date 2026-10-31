@@ -668,3 +668,32 @@ fn r21_a_live_duplicate_names_the_op_and_the_constraint() {
     assert!(!text.contains("Duplicate entry"), "{text}");
     assert!(!text.contains(&cred.meta.id), "no stored value: {text}");
 }
+
+#[test]
+fn redeem_plane_token_sweeps_only_its_own_kind() {
+    let Some(s) = fresh_store() else { return };
+    let (a, b) = (fresh("sweep_a"), fresh("sweep_b"));
+    assert!(s.redeem_plane_token(&a, "t1", 100, 10).unwrap());
+    // Another kind redeems long after `a`'s entry lapsed: that entry is not its to sweep.
+    assert!(s.redeem_plane_token(&b, "x", 5_000, 1_000).unwrap());
+    let kept: Option<u64> = s
+        .conn()
+        .unwrap()
+        .exec_first(
+            "SELECT expires_at FROM plane_tokens WHERE kind = :k AND token = 't1'",
+            params! { "k" => &a },
+        )
+        .unwrap();
+    assert_eq!(kept, Some(100), "a redemption sweeps its own kind only");
+    // Its own kind's lapsed entry IS swept by its own redemption.
+    assert!(s.redeem_plane_token(&a, "t2", 5_000, 1_000).unwrap());
+    let swept: Option<u64> = s
+        .conn()
+        .unwrap()
+        .exec_first(
+            "SELECT expires_at FROM plane_tokens WHERE kind = :k AND token = 't1'",
+            params! { "k" => &a },
+        )
+        .unwrap();
+    assert_eq!(swept, None);
+}
