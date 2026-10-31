@@ -731,3 +731,60 @@ fn w4_a_connect_failure_is_one_prefix_then_the_driver_words() {
     );
     assert!(!e.contains("CANARYpw9"), "{e}");
 }
+
+#[test]
+fn w5_list_keys_orders_by_created_at_then_id() {
+    let Some(s) = fresh_store() else { return };
+    let p = fresh("vk_w5k");
+    for (suffix, created) in [("z", 500), ("b", 1000), ("a", 1000)] {
+        let mut k = sample_key(&format!("{p}_{suffix}"), "g");
+        k.created_at = created;
+        s.put_key(&k).unwrap();
+    }
+    let got: Vec<String> = s
+        .list_keys()
+        .unwrap()
+        .into_iter()
+        .map(|k| k.id)
+        .filter(|id| id.starts_with(&p))
+        .collect();
+    assert_eq!(got, [format!("{p}_z"), format!("{p}_a"), format!("{p}_b")]);
+}
+
+#[test]
+fn w5_list_keys_since_orders_by_revision() {
+    let Some(s) = fresh_store() else { return };
+    let p = fresh("vk_w5r");
+    for suffix in ["z", "m", "a"] {
+        s.put_key(&sample_key(&format!("{p}_{suffix}"), "g"))
+            .unwrap();
+    }
+    let got: Vec<String> = s
+        .list_keys_since(0)
+        .unwrap()
+        .into_iter()
+        .map(|k| k.id)
+        .filter(|id| id.starts_with(&p))
+        .collect();
+    assert_eq!(got, [format!("{p}_z"), format!("{p}_m"), format!("{p}_a")]);
+}
+
+#[test]
+fn w5_list_credentials_orders_by_kind_then_slot() {
+    let Some(s) = fresh_store() else { return };
+    let key = fresh("vk_w5c");
+    s.put_key(&sample_key(&key, "g")).unwrap();
+    let mut late = sample_credential(&key, &fresh("AKIA"), 1);
+    late.meta.id = fresh("cred_a");
+    let mut early = sample_credential(&key, &fresh("AKIA"), 0);
+    early.meta.id = fresh("cred_b");
+    s.put_credential(&late).unwrap();
+    s.put_credential(&early).unwrap();
+    let slots: Vec<u8> = s
+        .list_credentials(&key)
+        .unwrap()
+        .into_iter()
+        .map(|c| c.slot)
+        .collect();
+    assert_eq!(slots, [0, 1]);
+}
