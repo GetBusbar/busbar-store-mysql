@@ -611,3 +611,60 @@ fn r16_upsert_and_append_through_the_sync_bridge_name_the_field() {
     assert!(err.to_string().contains("upsert_plane_record: ts"), "{err}");
     assert!(get_task(&s, &t).is_none());
 }
+
+#[test]
+fn r21_a_duplicate_entry_is_rendered_naming_the_constraint_never_the_value() {
+    let e = server_error(
+        1062,
+        "23000",
+        "Duplicate entry 'SECRET_ID' for key 'credentials.uq_cred_public'",
+    );
+    let text = e.to_string();
+    assert!(!text.contains("SECRET_ID"), "{text}");
+    assert!(
+        text.contains("duplicate credentials.uq_cred_public"),
+        "{text}"
+    );
+    // A value that itself looks like the tail of the message does not confuse the constraint.
+    let tricky = server_error(
+        1062,
+        "23000",
+        "Duplicate entry 'x' for key 'fake' for key 'credentials.PRIMARY'",
+    )
+    .to_string();
+    assert!(tricky.contains("duplicate credentials.PRIMARY"), "{tricky}");
+    assert!(!tricky.contains("fake"), "{tricky}");
+}
+
+#[test]
+fn r21_an_incorrect_value_error_names_the_column_never_the_value() {
+    let text = server_error(
+        1292,
+        "22007",
+        "Incorrect integer value: 'TOP_SECRET' for column 'slot' at row 1",
+    )
+    .to_string();
+    assert!(!text.contains("TOP_SECRET"), "{text}");
+    assert!(text.contains("slot"), "{text}");
+    let text = server_error(
+        1366,
+        "HY000",
+        "Incorrect string value: '\\xF0\\x9F' for column 'name' at row 1",
+    )
+    .to_string();
+    assert!(!text.contains("xF0"), "{text}");
+    assert!(text.contains("name"), "{text}");
+}
+
+#[test]
+fn r21_a_live_duplicate_names_the_op_and_the_constraint() {
+    let (s, _key, cred) = seeded("vk_r21", 0);
+    let other = fresh("vk_r21_other");
+    s.put_key(&sample_key(&other, "g")).unwrap();
+    let mut clash = sample_credential(&other, &fresh("AKIA"), 1);
+    clash.meta.id = cred.meta.id.clone();
+    let text = s.put_credential(&clash).unwrap_err().to_string();
+    assert!(text.contains("put_credential: duplicate "), "{text}");
+    assert!(!text.contains("Duplicate entry"), "{text}");
+    assert!(!text.contains(&cred.meta.id), "no stored value: {text}");
+}

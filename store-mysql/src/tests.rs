@@ -1290,8 +1290,10 @@ fn put_credential_rejects_an_id_collision_against_a_different_key_or_slot() {
     // MySQL's own PRIMARY KEY constraint surfaces this now (a real 1062 duplicate-entry error),
     // since the INSERT path no longer silently upserts across an id collision.
     assert!(
-        err.to_string().contains("Duplicate entry") || err.to_string().contains("1062"),
-        "must be a real duplicate-key rejection, not a silent corruption: {err}"
+        err.to_string().contains("put_credential: duplicate ")
+            && err.to_string().contains("PRIMARY")
+            && !err.to_string().contains(&original.meta.id),
+        "must be a duplicate-key rejection naming the constraint, not the value: {err}"
     );
 
     // The ORIGINAL credential must be completely untouched.
