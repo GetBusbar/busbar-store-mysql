@@ -578,20 +578,25 @@ fn r16_metering_priced_from_ms_above_i64_max_is_refused_before_any_write() {
 }
 
 #[test]
-fn r16_redeem_with_expires_at_or_now_above_i64_max_is_refused() {
+fn r16_redeem_preserves_unsigned_expiry_and_clock_without_early_reuse() {
     let Some(s) = fresh_store() else { return };
     let (kind, token) = (fresh("r16_kind"), fresh("tok"));
-    let err = s.redeem_plane_token(&kind, &token, ABOVE, 10).unwrap_err();
+    assert!(s.redeem_plane_token(&kind, &token, ABOVE, 10).unwrap());
     assert!(
-        err.to_string().contains("redeem_plane_token: expires_at"),
-        "{err}"
+        !s.redeem_plane_token(&kind, &token, ABOVE, ABOVE).unwrap(),
+        "the token stays spent at its unsigned expiry"
     );
-    let err = s.redeem_plane_token(&kind, &token, 100, ABOVE).unwrap_err();
-    assert!(err.to_string().contains("redeem_plane_token: now"), "{err}");
     assert!(
-        s.redeem_plane_token(&kind, &token, 100, 10).unwrap(),
-        "the refusals spent nothing"
+        s.redeem_plane_token(&kind, &token, u64::MAX, ABOVE + 1)
+            .unwrap(),
+        "the token can be reused strictly after expiry on an unsigned clock"
     );
+    assert!(
+        !s.redeem_plane_token(&kind, &token, u64::MAX, u64::MAX)
+            .unwrap(),
+        "even the largest expiry does not permit duplicate redemption"
+    );
+    reset_tokens(&s, &kind, &[&token]);
 }
 
 #[test]
