@@ -4772,3 +4772,28 @@ fn purges_drain_more_than_one_batch_and_count_exactly() {
 }
 
 mod align;
+
+/// Token expiries use BIGINT UNSIGNED, including permanent node-identity claims.
+#[test]
+fn token_redemption_preserves_unsigned_expiry_and_clock_boundaries() {
+    let Some(store) = fresh_store() else { return };
+    let kind = trust_ns("unsigned_token_range");
+    for expiry in [i64::MAX as u64 + 1, u64::MAX - 1, u64::MAX] {
+        let token = trust_ns("unsigned_token");
+        assert!(store
+            .redeem_plane_token(&kind, &token, expiry, expiry - 1)
+            .unwrap());
+        assert!(!store
+            .redeem_plane_token(&kind, &token, expiry, expiry)
+            .unwrap());
+        if let Some(after) = expiry.checked_add(1) {
+            assert!(store
+                .redeem_plane_token(&kind, &token, u64::MAX, after)
+                .unwrap());
+            assert!(!store
+                .redeem_plane_token(&kind, &token, u64::MAX, after)
+                .unwrap());
+        }
+        reset_tokens(&store, &kind, &[&token]);
+    }
+}
