@@ -36,38 +36,6 @@ pub fn mint() -> busbar_contract::abi::store::OpId {
     )
 }
 
-/// Locate the cdylib THIS `cargo test` invocation just built — never a leftover artifact.
-///
-/// This looks ONLY in `target/<profile>/deps/`, never `target/<profile>/`, and that distinction is
-/// the whole point of this function.
-///
-/// `cargo` emits the lib target's cdylib into `deps/` as part of the very build graph that produces
-/// this test binary (this package's lib unit is compiled with BOTH declared crate-types — see
-/// `[lib] crate-type = ["cdylib", "rlib"]` in Cargo.toml), so `deps/libbusbar_store_mysql_plugin.dylib` is by construction up to
-/// date with the source tree under test. Cargo only *uplifts* a copy to `target/<profile>/` for
-/// `cargo build`, NEVER for `cargo test`. A lookup in `target/<profile>/` therefore reads an
-/// artifact that nothing in this test's dependency graph refreshes: whatever some earlier `cargo
-/// build` left there, from any commit — or nothing at all.
-///
-/// Both outcomes of that are lies about durability, and the second is the dangerous one:
-///   * NOTHING there  -> the old code `return`ed with a "skip:" line and reported GREEN. That is how
-///     `cargo test` can pass with ZERO over-the-ABI coverage of the durable store path.
-///   * STALE artifact -> a cdylib built before an ABI change answers every write `Ok(())` and every
-///     read empty, which is BYTE-FOR-BYTE the signature of the unrelayed-seam defect this file
-///     exists to catch (that defect was real: `DynStore`'s `impl Store` overrode 24 methods, none of
-///     them the task/call-log methods, so `put_task` took the accept-and-keep-nothing trait
-///     default). RED on a stale artifact is indistinguishable from RED on the real bug — and an
-///     artifact NEWER than a regression reports GREEN while the shipped ABI is broken. Proven, not
-///     theorised: with a regressed plugin in the tree and a good cdylib in `target/debug/`, the old
-///     lookup passed and this one fails.
-///
-/// Same hazard, and the same reasoning, as the engine's `crates/busbar/Cargo.toml` dev-dependency on
-/// `busbar-store-example-plugin`: keep the cdylib in the build graph so no test can judge a stale
-/// one. Here the plugin's lib IS this package, so that graph edge already exists — what was missing
-/// was reading the artifact that edge actually produces.
-///
-/// Panics rather than skipping: a missing cdylib under `cargo test` means the build graph changed
-/// shape, and the only honest report of that is a failure, not a silent pass.
 /// The newest mtime across every workspace crate's `src/` — "how fresh must a cdylib be to be the
 /// one this source tree describes".
 ///
@@ -118,6 +86,38 @@ pub fn newest_source_mtime_under(ws_root: &std::path::Path) -> std::time::System
     newest
 }
 
+/// Locate the cdylib THIS `cargo test` invocation just built — never a leftover artifact.
+///
+/// This looks ONLY in `target/<profile>/deps/`, never `target/<profile>/`, and that distinction is
+/// the whole point of this function.
+///
+/// `cargo` emits the lib target's cdylib into `deps/` as part of the very build graph that produces
+/// this test binary (this package's lib unit is compiled with BOTH declared crate-types — see
+/// `[lib] crate-type = ["cdylib", "rlib"]` in Cargo.toml), so `deps/libbusbar_store_mysql_plugin.dylib` is by construction up to
+/// date with the source tree under test. Cargo only *uplifts* a copy to `target/<profile>/` for
+/// `cargo build`, NEVER for `cargo test`. A lookup in `target/<profile>/` therefore reads an
+/// artifact that nothing in this test's dependency graph refreshes: whatever some earlier `cargo
+/// build` left there, from any commit — or nothing at all.
+///
+/// Both outcomes of that are lies about durability, and the second is the dangerous one:
+///   * NOTHING there  -> the old code `return`ed with a "skip:" line and reported GREEN. That is how
+///     `cargo test` can pass with ZERO over-the-ABI coverage of the durable store path.
+///   * STALE artifact -> a cdylib built before an ABI change answers every write `Ok(())` and every
+///     read empty, which is BYTE-FOR-BYTE the signature of the unrelayed-seam defect this file
+///     exists to catch (that defect was real: `DynStore`'s `impl Store` overrode 24 methods, none of
+///     them the task/call-log methods, so `put_task` took the accept-and-keep-nothing trait
+///     default). RED on a stale artifact is indistinguishable from RED on the real bug — and an
+///     artifact NEWER than a regression reports GREEN while the shipped ABI is broken. Proven, not
+///     theorised: with a regressed plugin in the tree and a good cdylib in `target/debug/`, the old
+///     lookup passed and this one fails.
+///
+/// Same hazard, and the same reasoning, as the engine's `crates/busbar/Cargo.toml` dev-dependency on
+/// `busbar-store-example-plugin`: keep the cdylib in the build graph so no test can judge a stale
+/// one. Here the plugin's lib IS this package, so that graph edge already exists — what was missing
+/// was reading the artifact that edge actually produces.
+///
+/// Panics rather than skipping: a missing cdylib under `cargo test` means the build graph changed
+/// shape, and the only honest report of that is a failure, not a silent pass.
 pub fn plugin_path() -> PathBuf {
     let exe = std::env::current_exe().expect("current_exe"); // .../target/<profile>/deps/<test>-<hash>
     let deps_dir = exe.parent().expect("the test binary always lives in deps/");

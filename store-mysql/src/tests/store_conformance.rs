@@ -16,12 +16,12 @@
 //! the ruled design, not an accident of the move — the cost #2 accepts in exchange for a plugin that
 //! can be built and tested with no sibling in the tree.
 //!
-//! WHICH VERSION: everything below this header is BYTE-IDENTICAL to busbar's own in-tree copy,
-//! `crates/store-example-plugin/src/tests/store_conformance.rs` at busbar predev `c5198d08e` (this
-//! repo's `.busbar-ref` pin) — the full current suite, including the checks added after the four
-//! this backend used to wire: `assert_put_credential_requires_a_live_key`,
-//! `assert_put_key_with_credential_is_atomic`, and the neutral plane-record battery. Every one is
-//! wired in `src/tests.rs` `mod conformance`.
+//! WHICH VERSION: copied from busbar's own in-tree copy,
+//! `crates/store-example-plugin/src/tests/store_conformance.rs` at busbar predev `c5198d08e`, the full
+//! suite as of then, including `assert_put_credential_requires_a_live_key`,
+//! `assert_put_key_with_credential_is_atomic`, and the neutral plane-record battery. That in-tree copy
+//! no longer exists at this repo's `.busbar-ref` pin, and this file is NOT kept byte-identical to it:
+//! this repo owns it and edits it in place. Every check is wired in `src/tests.rs` `mod conformance`.
 //!
 //! The "reaches every backend on its next dependency bump" promise in the doc below is therefore
 //! NO LONGER TRUE of this copy, and is left standing as the record of what the shared crate was for.
