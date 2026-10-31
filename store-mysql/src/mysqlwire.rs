@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The MySQL client protocol over the host's connector: the `mysql` driver's connection logic
-//! (`mysql` 26, the `minimal` build), every byte through the op's one connection ([`Wire`], the
+//! (`mysql` 28, the `minimal-rust` build), every byte through the op's one connection ([`Wire`], the
 //! store SDK's `wire`), so this store opens no socket of its own.
 //!
 //! The protocol itself is `mysql_common` 0.35.5, the sans-IO core that driver is built on: the
@@ -423,7 +423,10 @@ impl Opts {
                 "pool_min" | "pool_max" => {
                     return Err(not_supported(
                         key,
-                        "this store keeps 8 connections over the host's connector",
+                        &format!(
+                            "this store keeps {} connections over the host's connector",
+                            crate::KEPT_CONNECTIONS
+                        ),
                     ));
                 }
                 "user" => opts.user = Some(value.to_string()),
@@ -658,7 +661,7 @@ fn connect_attrs() -> HashMap<String, String> {
         .unwrap_or_default();
     let mut attrs = HashMap::new();
     attrs.insert("_client_name".into(), "rust-mysql-simple".into());
-    attrs.insert("_client_version".into(), "26.0.1".into());
+    attrs.insert("_client_version".into(), "28.0.4".into());
     attrs.insert("_os".into(), std::env::consts::OS.into());
     attrs.insert("_pid".into(), std::process::id().to_string());
     attrs.insert("_platform".into(), std::env::consts::ARCH.into());
