@@ -255,6 +255,13 @@ fn backend<D: std::fmt::Display>(e: D) -> OpRefused {
     OpRefused::Failed(e.to_string())
 }
 
+/// The connect step could not open its connection: one prefix, then the driver's words.
+fn connect_failure(e: Error) -> String {
+    format!("{NAME_PREFIX}: failed to connect: {e}")
+}
+
+const NAME_PREFIX: &str = "mysql store";
+
 /// A backend text (the slots that answer `Result<_, String>`).
 fn text(e: Error) -> String {
     e.to_string()
@@ -314,9 +321,11 @@ impl StoreSlots for MysqlStore {
     /// Reach the server, create the schema and run the probes (at the load), in the driver's words
     /// when it cannot.
     fn connect(&self, cx: &mut Op<'_>) -> Step<Result<(), String>> {
-        on_conn!(self, cx, text, |c| MysqlStore::connect_step(&mut c)
-            .await
-            .map_err(|e| c.scrub(e.0)))
+        on_conn!(self, cx, connect_failure, |c| MysqlStore::connect_step(
+            &mut c
+        )
+        .await
+        .map_err(|e| c.scrub(e.0)))
     }
 
     fn append_plane_record_op(
