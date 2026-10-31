@@ -109,7 +109,7 @@ fn apply_err(e: Error) -> ApplyError {
 /// `plane_tokens` and open usage units (`run_v7_*`); v8/v9 added the store v3 door's tables; v10
 /// dropped the deleted slots' tables (`run_v10_drop_dead_slot_tables`); v11 made every key exact
 /// (`run_v11_exact_keys`); v12 lets a revoked credential lose its secret
-/// (`run_v12_revoked_secrets`).
+/// and drops the metering foreign key (`run_v12_revoked_secrets`).
 const SCHEMA_VERSION: u32 = 12;
 
 /// The oldest schema a release shipped (v3): a database stamped older is refused.
@@ -207,20 +207,18 @@ const V11_EXACT_KEY_COLUMNS: &[(&str, &[(&str, &str)])] = &[
     ("store_records", &[("schema_id", "VARBINARY(764) NOT NULL")]),
 ];
 
-/// The foreign keys onto `api_keys.id`, `(table, constraint, definition)` exactly as `SCHEMA`
-/// declares them: v11 drops them to retype the columns they join and puts them back.
-const V11_KEY_FOREIGN_KEYS: &[(&str, &str, &str)] = &[
-    (
-        "credentials",
-        "fk_cred_key",
-        "FOREIGN KEY (key_id) REFERENCES api_keys(id) ON DELETE CASCADE",
-    ),
-    (
-        "usage_metering",
-        "fk_metering_key",
-        "FOREIGN KEY (key_id) REFERENCES api_keys(id) ON DELETE RESTRICT",
-    ),
-];
+/// The foreign key onto `api_keys.id`, `(table, constraint, definition)` exactly as `SCHEMA`
+/// declares it: v11 drops it to retype the columns it joins and puts it back.
+const V11_KEY_FOREIGN_KEYS: &[(&str, &str, &str)] = &[(
+    "credentials",
+    "fk_cred_key",
+    "FOREIGN KEY (key_id) REFERENCES api_keys(id) ON DELETE CASCADE",
+)];
+
+/// The foreign key from metering to keys that earlier builds declared and no build now does
+/// (metering is accepted for any key id): v11 drops it to retype `usage_metering.key_id`, v12 drops
+/// it from a database v11 left it in.
+const FK_METERING_KEY: (&str, &str) = ("usage_metering", "fk_metering_key");
 
 /// v11's child-to-parent re-spelling, run before any key is retyped (see `run_v11_exact_keys`):
 /// parents before children, so a metering unit takes its cell's spelling after the cell has taken
@@ -354,8 +352,7 @@ const SCHEMA: &[&str] = &[
         tokens_cache_read BIGINT UNSIGNED NOT NULL DEFAULT 0,
         tokens_cache_write BIGINT UNSIGNED NOT NULL DEFAULT 0,
         priced_from_ms BIGINT UNSIGNED NOT NULL DEFAULT 0,
-        PRIMARY KEY (key_id, bucket, model, provider, priced_from_ms),
-        CONSTRAINT fk_metering_key FOREIGN KEY (key_id) REFERENCES api_keys(id) ON DELETE RESTRICT
+        PRIMARY KEY (key_id, bucket, model, provider, priced_from_ms)
     ) ENGINE=InnoDB",
     "CREATE INDEX idx_metering_bucket ON usage_metering (bucket)",
     "CREATE TABLE IF NOT EXISTS audit_log (
@@ -780,16 +777,9 @@ impl MysqlStore {
                 })?;
             }
             for (table, constraint, _) in V11_KEY_FOREIGN_KEYS {
-                if Self::foreign_key_exists(conn, table, constraint).await? {
-                    conn.query_drop(format!("ALTER TABLE {table} DROP FOREIGN KEY {constraint}"))
-                        .await
-                        .map_err(|e| {
-                            store_err(format!(
-                                "schema upgrade v11 failed dropping {table}.{constraint}: {e}"
-                            ))
-                        })?;
-                }
+                Self::drop_foreign_key(conn, table, constraint, "v11").await?;
             }
+            Self::drop_foreign_key(conn, FK_METERING_KEY.0, FK_METERING_KEY.1, "v11").await?;
             for (table, columns) in &pending {
                 let modify = columns
                     .iter()
@@ -857,7 +847,8 @@ impl MysqlStore {
              WHERE revoked_at IS NOT NULL AND (secret IS NOT NULL OR secret_form <> 'none')",
         )
         .await
-        .map_err(|e| fail("scrubbing revoked secrets", e))
+        .map_err(|e| fail("scrubbing revoked secrets", e))?;
+        Self::drop_foreign_key(conn, FK_METERING_KEY.0, FK_METERING_KEY.1, "v12").await
     }
 
     async fn check_exists(
@@ -868,6 +859,28 @@ impl MysqlStore {
         let cond = "table_name = :t AND constraint_name = :c AND constraint_type = 'CHECK'";
         let p = params! { "t" => table, "c" => constraint };
         Self::exists(conn, "table_constraints", cond, p).await
+    }
+
+    /// Drop `table`'s foreign key `constraint` if the database has it (`step` names the schema
+    /// step in a failure).
+    async fn drop_foreign_key(
+        conn: &mut Conn,
+        table: &str,
+        constraint: &str,
+        step: &str,
+    ) -> RecordStoreResult<()> {
+        if !Self::table_exists(conn, table).await?
+            || !Self::foreign_key_exists(conn, table, constraint).await?
+        {
+            return Ok(());
+        }
+        conn.query_drop(format!("ALTER TABLE {table} DROP FOREIGN KEY {constraint}"))
+            .await
+            .map_err(|e| {
+                store_err(format!(
+                    "schema upgrade {step} failed dropping {table}.{constraint}: {e}"
+                ))
+            })
     }
 
     async fn foreign_key_exists(
