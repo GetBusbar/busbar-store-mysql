@@ -4,6 +4,7 @@
 //! The store-kind family alignment rules (R*/W*) against a live MySQL.
 
 use super::*;
+use busbar_contract::records::MeteringDelta;
 
 /// A name no other test (or earlier run) uses.
 fn fresh(tag: &str) -> String {
@@ -375,4 +376,69 @@ fn r7_the_schema_step_lets_a_v11_database_destroy_secrets_and_keeps_its_rows() {
     drop(s);
     let again = MysqlStore::connect(&db.url).expect("a second open");
     assert_eq!(again.list_credentials(&key).unwrap().len(), 2);
+}
+
+/// A metering delta for `key_id` in `bucket`, with one request.
+fn meter(key_id: &str, bucket: u64) -> MeteringDelta {
+    MeteringDelta {
+        key_id: key_id.to_string(),
+        bucket,
+        model: "m".to_string(),
+        provider: "p".to_string(),
+        tokens_input: 3,
+        tokens_output: 2,
+        tokens_cache_read: 0,
+        tokens_cache_write: 0,
+        requests: 1,
+        billable_requests: 1,
+        key_group_at_use: String::new(),
+        pricing_version: "v1".to_string(),
+        priced_from_ms: 0,
+        usage_units: BTreeMap::new(),
+    }
+}
+
+/// A bucket no other test or run uses.
+fn fresh_bucket() -> u64 {
+    1_000_000_000 + (ulid::Ulid::new().random() as u64 % 8_000_000_000)
+}
+
+#[test]
+fn r22_metering_for_a_key_the_store_never_saw_is_accepted() {
+    let Some(s) = fresh_store() else { return };
+    let (key, bucket) = (fresh("vk_r22_never_put"), fresh_bucket());
+    s.add_metering(&meter(&key, bucket))
+        .expect("no foreign key from metering to keys");
+    let rows = s.list_metering(bucket).unwrap();
+    assert!(rows.iter().any(|r| r.key_id == key && r.requests == 1));
+}
+
+#[test]
+fn r22_the_schema_step_drops_fk_metering_key_and_keeps_the_rows() {
+    let _ddl_guard = lock_fresh_database_ddl();
+    let Some(db) = ScratchDb::new("r22mig") else {
+        return;
+    };
+    let key = build_v11_database(&db);
+    let bucket = fresh_bucket();
+    db.conn()
+        .query_drop(format!(
+            "INSERT INTO usage_metering (bucket, key_id, provider, model, requests) \
+             VALUES ('{bucket:010}', '{key}', 'p', 'm', 5)"
+        ))
+        .unwrap();
+    let s = MysqlStore::connect(&db.url).expect("a v11 database opens and migrates");
+    let fks: Vec<String> = db
+        .conn()
+        .query(
+            "SELECT constraint_name FROM information_schema.table_constraints \
+             WHERE table_schema = DATABASE() AND table_name = 'usage_metering' \
+             AND constraint_type = 'FOREIGN KEY'",
+        )
+        .unwrap();
+    assert!(fks.is_empty(), "fk_metering_key is dropped: {fks:?}");
+    let rows = s.list_metering(bucket).unwrap();
+    assert!(rows.iter().any(|r| r.key_id == key && r.requests == 5));
+    s.add_metering(&meter(&fresh("vk_r22_mig_never"), bucket))
+        .expect("metering for any key id");
 }
