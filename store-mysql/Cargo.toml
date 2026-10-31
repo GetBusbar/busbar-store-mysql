@@ -28,6 +28,7 @@ busbar-contract = { workspace = true }
 # every parameter and column converts exactly as it did over the driver. `src/mysqlwire.rs` is the
 # driver's connection logic, every byte over the op's wire.
 mysql_common = { workspace = true }
+flate2 = { workspace = true }
 bytes = { workspace = true }
 # The 1.5.5 driver's URL reading (`mysql://...`): pure parsing, no socket.
 url = { workspace = true }
