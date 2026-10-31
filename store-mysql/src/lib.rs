@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 
-use busbar_contract::abi::sdk::store::column::storable_i64;
+use busbar_contract::abi::sdk::store::column::{clamp, storable_i64};
 use busbar_contract::abi::sdk::store::fork;
 use busbar_contract::abi::sdk::store::wire::Pool;
 use mysql_common::params;
@@ -1621,17 +1621,22 @@ fn split_delta(d: i64) -> (u64, u64) {
     }
 }
 
+/// The family's counter ceiling, `i64::MAX`: a counter pins here, whatever the column could hold.
+const COUNTER_CEILING: &str = "9223372036854775807";
+
 /// SQL for `col` + a signed delta, over a `BIGINT UNSIGNED` column: floored at zero and pinned at
-/// `u64::MAX`, never wrapping and never an out-of-range error. `up` and `down` name the
-/// [`split_delta`] parameters.
+/// [`COUNTER_CEILING`], never wrapping and never an out-of-range error (a row an earlier build left
+/// above the ceiling counts as AT it). `up` and `down` name the [`split_delta`] parameters.
 fn sat_add(col: &str, up: &str, down: &str) -> String {
-    let floored = format!("(GREATEST({col}, :{down}) - :{down})");
-    format!("{floored} + LEAST(:{up}, 18446744073709551615 - {floored})")
+    let held = format!("LEAST((GREATEST({col}, :{down}) - :{down}), {COUNTER_CEILING})");
+    format!("{held} + LEAST(:{up}, {COUNTER_CEILING} - {held})")
 }
 
-/// SQL for `col` + the inserted row's `col`, pinned at `u64::MAX` instead of erroring.
+/// SQL for `col` + the inserted row's `col`, pinned at [`COUNTER_CEILING`] instead of erroring.
+/// The inserted values are bound through [`clamp`], so they are at most the ceiling themselves.
 fn sat_values(col: &str) -> String {
-    format!("{col} + LEAST(VALUES({col}), 18446744073709551615 - {col})")
+    let held = format!("LEAST({col}, {COUNTER_CEILING})");
+    format!("{held} + LEAST(VALUES({col}), {COUNTER_CEILING} - {held})")
 }
 
 fn is_reserved_unit(k: &str) -> bool {
@@ -1806,9 +1811,9 @@ impl MysqlStore {
                 "bucket" => &bucket, "key" => &delta.key_id, "provider" => &delta.provider,
                 "model" => &delta.model, "grp" => &delta.key_group_at_use, "pv" => &delta.pricing_version,
                 "pfm" => delta.priced_from_ms,
-                "req" => delta.requests, "breq" => delta.billable_requests,
-                "ti" => delta.tokens_input, "to_" => delta.tokens_output,
-                "cr" => delta.tokens_cache_read, "cw" => delta.tokens_cache_write,
+                "req" => clamp(delta.requests), "breq" => clamp(delta.billable_requests),
+                "ti" => clamp(delta.tokens_input), "to_" => clamp(delta.tokens_output),
+                "cr" => clamp(delta.tokens_cache_read), "cw" => clamp(delta.tokens_cache_write),
             },
         ).await
         .map_err(apply_err)?;
@@ -1822,7 +1827,7 @@ impl MysqlStore {
                  ON DUPLICATE KEY UPDATE count = {}", sat_values("count")),
                 params! {
                     "bucket" => &bucket, "key" => &delta.key_id, "provider" => &delta.provider,
-                    "model" => &delta.model, "pfm" => delta.priced_from_ms, "unit" => unit, "n" => *n,
+                    "model" => &delta.model, "pfm" => delta.priced_from_ms, "unit" => unit, "n" => clamp(*n),
                 },
             ).await
             .map_err(apply_err)?;
@@ -2178,7 +2183,7 @@ impl MysqlStore {
                 requests = VALUES(requests), billable_requests = VALUES(billable_requests)",
             params! {
                 "w" => window_start, "b" => bucket_id,
-                "req" => ledger.requests, "breq" => ledger.billable_requests,
+                "req" => clamp(ledger.requests), "breq" => clamp(ledger.billable_requests),
             },
         )
         .await
@@ -2199,7 +2204,7 @@ impl MysqlStore {
                  VALUES (:w, 'key', :b, :model, :ti, :to_, :cr, :cw)",
                 params! {
                     "w" => window_start, "b" => bucket_id, "model" => &m.model,
-                    "ti" => ti, "to_" => to, "cr" => cr, "cw" => cw,
+                    "ti" => clamp(ti), "to_" => clamp(to), "cr" => clamp(cr), "cw" => clamp(cw),
                 },
             )
             .await
@@ -2212,7 +2217,7 @@ impl MysqlStore {
                      VALUES (:w, 'key', :b, :model, :unit, :n)",
                     params! {
                         "w" => window_start, "b" => bucket_id, "model" => &m.model,
-                        "unit" => unit, "n" => count,
+                        "unit" => unit, "n" => clamp(count),
                     },
                 )
                 .await
