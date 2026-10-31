@@ -1075,3 +1075,49 @@ fn the_ops_sweep_drops_aged_dedupe_rows_and_keeps_fresh_ones() {
 fn fresh_bucket() -> String {
     fresh("sweep")
 }
+
+/// TB2: the metering batch in its CURRENT body form (not the older `{:?}` one): a replay applies
+/// nothing and answers Ok, a changed body under the same `op_id` is a conflict that applies nothing.
+#[test]
+fn a_metering_op_id_replays_and_a_changed_body_conflicts() {
+    use busbar_contract::records::MeteringDelta;
+    let Some(s) = fresh_store() else { return };
+    let key = fresh("vk_meter_replay");
+    s.put_key(&sample_key(&key, "g")).expect("put_key");
+    let delta = |tokens: u64| MeteringDelta {
+        key_id: key.clone(),
+        bucket: 20_261_033,
+        model: "m".into(),
+        provider: "p".into(),
+        tokens_input: tokens,
+        tokens_output: 0,
+        tokens_cache_read: 0,
+        tokens_cache_write: 0,
+        requests: 1,
+        billable_requests: 1,
+        key_group_at_use: "g".into(),
+        pricing_version: "v1".into(),
+        priced_from_ms: 0,
+        usage_units: Default::default(),
+    };
+    let id = op(41);
+    s.add_metering_op(id, &[delta(10)]).expect("applies");
+    s.add_metering_op(id, &[delta(10)])
+        .expect("a replay answers Ok");
+    assert_eq!(
+        s.add_metering_op(id, &[delta(11)]),
+        Err(OpRefused::Conflict)
+    );
+    let rows: Vec<_> = s
+        .list_metering(20_261_033)
+        .expect("list_metering")
+        .into_iter()
+        .filter(|r| r.key_id == key)
+        .collect();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        (rows[0].tokens_input, rows[0].requests),
+        (10, 1),
+        "{rows:?}"
+    );
+}
