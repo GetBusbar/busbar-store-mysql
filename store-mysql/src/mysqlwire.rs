@@ -330,6 +330,9 @@ impl fmt::Debug for Opts {
     }
 }
 
+/// MySQL's smallest `max_allowed_packet` (1024 bytes).
+const MAX_PACKET_FLOOR: usize = 1024;
+
 /// MySQL's largest `max_allowed_packet` (1 GiB).
 const MAX_PACKET_CEILING: usize = 1 << 30;
 
@@ -512,10 +515,10 @@ impl Opts {
                 }
                 "max_allowed_packet" => {
                     let n: usize = value.parse().map_err(|_| invalid())?;
-                    if !(1..=MAX_PACKET_CEILING).contains(&n) {
+                    if !(MAX_PACKET_FLOOR..=MAX_PACKET_CEILING).contains(&n) {
                         return Err(UrlError::Refused(format!(
-                            "mysql store: URL parameter `max_allowed_packet` must be between 1 \
-                             and {MAX_PACKET_CEILING} bytes (MySQL's maximum)"
+                            "mysql store: URL parameter `max_allowed_packet` must be between \
+                             {MAX_PACKET_FLOOR} and {MAX_PACKET_CEILING} bytes (MySQL's range)"
                         )));
                     }
                     opts.max_allowed_packet = Some(n);
