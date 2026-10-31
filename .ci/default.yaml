@@ -203,6 +203,7 @@ env:
     # fixture plugin calling std::net::TcpStream::connect must fail it before its verdict is trusted.
     NET_BAN_SHA=d68d39cd409a60797b540bff42747bd67cc03879
     s_netban() {
+      (cd plugin && cargo fetch --locked -q)  # net-ban's `cargo tree --offline --target all` needs every target's crates
       nb="$W/busbar/scripts/fleet/net-ban.sh"
       if [ ! -f "$nb" ]; then
         git init -q "$W/netban" && git -C "$W/netban" remote add origin https://github.com/GetBusbar/busbar.git
