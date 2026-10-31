@@ -4548,12 +4548,38 @@ fn v11_respells_children_onto_their_parents_keys() {
     let n: u64 = db
         .conn()
         .query_first(
-            "SELECT COUNT(*) FROM information_schema.table_constraints \
-             WHERE table_schema = DATABASE() AND constraint_type = 'FOREIGN KEY'",
+            "SELECT COUNT(*) FROM information_schema.key_column_usage k \
+             JOIN information_schema.referential_constraints r \
+             ON r.constraint_schema = k.constraint_schema AND r.constraint_name = k.constraint_name \
+             WHERE k.table_schema = DATABASE() AND k.table_name = 'credentials' \
+             AND k.constraint_name = 'fk_cred_key' AND k.column_name = 'key_id' \
+             AND k.referenced_table_name = 'api_keys' AND k.referenced_column_name = 'id' \
+             AND r.delete_rule = 'CASCADE'",
         )
         .unwrap()
         .unwrap();
-    assert_eq!(n, 2, "both foreign keys onto api_keys.id are restored");
+    assert_eq!(
+        n, 1,
+        "the credential foreign key and its cascade are restored"
+    );
+    let metering: u64 = db
+        .conn()
+        .query_first(
+            "SELECT COUNT(*) FROM information_schema.table_constraints \
+             WHERE table_schema = DATABASE() AND table_name = 'usage_metering' \
+             AND constraint_type = 'FOREIGN KEY'",
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(metering, 0, "metering accepts keys without a live parent");
+    db.conn()
+        .query_drop("DELETE FROM api_keys WHERE id = 'abc'")
+        .unwrap();
+    assert!(store
+        .lookup_credential_secret("sigv4", "pad")
+        .unwrap()
+        .is_none());
+    assert_eq!(store.list_metering(20_991_231).unwrap().len(), 1);
 }
 
 /// UPSERT IS BY `(kind, id)` (the contract's `RecordStore::upsert_plane_record` /

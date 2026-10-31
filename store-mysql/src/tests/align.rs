@@ -725,10 +725,11 @@ fn w4_a_connect_failure_is_one_prefix_then_the_driver_words() {
     let e = MysqlStore::connect("mysql://u:CANARYpw9@127.0.0.1:1/definitely_not_a_real_db")
         .err()
         .expect("nothing listens on port 1");
-    assert!(
-        e.contains("mysql store: failed to connect: Could not connect"),
-        "{e}"
-    );
+    let prefix = "mysql store: failed to connect:";
+    assert_eq!(e.matches(prefix).count(), 1, "{e}");
+    let driver = e.split_once(prefix).expect("the store prefix").1;
+    assert!(driver.contains("Could not connect"), "{e}");
+    assert!(driver.contains("connection was refused"), "{e}");
     assert!(!e.contains("CANARYpw9"), "{e}");
 }
 
