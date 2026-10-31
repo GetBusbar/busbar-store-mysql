@@ -2662,7 +2662,8 @@ impl MysqlStore {
                 return Ok(total);
             }
         }
-        // Every other kind: a batch of primary keys is read (no locks), then deleted by primary
+        // Every other kind: a batch of primary keys is read (no locks; ordered by `(ts, ident, seq)`,
+        // which the `(kind, ts)` index already holds, so the scan stops at the LIMIT), then deleted by primary
         // key with the predicate re-checked, so concurrent writers and sweeps take record locks
         // only and never deadlock on each other's ranges. Terminal-only keeps an ACTIVE row (the
         // typed `terminal` column, never the body). Looped until the backlog is gone.
@@ -2673,7 +2674,7 @@ impl MysqlStore {
                     format!(
                         "SELECT ident, seq FROM plane_records \
                          WHERE kind = :kind AND ts < :before{terminal} \
-                         ORDER BY ident, seq LIMIT {PURGE_BATCH}"
+                         ORDER BY ts, ident, seq LIMIT {PURGE_BATCH}"
                     ),
                     params! { "kind" => kind, "before" => before },
                 )
@@ -2729,7 +2730,7 @@ impl MysqlStore {
                 .exec(
                     format!(
                         "SELECT ident FROM plane_records WHERE kind = :kind AND seq = :seq \
-                         AND ts < :before{terminal} ORDER BY ident LIMIT {PURGE_BATCH}"
+                         AND ts < :before{terminal} ORDER BY ts, ident LIMIT {PURGE_BATCH}"
                     ),
                     params! { "kind" => KIND_TASK, "before" => before, "seq" => UPSERT_SEQ },
                 )
