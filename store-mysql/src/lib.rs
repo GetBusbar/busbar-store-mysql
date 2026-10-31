@@ -108,8 +108,9 @@ fn apply_err(e: Error) -> ApplyError {
 /// v4..v6 never shipped (per-protocol tables); v7 is the neutral `plane_records` /
 /// `plane_tokens` and open usage units (`run_v7_*`); v8/v9 added the store v3 door's tables; v10
 /// dropped the deleted slots' tables (`run_v10_drop_dead_slot_tables`); v11 made every key exact
-/// (`run_v11_exact_keys`).
-const SCHEMA_VERSION: u32 = 11;
+/// (`run_v11_exact_keys`); v12 lets a revoked credential lose its secret
+/// (`run_v12_revoked_secrets`).
+const SCHEMA_VERSION: u32 = 12;
 
 /// The oldest schema a release shipped (v3): a database stamped older is refused.
 const FIRST_RELEASED_SCHEMA: u32 = 3;
@@ -122,6 +123,7 @@ const FIRST_RELEASED_SCHEMA: u32 = 3;
 const V7_PLANE_RECORDS: u32 = 7;
 const V10_DEAD_SLOTS: u32 = 10;
 const V11_EXACT_KEYS: u32 = 11;
+const V12_REVOKED_SECRETS: u32 = 12;
 
 /// Every key and identity column v11 makes byte-exact, per table, with the definition `SCHEMA`
 /// declares for it (a migrated database ends with exactly the columns a fresh one is created
@@ -308,7 +310,7 @@ const SCHEMA: &[&str] = &[
         CONSTRAINT ck_cred_slot CHECK (slot IN (0,1)),
         CONSTRAINT ck_cred_form CHECK (secret_form IN ('none','recoverable','digest')),
         CONSTRAINT ck_cred_form_null CHECK ((secret_form = 'none') = (secret IS NULL)),
-        CONSTRAINT ck_cred_sigv4_recov CHECK (kind <> 'sigv4' OR secret_form = 'recoverable'),
+        CONSTRAINT ck_cred_sigv4_secret CHECK (kind <> 'sigv4' OR secret_form = 'recoverable' OR revoked_at IS NOT NULL),
         CONSTRAINT uq_cred_public UNIQUE (kind, public_id),
         CONSTRAINT uq_cred_slot UNIQUE (key_id, kind, slot),
         CONSTRAINT fk_cred_key FOREIGN KEY (key_id) REFERENCES api_keys(id) ON DELETE CASCADE
@@ -821,6 +823,53 @@ impl MysqlStore {
         Ok(())
     }
 
+    /// v12 schema upgrade: a revoked credential's secret is destroyed (`revoke_credential`), which
+    /// v11's `ck_cred_sigv4_recov` forbids for a sigv4 row, so the check is replaced by
+    /// `ck_cred_sigv4_secret` (the same rule, unless the row is revoked), and the secrets of the
+    /// rows already revoked are scrubbed. Every row is kept. Each step is gated on what the
+    /// database has, so it converges after a crash.
+    pub(crate) async fn run_v12_revoked_secrets(conn: &mut Conn) -> RecordStoreResult<()> {
+        let fail =
+            |what: &str, e: Error| store_err(format!("schema upgrade v12 failed {what}: {e}"));
+        if Self::check_exists(conn, "credentials", "ck_cred_sigv4_recov").await? {
+            // MySQL 8.0.16+ spells it DROP CHECK (DROP CONSTRAINT from 8.0.19); MariaDB takes
+            // DROP CONSTRAINT.
+            if conn
+                .query_drop("ALTER TABLE credentials DROP CHECK ck_cred_sigv4_recov")
+                .await
+                .is_err()
+            {
+                conn.query_drop("ALTER TABLE credentials DROP CONSTRAINT ck_cred_sigv4_recov")
+                    .await
+                    .map_err(|e| fail("dropping credentials.ck_cred_sigv4_recov", e))?;
+            }
+        }
+        if !Self::check_exists(conn, "credentials", "ck_cred_sigv4_secret").await? {
+            conn.query_drop(
+                "ALTER TABLE credentials ADD CONSTRAINT ck_cred_sigv4_secret CHECK \
+                 (kind <> 'sigv4' OR secret_form = 'recoverable' OR revoked_at IS NOT NULL)",
+            )
+            .await
+            .map_err(|e| fail("adding credentials.ck_cred_sigv4_secret", e))?;
+        }
+        conn.query_drop(
+            "UPDATE credentials SET secret = NULL, secret_form = 'none' \
+             WHERE revoked_at IS NOT NULL AND (secret IS NOT NULL OR secret_form <> 'none')",
+        )
+        .await
+        .map_err(|e| fail("scrubbing revoked secrets", e))
+    }
+
+    async fn check_exists(
+        conn: &mut Conn,
+        table: &str,
+        constraint: &str,
+    ) -> RecordStoreResult<bool> {
+        let cond = "table_name = :t AND constraint_name = :c AND constraint_type = 'CHECK'";
+        let p = params! { "t" => table, "c" => constraint };
+        Self::exists(conn, "table_constraints", cond, p).await
+    }
+
     async fn foreign_key_exists(
         conn: &mut Conn,
         table: &str,
@@ -1068,6 +1117,9 @@ impl MysqlStore {
         Self::run_v10_drop_dead_slot_tables(conn, prior_version).await?;
         if prior_version < V11_EXACT_KEYS {
             Self::run_v11_exact_keys(conn).await?;
+        }
+        if prior_version < V12_REVOKED_SECRETS {
+            Self::run_v12_revoked_secrets(conn).await?;
         }
 
         Self::stamp_schema_version(conn, "store_meta").await?;
@@ -2355,17 +2407,24 @@ impl MysqlStore {
             )
             .await
             .map_err(store_err)?;
-        if existing.is_none() {
+        let Some((revoked_at,)) = existing else {
             tx.rollback().await.map_err(store_err)?;
             return Err(store_err(format!("revoke_credential: unknown id '{id}'")));
+        };
+        if revoked_at.is_some() {
+            // Already revoked: the first revoke's time, reason and revision stand.
+            tx.rollback().await.map_err(store_err)?;
+            return Ok(());
         }
 
+        // The secret goes with the revoke: it must not outlive its use.
         let now = crate_now();
         tx.exec_drop(
-            "UPDATE credentials SET revoked_at = :now, revoke_reason = :reason, updated_at = :now, \
-             revision = :rev WHERE id = :id AND revoked_at IS NULL",
+            "UPDATE credentials SET secret = NULL, secret_form = 'none', revoked_at = :now, \
+             revoke_reason = :reason, updated_at = :now, revision = :rev WHERE id = :id",
             params! { "now" => now, "reason" => reason, "rev" => rev, "id" => id },
-        ).await
+        )
+        .await
         .map_err(store_err)?;
         tx.commit().await.map_err(store_err)
     }
