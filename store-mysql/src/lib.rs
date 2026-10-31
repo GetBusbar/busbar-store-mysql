@@ -1343,6 +1343,77 @@ async fn insert_credential(
     .map_err(store_err)
 }
 
+/// Write `secret` as a credential row at revision `rev`, in the caller's transaction, for the op
+/// named `op` (its refusals name it).
+///
+/// `credentials` has THREE unique keys: `id` (PRIMARY KEY), `uq_cred_public UNIQUE(kind,
+/// public_id)` and `uq_cred_slot UNIQUE(key_id, kind, slot)`. A blanket `INSERT ... ON DUPLICATE
+/// KEY UPDATE` would fire on any of them and overwrite an unrelated row's identity, so the slot is
+/// looked up under a row lock first: a revoked occupant is reclaimed in place (UPDATE), a live one
+/// refused, and an empty slot inserted into. A clash on `id` surfaces as the server's own duplicate
+/// error.
+async fn write_credential(
+    tx: &mut Conn,
+    op: &str,
+    secret: &CredentialSecret,
+    rev: u64,
+) -> RecordStoreResult<()> {
+    let m = &secret.meta;
+    let occupied: Option<(Option<u64>,)> = tx
+        .exec_first(
+            "SELECT revoked_at FROM credentials \
+             WHERE key_id = :k AND kind = :kind AND slot = :s FOR UPDATE",
+            params! { "k" => &m.key_id, "kind" => &m.kind, "s" => m.slot },
+        )
+        .await
+        .map_err(store_err)?;
+    if let Some((None,)) = occupied {
+        return Err(store_err(format!(
+            "{op}: slot {} for key '{}' kind '{}' holds a live credential; revoke it first",
+            m.slot, m.key_id, m.kind
+        )));
+    }
+    // The revoked occupant this write replaces keeps no claim on its public_id.
+    let taken: Option<Vec<u8>> = tx
+        .exec_first(
+            "SELECT id FROM credentials WHERE kind = :kind AND public_id = :pub \
+             AND id <> :id AND NOT (key_id = :k AND slot = :s)",
+            params! {
+                "kind" => &m.kind, "pub" => &m.public_id, "id" => &m.id,
+                "k" => &m.key_id, "s" => m.slot,
+            },
+        )
+        .await
+        .map_err(store_err)?;
+    if taken.is_some() {
+        return Err(store_err(format!(
+            "{op}: public_id '{}' is already in use for kind '{}'",
+            m.public_id, m.kind
+        )));
+    }
+    if occupied.is_some() {
+        tx.exec_drop(
+            "UPDATE credentials SET
+                id = :id, public_id = :pub, secret = :secret, secret_form = :form,
+                created_at = :created, updated_at = :updated, expires_at = :expires,
+                revoked_at = NULL, revoke_reason = NULL, revision = :rev
+             WHERE key_id = :key AND kind = :kind AND slot = :slot",
+            params! {
+                "id" => &m.id, "key" => &m.key_id, "kind" => &m.kind, "slot" => m.slot,
+                "pub" => &m.public_id, "secret" => &secret.secret,
+                "form" => secret_form_str(&m.secret_form),
+                "created" => m.created_at, "updated" => m.updated_at,
+                "expires" => m.expires_at, "rev" => rev,
+            },
+        )
+        .await
+        .map_err(store_err)?;
+        Ok(())
+    } else {
+        insert_credential(tx, secret, rev).await
+    }
+}
+
 /// PARTITION `allowed_scopes` into its two columns: `allowed_pools` (the `pool` kind, a JSON array
 /// of bare names -- byte-for-byte the v3 shape, so a 1.5.x node reading a row mid-rolling-upgrade
 /// sees exactly the pool grant it always did) and `allowed_scopes_ext` (every OTHER kind, as a JSON
@@ -2146,74 +2217,26 @@ impl MysqlStore {
             )
             .await
             .map_err(store_err)?;
-        match owner {
-            None => {
-                tx.rollback().await.map_err(store_err)?;
-                return Err(store_err(format!(
-                    "put_credential: owning key '{}' does not exist",
-                    m.key_id
-                )));
-            }
-            Some((Some(_),)) => {
-                tx.rollback().await.map_err(store_err)?;
-                return Err(store_err(format!(
-                    "put_credential: owning key '{}' is tombstoned; a revoked key takes no new \
-                     credentials",
-                    m.key_id
-                )));
-            }
-            Some((None,)) => {}
-        }
-
-        // Slot-occupied-by-a-LIVE-credential guard: an explicit slot pointed at a live credential
-        // must fail loudly, not silently clobber a working credential mid-overlap-window.
-        let occupied: Option<(Option<u64>,)> = tx
-            .exec_first(
-                "SELECT revoked_at FROM credentials WHERE key_id = :k AND kind = :kind AND slot = :s FOR UPDATE",
-                params! { "k" => &m.key_id, "kind" => &m.kind, "s" => m.slot },
-            ).await
-            .map_err(store_err)?;
-        if let Some((None,)) = occupied {
+        let refused = match owner {
+            None => Some(format!(
+                "put_credential: key '{}' does not exist; a credential must hang off a real key",
+                m.key_id
+            )),
+            Some((Some(_),)) => Some(format!(
+                "put_credential: key '{}' is tombstoned; its credentials were revoked with it and \
+                 are never reissued",
+                m.key_id
+            )),
+            Some((None,)) => None,
+        };
+        if let Some(text) = refused {
             tx.rollback().await.map_err(store_err)?;
-            return Err(store_err(format!(
-                "put_credential: slot {} for key {} kind {} holds a LIVE credential — revoke it first",
-                m.slot, m.key_id, m.kind
-            )));
+            return Err(store_err(text));
         }
-
-        // `credentials` has THREE unique keys total: `id` (PRIMARY KEY), `uq_cred_public
-        // UNIQUE(kind, public_id)`, and `uq_cred_slot UNIQUE(key_id, kind, slot)` (checked above).
-        // A single `INSERT ... ON DUPLICATE KEY UPDATE` fires its UPDATE on ANY of the 3, but its
-        // SET list only ever touches `id`/`public_id`/`secret`/etc, never `key_id`/`slot` -- so a
-        // collision on `id` OR `public_id` against an UNRELATED row (different key_id/slot) would
-        // silently overwrite that row's identity/secret while leaving it pointed at the WRONG
-        // key/slot. Branching INSERT-vs-UPDATE off the slot guard above (the only unique key that
-        // legitimately gets reused, when reclaiming a revoked slot) instead of a blanket upsert
-        // means a collision on `id` or `public_id` now surfaces as a real MySQL 1062 duplicate-key
-        // error rather than a silent cross-row overwrite.
-        if occupied.is_some() {
-            // A revoked row already holds this exact (key_id, kind, slot) -- reclaim it in place.
-            tx.exec_drop(
-                "UPDATE credentials SET
-                    id = :id, public_id = :pub, secret = :secret, secret_form = :form,
-                    created_at = :created, updated_at = :updated, expires_at = :expires,
-                    revoked_at = NULL,
-                    revoke_reason = NULL, revision = :rev
-                 WHERE key_id = :key AND kind = :kind AND slot = :slot",
-                params! {
-                    "id" => &m.id, "key" => &m.key_id, "kind" => &m.kind, "slot" => m.slot,
-                    "pub" => &m.public_id, "secret" => &secret.secret,
-                    "form" => secret_form_str(&m.secret_form),
-                    "created" => m.created_at, "updated" => m.updated_at,
-                    "expires" => m.expires_at, "rev" => rev,
-                },
-            )
-            .await
-            .map_err(store_err)?;
-        } else {
-            insert_credential(&mut tx, secret, rev).await?;
+        if let Err(e) = write_credential(&mut tx, "put_credential", secret, rev).await {
+            tx.rollback().await.map_err(store_err)?;
+            return Err(e);
         }
-
         tx.commit().await.map_err(store_err)
     }
 
@@ -2227,7 +2250,10 @@ impl MysqlStore {
         tx.exec_drop(KEY_INSERT, key_params(key, None, rev)?)
             .await
             .map_err(store_err)?;
-        insert_credential(&mut tx, secret, rev).await?;
+        if let Err(e) = write_credential(&mut tx, "put_key_with_credential", secret, rev).await {
+            tx.rollback().await.map_err(store_err)?;
+            return Err(e);
+        }
         tx.commit().await.map_err(store_err)
     }
 
@@ -2267,9 +2293,7 @@ impl MysqlStore {
             .map_err(store_err)?;
         if existing.is_none() {
             tx.rollback().await.map_err(store_err)?;
-            return Err(store_err(format!(
-                "revoke_credential: unknown credential id {id}"
-            )));
+            return Err(store_err(format!("revoke_credential: unknown id '{id}'")));
         }
 
         let now = crate_now();
