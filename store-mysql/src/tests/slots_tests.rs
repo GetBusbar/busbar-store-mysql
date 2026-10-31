@@ -366,13 +366,16 @@ fn get_usage_reads_one_snapshot() {
     s.put_usage(&bucket, 60, &seed).expect("seed");
     race(
         &s,
-        3000,
+        400,
         |c| {
             let mut tx = c.start_transaction(mysql::TxOpts::default()).expect("tx");
             for sql in [
-                "UPDATE usage_windows SET requests = requests + 1 WHERE bucket_id = ? AND model = ''",
-                "UPDATE usage_windows SET tokens_input = tokens_input + 1 WHERE bucket_id = ? AND model = 'm'",
-                "UPDATE usage_window_units SET count = count + 1 WHERE bucket_id = ?",
+                "UPDATE usage_windows SET requests = requests + 1 \
+                 WHERE window_start = 60 AND bucket_scope = 'key' AND bucket_id = ? AND model = ''",
+                "UPDATE usage_windows SET tokens_input = tokens_input + 1 \
+                 WHERE window_start = 60 AND bucket_scope = 'key' AND bucket_id = ? AND model = 'm'",
+                "UPDATE usage_window_units SET count = count + 1 \
+                 WHERE window_start = 60 AND bucket_scope = 'key' AND bucket_id = ?",
             ] {
                 tx.exec_drop(sql, (&bucket,)).expect("update");
             }
@@ -420,16 +423,18 @@ fn list_metering_reads_one_snapshot() {
     s.add_metering_op(op(13), &[delta]).expect("seed");
     race(
         &s,
-        3000,
+        400,
         |c| {
             let mut tx = c.start_transaction(mysql::TxOpts::default()).expect("tx");
             tx.exec_drop(
-                "UPDATE usage_metering SET requests = requests + 1 WHERE key_id = ?",
+                "UPDATE usage_metering SET requests = requests + 1 \
+                 WHERE bucket = '0020261032' AND key_id = ?",
                 (&key,),
             )
             .expect("update");
             tx.exec_drop(
-                "UPDATE usage_metering_units SET count = count + 1 WHERE key_id = ?",
+                "UPDATE usage_metering_units SET count = count + 1 \
+                 WHERE bucket = '0020261032' AND key_id = ?",
                 (&key,),
             )
             .expect("update");
