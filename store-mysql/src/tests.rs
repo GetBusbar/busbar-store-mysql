@@ -2526,40 +2526,44 @@ fn purging_a_task_takes_its_provenance_chain_with_it_and_no_other() {
     clear_purge_band(&store);
 }
 
-/// Every `u64` of the envelope round-trips at the FULL range, `u64::MAX` included — `seq` and `ts`
-/// are BIGINT UNSIGNED like every other u64 in this store, so there is no value the contract can
-/// hand this backend that it has to refuse or silently mangle.
+/// The envelope's `seq` and `ts` round-trip up to `i64::MAX`, the largest value every store of the
+/// family can hold (R16); one above is refused, not stored.
 #[test]
-fn the_plane_store_round_trips_the_full_u64_range() {
+fn the_plane_store_round_trips_up_to_i64_max_and_refuses_above() {
     let Some(url) = test_url() else { return };
     let store = MysqlStore::connect(&url).expect("connect");
     let t = "t_full_range";
     reset_tasks(&store, &[t]);
+    let top = i64::MAX as u64;
 
-    let task = active_task(t, "working", u64::MAX);
+    let task = active_task(t, "working", top);
     store
         .upsert_plane_record(task.view())
-        .expect("BIGINT UNSIGNED holds the whole u64 range; nothing here needs refusing");
+        .expect("i64::MAX is storable");
     let got = get_task(&store, t).expect("the task must read back at all");
-    assert_eq!(got["updated_at"].as_u64(), Some(u64::MAX));
+    assert_eq!(got["updated_at"].as_u64(), Some(top));
     assert!(
         all_task_ids(&store).contains(&t.to_string()),
-        "a u64::MAX ts must not break the listing"
+        "an i64::MAX ts must not break the listing"
+    );
+    let too_big = active_task(t, "working", top + 1);
+    let err = store.upsert_plane_record(too_big.view()).unwrap_err();
+    assert!(
+        err.to_string().contains("exceeds the storable range"),
+        "{err}"
     );
 
-    let mut ev = event_rec(t, u64::MAX, "task.submitted", "", "e1");
-    ev.ts = u64::MAX;
+    let mut ev = event_rec(t, top, "task.submitted", "", "e1");
+    ev.ts = top;
     store
         .append_plane_record(ev.view())
-        .expect("seq/ts hold u64::MAX");
+        .expect("seq/ts hold i64::MAX");
     let events = events_of(&store, t);
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0]["seq"].as_u64(), Some(u64::MAX));
-    // And the identical replay at that position is still recognised as identical — a column that
-    // wrapped would read back as a different `ts` and report a fork.
+    assert_eq!(events[0]["seq"].as_u64(), Some(top));
     store
         .append_plane_record(ev.view())
-        .expect("the replay at u64::MAX must compare identical");
+        .expect("the replay at i64::MAX must compare identical");
     reset_tasks(&store, &[t]);
 }
 
@@ -2974,36 +2978,38 @@ fn the_sweep_keeps_an_entry_expiring_exactly_at_now() {
     reset_tokens(&store, "ask", &[&edge, &other]);
 }
 
-/// THE FULL u64 RANGE STORES FAITHFULLY. A clamped or wrapped `now` would be a security bug rather
-/// than a rounding one: clamped high it sweeps the ENTIRE ledger and reports a replay as first.
+/// THE TOP OF THE SIGNED RANGE STORES FAITHFULLY (R16: a value above `i64::MAX` is refused, never
+/// clamped). A clamped or wrapped `now` would be a security bug rather than a rounding one:
+/// clamped high it sweeps the ENTIRE ledger and reports a replay as first.
 #[test]
-fn the_trust_state_stores_the_full_unsigned_range() {
+fn the_trust_state_stores_the_full_signed_range() {
     let url = require_test_url();
     let (server, nonce) = (trust_ns("srv_range"), trust_ns("nonce_range"));
     let store = MysqlStore::connect(&url).expect("connect");
     reset_plane(&store, "demotion", &[&server]);
     reset_tokens(&store, "ask", &[&nonce]);
 
+    let top = i64::MAX as u64;
     store
-        .upsert_plane_record(demotion_rec(&server, "tool-drift", u64::MAX).view())
-        .expect("BIGINT UNSIGNED holds the whole u64 range");
+        .upsert_plane_record(demotion_rec(&server, "tool-drift", top).view())
+        .expect("i64::MAX is storable");
     assert_eq!(
         demotions(&store)
             .into_iter()
             .find(|d| d["server"] == server.as_str())
             .expect("the row must be there")["recorded_at"]
             .as_u64(),
-        Some(u64::MAX)
+        Some(top)
     );
     assert!(
         store
-            .redeem_plane_token("ask", &nonce, u64::MAX, TRUST_NOW)
+            .redeem_plane_token("ask", &nonce, top, TRUST_NOW)
             .unwrap(),
         "an expires_at at the top of the range is storable here and must redeem normally"
     );
     assert!(
         !store
-            .redeem_plane_token("ask", &nonce, u64::MAX, TRUST_NOW + 1)
+            .redeem_plane_token("ask", &nonce, top, TRUST_NOW + 1)
             .unwrap(),
         "and the row it wrote must still be found on the replay"
     );
@@ -3643,7 +3649,7 @@ fn a_v6_development_database_carries_its_plane_state_across_once() {
     );
     assert!(
         !store
-            .redeem_plane_token("ask", "nonce_v6", u64::MAX, 1_000)
+            .redeem_plane_token("ask", "nonce_v6", i64::MAX as u64, 1_000)
             .unwrap(),
         "an approval spent before the upgrade stays spent"
     );

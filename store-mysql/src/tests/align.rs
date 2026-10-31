@@ -4,6 +4,8 @@
 //! The store-kind family alignment rules (R*/W*) against a live MySQL.
 
 use super::*;
+use busbar_contract::abi::sdk::store::OpRefused;
+use busbar_contract::abi::store::OpId;
 use busbar_contract::records::{MeteringDelta, Retention};
 
 /// A name no other test (or earlier run) uses.
@@ -521,4 +523,91 @@ fn r13_deleting_a_task_deletes_its_event_chain() {
     );
     assert!(get_task(&store, stays).is_some());
     reset_tasks(&store, &[stays]);
+}
+
+fn refused_with(r: Result<(), OpRefused>, needle: &str) {
+    match r {
+        Err(OpRefused::Refused(t)) => assert!(t.contains(needle), "{t}"),
+        other => panic!("expected a refusal naming {needle:?}, got {other:?}"),
+    }
+}
+
+const ABOVE: u64 = i64::MAX as u64 + 1;
+
+#[test]
+fn r16_an_append_above_i64_max_is_refused_before_any_write() {
+    let Some(s) = fresh_store() else { return };
+    let t = fresh("t_r16_append");
+    let t = t.as_str();
+    let mut big_seq = event_rec(t, ABOVE, "task.submitted", "", "h");
+    big_seq.ts = TASK_LIVE_TS;
+    refused_with(
+        s.append_plane_record_op(
+            OpId::from_parts(ulid::Ulid::new().random() as u64 | 1, 3),
+            big_seq.view(),
+        ),
+        "append_plane_record: seq",
+    );
+    let mut big_ts = event_rec(t, 1, "task.submitted", "", "h");
+    big_ts.ts = ABOVE;
+    refused_with(
+        s.append_plane_record_op(
+            OpId::from_parts(ulid::Ulid::new().random() as u64 | 1, 5),
+            big_ts.view(),
+        ),
+        "append_plane_record: ts",
+    );
+    assert!(events_of(&s, t).is_empty(), "nothing was written");
+    reset_tasks(&s, &[t]);
+}
+
+#[test]
+fn r16_metering_priced_from_ms_above_i64_max_is_refused_before_any_write() {
+    let Some(s) = fresh_store() else { return };
+    let (key, bucket) = (fresh("vk_r16_meter"), fresh_bucket());
+    let mut d = meter(&key, bucket);
+    d.priced_from_ms = ABOVE;
+    refused_with(
+        s.add_metering_op(
+            OpId::from_parts(ulid::Ulid::new().random() as u64 | 1, 7),
+            &[d],
+        ),
+        "add_metering_batch: priced_from_ms",
+    );
+    assert!(s.list_metering(bucket).unwrap().is_empty());
+}
+
+#[test]
+fn r16_redeem_with_expires_at_or_now_above_i64_max_is_refused() {
+    let Some(s) = fresh_store() else { return };
+    let (kind, token) = (fresh("r16_kind"), fresh("tok"));
+    let err = s.redeem_plane_token(&kind, &token, ABOVE, 10).unwrap_err();
+    assert!(
+        err.to_string().contains("redeem_plane_token: expires_at"),
+        "{err}"
+    );
+    let err = s.redeem_plane_token(&kind, &token, 100, ABOVE).unwrap_err();
+    assert!(err.to_string().contains("redeem_plane_token: now"), "{err}");
+    assert!(
+        s.redeem_plane_token(&kind, &token, 100, 10).unwrap(),
+        "the refusals spent nothing"
+    );
+}
+
+#[test]
+fn r16_upsert_and_append_through_the_sync_bridge_name_the_field() {
+    let Some(s) = fresh_store() else { return };
+    let t = fresh("t_r16_up");
+    let mut rec = active_task(&t, "working", TASK_LIVE_TS);
+    rec.seq = ABOVE;
+    let err = s.upsert_plane_record(rec.view()).unwrap_err();
+    assert!(
+        err.to_string().contains("upsert_plane_record: seq"),
+        "{err}"
+    );
+    let err = s
+        .upsert_plane_record(active_task(&t, "working", ABOVE).view())
+        .unwrap_err();
+    assert!(err.to_string().contains("upsert_plane_record: ts"), "{err}");
+    assert!(get_task(&s, &t).is_none());
 }
