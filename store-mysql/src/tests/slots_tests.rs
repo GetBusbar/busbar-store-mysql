@@ -273,7 +273,8 @@ fn metering_counters_pin_at_i64_max() {
     }
 }
 
-/// M8: a batch is applied in one global order whatever order the caller sent it in (a unit-level
+/// M8: a batch is applied in one global order (the primary key's, `(key_id, bucket, model,
+/// provider, priced_from_ms)`) whatever order the caller sent it in (a unit-level
 /// check of the order handed to the apply loop; the deadlock itself needs two nodes).
 #[test]
 fn a_batch_applies_in_one_global_order() {
@@ -331,8 +332,8 @@ fn a_batch_applies_in_one_global_order() {
             (1, "k", "m", 0),
             (1, "k", "m", 5),
             (1, "k", "n", 0),
-            (1, "z", "m", 0),
-            (2, "k", "m", 0)
+            (2, "k", "m", 0),
+            (1, "z", "m", 0)
         ]
     );
 }
