@@ -4,7 +4,7 @@
 //! The store-kind family alignment rules (R*/W*) against a live MySQL.
 
 use super::*;
-use busbar_contract::records::MeteringDelta;
+use busbar_contract::records::{MeteringDelta, Retention};
 
 /// A name no other test (or earlier run) uses.
 fn fresh(tag: &str) -> String {
@@ -441,4 +441,84 @@ fn r22_the_schema_step_drops_fk_metering_key_and_keeps_the_rows() {
     assert!(rows.iter().any(|r| r.key_id == key && r.requests == 5));
     s.add_metering(&meter(&fresh("vk_r22_mig_never"), bucket))
         .expect("metering for any key id");
+}
+
+#[test]
+fn r12_an_age_purge_of_tasks_takes_each_purged_tasks_event_chain() {
+    let Some(url) = test_url() else { return };
+    let _guard = lock_plane_purge();
+    let store = MysqlStore::connect(&url).expect("connect");
+    clear_purge_band(&store);
+    let (done, working, newer) = ("t_r12_done", "t_r12_working", "t_r12_newer");
+    reset_tasks(&store, &[done, working, newer]);
+    store
+        .upsert_plane_record(terminal_task(done, "completed", 1_000_000_100).view())
+        .unwrap();
+    store
+        .upsert_plane_record(active_task(working, "working", 1_000_000_100).view())
+        .unwrap();
+    store
+        .upsert_plane_record(active_task(newer, "working", 1_000_000_300).view())
+        .unwrap();
+    for (t, h) in [(done, "d"), (working, "w"), (newer, "n")] {
+        store
+            .append_plane_record(event_rec(t, 1, "task.submitted", "", h).view())
+            .unwrap();
+    }
+    let n = store
+        .purge_plane_records("task", 1_000_000_200, Retention::Age)
+        .unwrap();
+    assert_eq!(
+        n, 2,
+        "the count is the task rows (terminal and active alike)"
+    );
+    assert!(
+        events_of(&store, done).is_empty(),
+        "a terminal task's chain goes"
+    );
+    assert!(
+        events_of(&store, working).is_empty(),
+        "an active task's chain goes under Age"
+    );
+    assert_eq!(
+        events_of(&store, newer).len(),
+        1,
+        "a surviving task keeps its chain"
+    );
+    reset_tasks(&store, &[done, working, newer]);
+    clear_purge_band(&store);
+}
+
+#[test]
+fn r13_deleting_a_task_deletes_its_event_chain() {
+    let Some(url) = test_url() else { return };
+    let _guard = lock_plane_purge();
+    let store = MysqlStore::connect(&url).expect("connect");
+    let (gone, stays) = (fresh("t_r13_gone"), fresh("t_r13_stays"));
+    let (gone, stays) = (gone.as_str(), stays.as_str());
+    reset_tasks(&store, &[gone, stays]);
+    for t in [gone, stays] {
+        store
+            .upsert_plane_record(active_task(t, "working", TASK_LIVE_TS).view())
+            .unwrap();
+        store
+            .append_plane_record(event_rec(t, 1, "task.submitted", "", "h1").view())
+            .unwrap();
+        store
+            .append_plane_record(event_rec(t, 2, "task.working", "h1", "h2").view())
+            .unwrap();
+    }
+    store.delete_plane_record("task", gone).unwrap();
+    assert!(get_task(&store, gone).is_none());
+    assert!(
+        events_of(&store, gone).is_empty(),
+        "the chain goes with the task"
+    );
+    assert_eq!(
+        events_of(&store, stays).len(),
+        2,
+        "another task's chain stays"
+    );
+    assert!(get_task(&store, stays).is_some());
+    reset_tasks(&store, &[stays]);
 }
