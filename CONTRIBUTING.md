@@ -1,7 +1,6 @@
-# Contributing to store-postgres
+# Contributing to busbar-store-mysql
 
-Thanks for your interest in improving `store-postgres`. This document covers
-how to build, test, and submit changes.
+Thanks for your interest in improving `busbar-store-mysql`.
 
 ## Ground rules
 
@@ -11,55 +10,39 @@ how to build, test, and submit changes.
   [Apache-2.0](LICENSE) license.
 - Security issues go through [SECURITY.md](SECURITY.md), **not** public issues.
 
-## Development setup
+## Layout
 
-`store-postgres` is a Rust `cdylib` plugin. You need a recent stable toolchain
-(`rustup` recommended), and — until [busbarAI](https://github.com/GetBusbar/busbar)
-ships publicly — a sibling checkout of it at `../busbarAI`, since this crate's
-`Cargo.toml` points at busbar's crates as local path dependencies. See the
-README's [Dependencies](README.md#dependencies) section for the exact layout;
-CI checks out `GetBusbar/busbar` at the branch named in the reusable
-`plugin-ci.yml` workflow reference in [`ci.yml`](.github/workflows/ci.yml).
+Every busbar plugin repo has the same skeleton. This one is a two-crate Cargo workspace: `store-mysql/` holds the plugin's logic and `store-mysql-plugin/` is the thin `cdylib` that packages it as a droppable `kind: store` plugin. busbar itself is a git dependency
+pinned to the commit in `.busbar-ref`. The CI, release, dependency and lint configuration
+are rendered by `busbar-release plugin heal` from the fleet template (GetBusbar/busbar-release
+`template/`), [busbar's plugin registry](https://github.com/GetBusbar/busbar/blob/main/plugins.yaml)
+and busbar's dependency policy (`.github/fleet/deps.toml` and the root `[workspace.dependencies]`
+at the pin); change them there, not here.
 
-The meaningful test coverage here needs a **live Postgres** — see the README's
-[Tests need a real Postgres](README.md#tests-need-a-real-postgres) section.
-Locally, `cargo test` skips that coverage cleanly if `BUSBAR_TEST_POSTGRES_URL`
-is unset; set it to point at a real Postgres 16+ database to exercise it:
+## This repo tests itself against busbar
 
-```bash
-export BUSBAR_TEST_POSTGRES_URL=postgres://busbar:busbar@localhost:5432/busbar_test
-cargo build --release                       # cdylib
-cargo test                                   # unit tests + the e2e dlopen/live-Postgres test
-cargo clippy --all-targets -- -D warnings    # lints must be clean
-cargo fmt --all -- --check                   # format before committing
-```
+CI calls busbar's reusable `plugin-ci.yml` at the commit in `.busbar-ref`. It runs formatting,
+strict Clippy, dependency checks and this repository's ordinary Rust tests. The tests load the
+actual linked door and the freshly built library through the public plugin loader. CI exports the
+absolute library path as `BUSBAR_PLUGIN_CDYLIB`; a missing library fails the tests.
+
+Keep product assertions in this repository. Exercise both actual loading paths and retain negative
+cases that distinguish a refused input or failed operation from success. There is no shared kind
+script or generated host adapter. Configure any real service backends and existing test-only
+features in this repository's registry entry; test-image features do not change production builds.
+
+The plugin keeps its own `Cargo.lock`. Heal seeds its resolution from busbar's lock at the pin;
+this does not make the two complete dependency graphs or every resolved version identical.
 
 ## Before you open a pull request
 
-1. **`cargo fmt --all`** — code must be rustfmt-clean.
-2. **`cargo clippy --all-targets -- -D warnings`** — no warnings.
-3. **`cargo build && cargo test`** — green, including the live-Postgres
-   end-to-end test in `tests/e2e.rs` (it hard-fails under `CI=1` rather than
-   silently skipping — never let that coverage quietly vanish).
-4. Add or update tests for any behavior change.
-5. Update documentation (`README.md`, doc comments) when you change behavior or config.
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo build --release --locked -p busbar-store-mysql-plugin --lib
+BUSBAR_PLUGIN_CDYLIB="$PWD/target/release/libbusbar_store_mysql_plugin.so" cargo test --release --workspace --locked
+```
 
-## Architecture
-
-This repo is deliberately a thin adapter (`src/lib.rs`): it turns the engine's
-JSON `open` config into a `PostgresStore` and hands the trait object to
-[`busbar-plugin-sdk`](https://github.com/GetBusbar/busbar/tree/main/crates/plugin-sdk),
-which emits the C ABI symbols the loader resolves. All the SQL and schema logic
-lives in the `busbar-store-postgres` library crate this plugin wraps, in the
-`busbarAI` monorepo — most substantive changes belong there, not here.
-
-## Commit & PR conventions
-
-- Keep commits focused; squash noisy WIP commits before opening the PR.
-- Write a clear PR description: what changed, why, and how it was verified.
-- Reference any related issue.
-- Stage files by name; avoid sweeping `git add -A` that pulls in unrelated changes.
-
-## Questions
-
-Open a discussion or issue. We're happy to help you get oriented.
+The README's Tests section names any live backend the full suite needs. Add or update
+tests for any behavior change, and update the README when you change behavior or
+config. Keep commits focused and describe what changed, why, and how it was verified.

@@ -1,0 +1,134 @@
+# RENDERED by `busbar-release plugin heal busbar-store-mysql` from GetBusbar/busbar-release template/; a hand
+# edit is overwritten by the next sync (DEPENDABOT-ONE).
+# dependabot-bundle: plugin repos take no Dependabot version updates (no dependabot.yml is rendered);
+# the PRs this bundles are the security updates the repo settings keep on. Every open dependabot PR
+# (whatever its base today) is merged into ONE branch (deps/bundle), which carries ONE PR with
+# auto-merge on. It runs when dependabot opens or updates a PR into dev, and weekly (Monday) for the
+# rest. Merged PRs are closed with a link; a PR that conflicts
+# is listed in the bundle PR body and left open. The branch is only ever fast-forwarded (no force).
+# Secrets: BUNDLE_TOKEN (or FLEET_TOKEN) lets the bundle PR run CI and lets a github-actions bump
+# (a workflow-file change) be pushed; without one GITHUB_TOKEN is used and those cases fail loudly.
+# pull_request_target runs the BASE branch's copy of this file and never executes PR code: it only
+# fetches and merges the PR heads.
+name: dependabot-bundle
+on:
+  pull_request_target:
+    types: [opened, synchronize]
+    branches: [dev]
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+permissions:
+  contents: write
+  pull-requests: write
+concurrency:
+  group: dependabot-bundle
+env:
+  TARGET: dev
+  BUNDLE: deps/bundle
+  GH_TOKEN: ${{ secrets.BUNDLE_TOKEN || secrets.FLEET_TOKEN || github.token }}
+jobs:
+  bundle:
+    if: github.event_name != 'pull_request_target' || github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          set -euo pipefail
+          gh auth setup-git
+          git -C . clone -q "https://github.com/$GITHUB_REPOSITORY" w
+          cd w
+          git -C . config user.name "github-actions[bot]"
+          git -C . config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          pages=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/pulls?state=open&per_page=100")
+          prs=$(jq -r '.[][] | select(.user.login == "dependabot[bot]") | [.number, .title, .head.sha] | @tsv' <<< "$pages")
+          if [ -z "$prs" ]; then
+            echo "no open dependabot updates"
+            exit 0
+          fi
+          bundles=$(gh pr list --head "$BUNDLE" --base "$TARGET" --state open --json number,body)
+          pr=$(jq -r '.[0].number // empty' <<< "$bundles")
+          previous=$(jq -r '.[0].body // ""' <<< "$bundles")
+          merged=(); bad=(); rejected=()
+          report() {
+            local message="$1" body_file
+            printf '%s\n' "$message" >&2
+            if [ -n "$pr" ]; then
+              body_file=$(mktemp)
+              printf '%s\n\n%s\n' "$previous" "$message" > "$body_file"
+              gh pr edit "$pr" --body-file "$body_file"
+              rm -f "$body_file"
+            fi
+          }
+          remote=$(git -C . ls-remote --heads origin "$BUNDLE")
+          if [ -n "$remote" ]; then
+            git -C . checkout -q -B "$BUNDLE" "origin/$BUNDLE"
+            if ! git -C . merge -q -m "deps: merge $TARGET" "origin/$TARGET"; then
+              report "CONFLICT: $BUNDLE cannot incorporate $TARGET; prior updates are retained."
+              if git -C . rev-parse --verify MERGE_HEAD >/dev/null 2>&1; then
+                git -C . merge --abort || { echo "::error::cannot abort target merge" >&2; exit 1; }
+              fi
+              exit 1
+            fi
+          else
+            git -C . checkout -q -B "$BUNDLE" "origin/$TARGET"
+          fi
+          while IFS=$'\t' read -r n t expected; do
+            [ -n "$n" ] || continue
+            commits=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/pulls/$n/commits?per_page=100")
+            if ! jq -e --arg expected "$expected" '
+              [.[][]] as $commits | ($commits | length) > 0 and
+              $commits[-1].sha == $expected and
+              all($commits[]; .author.login == "dependabot[bot]" and
+                (.committer.login == "dependabot[bot]" or .committer.login == "web-flow") and
+                .commit.verification.verified == true)' <<< "$commits" >/dev/null; then
+              rejected+=("$n")
+              continue
+            fi
+            git -C . fetch -q origin "pull/$n/head"
+            if [ "$(git -C . rev-parse FETCH_HEAD)" != "$expected" ]; then
+              rejected+=("$n")
+              continue
+            fi
+            if git -C . merge -q -m "deps: merge #$n $t" FETCH_HEAD; then
+              merged+=("$n")
+            else
+              bad+=("$n")
+              if git -C . rev-parse --verify MERGE_HEAD >/dev/null 2>&1; then
+                git -C . merge --abort || { report "::error::cannot abort merge of #$n"; exit 1; }
+              else
+                report "::error::merge of #$n failed without a recoverable merge state"
+                exit 1
+              fi
+            fi
+          done <<< "$prs"
+          body_file=$(mktemp)
+          printf '%s\n' "$previous" > "$body_file"
+          if [ ${#merged[@]} -gt 0 ]; then
+            printf '\nBundled dependabot updates, merged from: ' >> "$body_file"
+            printf '#%s ' "${merged[@]}" >> "$body_file"
+            printf '\n' >> "$body_file"
+          fi
+          if [ ${#bad[@]} -gt 0 ]; then
+            printf '\nCONFLICT, left open: ' >> "$body_file"
+            printf '#%s ' "${bad[@]}" >> "$body_file"
+            printf '\n' >> "$body_file"
+          fi
+          if [ ${#rejected[@]} -gt 0 ]; then
+            printf '\nREFUSED, signed Dependabot commit/head verification failed: ' >> "$body_file"
+            printf '#%s ' "${rejected[@]}" >> "$body_file"
+            printf '\n' >> "$body_file"
+          fi
+          if [ ${#merged[@]} -eq 0 ]; then
+            cat "$body_file" >&2
+            if [ -n "$pr" ]; then gh pr edit "$pr" --body-file "$body_file"; fi
+            rm -f "$body_file"
+            [ ${#bad[@]} -eq 0 ] && [ ${#rejected[@]} -eq 0 ]
+            exit $?
+          fi
+          git -C . push -q origin "$BUNDLE"
+          if [ -n "$pr" ]; then gh pr edit "$pr" --body-file "$body_file"
+          else pr=$(gh pr create --head "$BUNDLE" --base "$TARGET" --title "deps: bundled dependabot updates" --body-file "$body_file"); pr=${pr##*/}; fi
+          rm -f "$body_file"
+          gh pr merge "$pr" --auto --merge || echo "::warning::auto-merge not enabled on #$pr"
+          for n in "${merged[@]}"; do gh pr close "$n" --comment "Merged into the bundle branch; continues in #$pr."; done
+          [ ${#bad[@]} -eq 0 ] && [ ${#rejected[@]} -eq 0 ]
