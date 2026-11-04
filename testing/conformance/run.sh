@@ -22,7 +22,8 @@
 #     BUSBAR_PIN         the pin's sha
 #     CARGO_TARGET_DIR   this repo's target/ (the subject builds there)
 #
-# and node 22 and rust on PATH (testing/conformance/tools.sh). Its verdict states `suite`, `status`
+# and Node at testing/conformance/tools.sh's pin on PATH. Rust workspaces also receive the Rust
+# toolchain declared by their own rust-toolchain[.toml]. Its verdict states `suite`, `status`
 # (pass|fail|not-run), `armed`, and may state `standard`, `plan`, `spec_version`, `reason`. A command
 # keeps the suite's three legs: the control (a known-good third-party peer) always runs, the negative
 # control (a deliberately broken peer) must grade red, and the subject is armed or red. `pass` means
@@ -234,14 +235,26 @@ export CONF_BRANCH
 export CONF_MCI_URL="$MCI_URL"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$here/target}"
 
+# One driver owns this checkout's fixed output tree until its suites and judgments finish.
+mkdir -p "$(dirname "$OUT")" || { say "the output parent could not be created"; exit 2; }
+exec 7>"$OUT.lock" || { say "the output lease could not be opened"; exit 2; }
+python3 -I - 7 <<'PYOUTPUT' || exit 2
+import fcntl, sys
+try:
+    fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError as error:
+    print(f"conformance: output is already leased or unavailable: {error}", file=sys.stderr)
+    sys.exit(1)
+PYOUTPUT
+
 # busbar at the pin, outside this checkout (its scripts and crates are what the subjects build on).
 W="$(mktemp -d "${TMPDIR:-/tmp}/conformance.XXXXXX")"
 trap 'rm -rf "$W"' EXIT
-if [ "$pin" = "$CONF_HEAD" ] && [ ! -f .busbar-ref ]; then
+if [ ! -f .busbar-ref ]; then
   export BUSBAR_CHECKOUT="$here"
 else
-export BUSBAR_CHECKOUT="$W/busbar"
-mkdir -p "$BUSBAR_CHECKOUT" && git -C "$BUSBAR_CHECKOUT" init -q \
+  export BUSBAR_CHECKOUT="$W/busbar"
+  mkdir -p "$BUSBAR_CHECKOUT" && git -C "$BUSBAR_CHECKOUT" init -q \
   && git -C "$BUSBAR_CHECKOUT" remote add origin https://github.com/GetBusbar/busbar.git \
   && git -C "$BUSBAR_CHECKOUT" fetch -q --depth 1 --no-tags origin "$pin" \
   && git -C "$BUSBAR_CHECKOUT" -c advice.detachedHead=false checkout -q FETCH_HEAD \
@@ -249,7 +262,9 @@ mkdir -p "$BUSBAR_CHECKOUT" && git -C "$BUSBAR_CHECKOUT" init -q \
 fi
 
 # shellcheck source=testing/conformance/tools.sh
-. testing/conformance/tools.sh rust node || { say "the pinned tools could not be provisioned"; exit 2; }
+tools=(node)
+if [ -f Cargo.toml ] || [ -f rust-toolchain.toml ] || [ -f rust-toolchain ]; then tools=(rust node); fi
+. testing/conformance/tools.sh "${tools[@]}" || { say "the pinned tools could not be provisioned"; exit 2; }
 
 if ! rm -rf "$OUT" || ! mkdir -p "$OUT/verdicts"; then
   say "the conformance output could not be cleaned and created"; exit 2
