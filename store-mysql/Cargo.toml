@@ -1,20 +1,53 @@
 # SPDX-License-Identifier: Apache-2.0
 [package]
 name = "busbar-store-mysql"
-version = "1.0.0"
-publish = false            # internal workspace crate; never goes to crates.io
-edition = "2021"
-rust-version = "1.97"
-description = "The MySQL/MariaDB backend for busbar's durable governance store — the shared, multi-node db plugin. Implements busbar_api::Store over a mutex-guarded sync mysql client."
-license = "Apache-2.0"
+version = "1.6.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "The MySQL/MariaDB backend for busbar's durable governance store — the shared, multi-node db plugin. Serves the store v3 door over the host's connector (no socket of its own): the MySQL client protocol over kept connections."
+license.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+# rlib: THE LOGIC, and the store's door (`store_door!` over its `StoreSlots`: `door`, the row a
+# busbar build that links this crate registers). The sibling `busbar-store-mysql-plugin` cdylib
+# exports the same `door` as the dropped-in door. One source, both doors (DECISIONS #2 rule (1)).
+crate-type = ["rlib"]
 
 [dependencies]
-# INTERIM: busbarAI isn't public yet, so this is a local path dependency into a sibling checkout of
-# the monorepo. Once busbarAI ships publicly this should become a git (pinned rev/tag) or crates.io
-# dependency instead — same pattern already applied across every other first-party plugin.
-busbar-api = { path = "../../busbarAI/crates/api" }
-mysql = { version = "26", default-features = false, features = ["minimal"] }
-serde_json = "1"
-ulid = "1"
+# The ONE busbar crate a plugin names (#40: contract only; DECISIONS #84 merged the plugin SDK into it
+# as `busbar_contract::abi::sdk`). Pinned by git rev to the busbar commit in `.busbar-ref`.
+busbar-contract = { workspace = true }
+zeroize = { workspace = true }
+tracing = { workspace = true }
+# THE MYSQL CLIENT PROTOCOL WITHOUT A SOCKET (busbar THE DESIGN, the connections section: the store
+# reaches its server only over the host's connector, ARCHITECT rulings 2026-10-03 on Q-L14-1 /
+# Q-L16-2): `mysql_common` is the sans-IO core the 1.5.5 `mysql` driver is built on (packets, the
+# handshake, mysql_native_password / caching_sha2_password, `Value`/`Row`/`FromRow`, `params!`), so
+# every parameter and column converts exactly as it did over the driver. `src/mysqlwire.rs` is the
+# driver's connection logic, every byte over the op's wire.
+mysql_common = { workspace = true }
+flate2 = { workspace = true }
+bytes = { workspace = true }
+# The 1.5.5 driver's URL reading (`mysql://...`): pure parsing, no socket.
+url = { workspace = true }
+percent-encoding = { workspace = true }
+serde_json = { workspace = true }
+# Typed settings capture seals the DSN while the SDK reads it.
+serde = { workspace = true }
 
 [dev-dependencies]
+# Backend-owned tests exercise tombstones, credentials and plane records.
+ulid = { workspace = true }
+# The live tests open the store the way the host does: its door through the REAL loader on a
+# dispatcher (`load_linked`, `LoadedStore`) and the actual connector/TCP carrier. The 1.5.5 `mysql` driver verifies what landed INDEPENDENTLY of the
+# store (tests only; never in the shipped image).
+busbar-plugin-loader = { workspace = true }
+mysql = { workspace = true }
+
+busbar-core-connector = { workspace = true }
+busbar-transport-tcp = { workspace = true }
+tokio = { workspace = true, features = ["rt", "net", "time"] }
