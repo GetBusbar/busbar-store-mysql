@@ -16,7 +16,9 @@
 #         already on PATH is left alone
 #   node  node v22.23.3 (nodejs.org)
 
-_ct_root="${MODERNCI_CACHE_DIR:-$HOME/.cache}/conformance-tools"
+_ct_root="${MODERNCI_CACHE_DIR:-${HOME:+$HOME/.cache}}"
+[ -n "$_ct_root" ] || { echo "tools.sh: no cache root; set MODERNCI_CACHE_DIR or HOME" >&2; return 1; }
+_ct_root="$_ct_root/conformance-tools"
 _ct_node_ver=v22.23.3
 _ct_node_major="${_ct_node_ver#v}"; _ct_node_major="${_ct_node_major%%.*}"
 _ct_rustup_ver=1.28.2
@@ -26,15 +28,17 @@ _ct_sha256() {
 }
 
 # _ct_fetch <url> <sha256> <dest>: the asset at dest, verified, or return 1.
-_ct_fetch() {
-  if [ -f "$3" ] && [ "$(_ct_sha256 "$3")" = "$2" ]; then return 0; fi
-  mkdir -p "$(dirname "$3")" || return 1
-  # A stalled transfer (under 1 KiB/s for a minute) fails instead of holding the check forever.
-  curl -fsSL --retry 3 --connect-timeout 30 --speed-limit 1024 --speed-time 60 -o "$3.part.$$" "$1" || { echo "tools.sh: download of $1 failed" >&2; rm -f "$3.part.$$"; return 1; }
-  local got; got="$(_ct_sha256 "$3.part.$$")"
-  [ "$got" = "$2" ] || { echo "tools.sh: sha256 mismatch for $1: expected $2, got $got" >&2; rm -f "$3.part.$$"; return 1; }
-  mv "$3.part.$$" "$3"
-}
+_ct_fetch() (
+  [ -f "$3" ] && [ "$(_ct_sha256 "$3")" = "$2" ] && exit 0
+  mkdir -p "$(dirname "$3")" || exit 1
+  part="$(mktemp "$3.part.XXXXXX")" || exit 1
+  trap 'rm -f "$part"' EXIT
+  trap 'exit 1' HUP INT TERM
+  curl -fsSL --retry 3 --retry-max-time 660 --max-time 600 --max-filesize 536870912 --connect-timeout 30 --speed-limit 1024 --speed-time 60 -o "$part" "$1" || { echo "tools.sh: download failed" >&2; exit 1; }
+  got="$(_ct_sha256 "$part")"
+  [ "$got" = "$2" ] || { echo "tools.sh: sha256 mismatch: expected $2, got $got" >&2; exit 1; }
+  mv "$part" "$3"
+)
 
 # _ct_publish <staged dir> <dir> <probe>: move a fully staged install into place in one rename; true
 # only when <dir>/<probe> is executable after it. Concurrent runs share the cache: a run that finds
@@ -43,24 +47,26 @@ _ct_fetch() {
 # replaced, never used.
 _ct_publish() {
   python3 -I - "$1" "$2" "$3" <<'PY'
-import os, shutil, sys
+import fcntl, os, shutil, sys
 stage, dest, probe = sys.argv[1:4]
 done = lambda: os.access(os.path.join(dest, probe), os.X_OK)
-for _ in range(2):
-    try:
-        os.rename(stage, dest)
-        break
-    except OSError:
-        if done():
-            break
-        stale = f"{dest}.stale.{os.getpid()}"
-        try:
-            os.rename(dest, stale)
-        except OSError:
-            pass
-        shutil.rmtree(stale, ignore_errors=True)
-shutil.rmtree(stage, ignore_errors=True)
-sys.exit(0 if done() else 1)
+try:
+    with open(dest + ".lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not done():
+            if os.path.lexists(dest):
+                if os.path.islink(dest):
+                    os.unlink(dest)
+                else:
+                    shutil.rmtree(dest)
+            os.rename(stage, dest)
+        if not done():
+            raise OSError("published tool has no executable probe")
+except OSError as error:
+    print(f"tools.sh: cannot publish {dest}: {error}", file=sys.stderr)
+    sys.exit(1)
+finally:
+    shutil.rmtree(stage, ignore_errors=True)
 PY
 }
 
@@ -86,11 +92,13 @@ _ct_node() {
   dir="$_ct_root/node-$_ct_node_ver-$plat"
   if [ ! -x "$dir/bin/node" ]; then
     _ct_fetch "https://nodejs.org/dist/$_ct_node_ver/node-$_ct_node_ver-$plat.tar.gz" "$sha" "$_ct_root/node-$_ct_node_ver-$plat.tar.gz" || return 1
-    local stage="$_ct_root/.node-stage.$$"
-    rm -rf "$stage"; mkdir -p "$stage" || return 1
-    tar -xzf "$_ct_root/node-$_ct_node_ver-$plat.tar.gz" -C "$stage" || { rm -rf "$stage"; return 1; }
-    _ct_publish "$stage/node-$_ct_node_ver-$plat" "$dir" bin/node || { rm -rf "$stage"; return 1; }
-    rm -rf "$stage"
+    (
+      stage="$(mktemp -d "$_ct_root/.node-stage.XXXXXX")" || exit 1
+      trap 'rm -rf "$stage"' EXIT
+      trap 'exit 1' HUP INT TERM
+      tar -xzf "$_ct_root/node-$_ct_node_ver-$plat.tar.gz" -C "$stage" || exit 1
+      _ct_publish "$stage/node-$_ct_node_ver-$plat" "$dir" bin/node
+    ) || return 1
   fi
   PATH="$dir/bin:$PATH"; export PATH
 }
@@ -101,6 +109,7 @@ _ct_rust() {
   case "$(uname -s)-$(uname -m)" in
     Linux-x86_64)  t=x86_64-unknown-linux-gnu;  sha=20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c ;;
     Linux-aarch64) t=aarch64-unknown-linux-gnu; sha=e3853c5a252fca15252d07cb23a1bdd9377a8c6f3efa01531109281ae47f841c ;;
+    Darwin-x86_64) t=x86_64-apple-darwin;      sha=9c331076f62b4d0edeae63d9d1c9442d5fe39b37b05025ec8d41c5ed35486496 ;;
     Darwin-arm64)  t=aarch64-apple-darwin;      sha=20ef5516c31b1ac2290084199ba77dbbcaa1406c45c1d978ca68558ef5964ef5 ;;
     *) echo "tools.sh: no pinned rustup for $(uname -s)-$(uname -m)" >&2; return 1 ;;
   esac
@@ -109,15 +118,25 @@ _ct_rust() {
   export RUSTUP_HOME CARGO_HOME
   if [ ! -x "$CARGO_HOME/bin/cargo" ]; then
     _ct_fetch "https://static.rust-lang.org/rustup/archive/$_ct_rustup_ver/$t/rustup-init" "$sha" "$_ct_root/rustup-init-$t" || return 1
-    chmod +x "$_ct_root/rustup-init-$t"
-    local stage="$_ct_root/.rustup-stage.$$"
-    rm -rf "$stage"
-    RUSTUP_HOME="$stage/rustup" CARGO_HOME="$stage/cargo" "$_ct_root/rustup-init-$t" -y --no-modify-path --default-toolchain none \
-      || { rm -rf "$stage"; return 1; }
-    _ct_publish "$stage" "$home" cargo/bin/cargo || return 1
+    chmod +x "$_ct_root/rustup-init-$t" || { echo "tools.sh: cannot make rustup installer executable" >&2; return 1; }
+    (
+      stage="$(mktemp -d "$_ct_root/.rustup-stage.XXXXXX")" || exit 1
+      trap 'rm -rf "$stage"' EXIT
+      trap 'exit 1' HUP INT TERM
+      RUSTUP_HOME="$stage/rustup" CARGO_HOME="$stage/cargo" "$_ct_root/rustup-init-$t" -y --no-modify-path --default-toolchain none || exit 1
+      _ct_publish "$stage" "$home" cargo/bin/cargo
+    ) || return 1
   fi
   PATH="$CARGO_HOME/bin:$PATH"; export PATH
-  rustup toolchain install || { echo "tools.sh: rustup toolchain install failed" >&2; return 1; }
+  [ -f rust-toolchain.toml ] || [ -f rust-toolchain ] || { echo "tools.sh: no pinned Rust toolchain" >&2; return 1; }
+  python3 -I - "$home/toolchain.lock" <<'PY'
+import fcntl, subprocess, sys
+with open(sys.argv[1], "a") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    ready = subprocess.run(["rustup", "show", "active-toolchain"], stdout=subprocess.DEVNULL)
+    if ready.returncode:
+        sys.exit(subprocess.call(["rustup", "toolchain", "install"]))
+PY
 }
 
 for _ct_t in "$@"; do
