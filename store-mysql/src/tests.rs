@@ -39,8 +39,11 @@ impl Lookup for MysqlStore {
 }
 
 /// A name-keyed `usage_units` map from literal pairs — the 1.6.0 shape of what used to be the four `TierTokens`/`TierTokensDelta` fields.
-fn units<V: Copy>(pairs: &[(&str, V)]) -> BTreeMap<String, V> {
-    pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+fn units<V: Copy + Into<i128>>(pairs: &[(&str, V)]) -> BTreeMap<String, i128> {
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), (*v).into()))
+        .collect()
 }
 
 fn test_url() -> Option<String> {
@@ -999,7 +1002,7 @@ fn list_metering_keeps_model_spellings_apart_and_units_on_their_cell() {
         }
     };
     clean(&mut conn);
-    let delta = |model: &str, usage_units: BTreeMap<String, u64>| MeteringDelta {
+    let delta = |model: &str, usage_units: BTreeMap<String, i128>| MeteringDelta {
         scale: 6,
         key_id: key.to_string(),
         bucket,
@@ -3226,12 +3229,12 @@ fn a_released_1_5_database_upgrades_in_place() {
     assert_eq!(
         usage.models[0].usage_units,
         units(&[
-            (UNIT_INPUT, 100),
-            (UNIT_OUTPUT, 50),
-            (UNIT_CACHE_READ, 7),
-            (UNIT_CACHE_WRITE, 3)
+            (UNIT_INPUT, 100_000_000),
+            (UNIT_OUTPUT, 50_000_000),
+            (UNIT_CACHE_READ, 7_000_000),
+            (UNIT_CACHE_WRITE, 3_000_000)
         ]),
-        "the four token columns ARE the reserved units — no data migration, nothing lost"
+        "the four token columns ARE the reserved units — whole units become micro-units exactly"
     );
     let meter = store.list_metering(20_260_731).unwrap();
     assert_eq!(meter.len(), 1);
@@ -3241,7 +3244,7 @@ fn a_released_1_5_database_upgrades_in_place() {
             meter[0].tokens_input,
             meter[0].priced_from_ms
         ),
-        (4, 40, 0),
+        (4, 40_000_000, 0),
         "a 1.5 metering cell reads back unchanged, dated at the opening card (0)"
     );
     assert_eq!(store.list_audit().unwrap().len(), 1);
@@ -3356,7 +3359,10 @@ fn unsupported_v6_development_database_is_refused_without_changing_plane_state()
         let error = MysqlStore::connect(&db.url)
             .err()
             .expect("unsupported schema 6 is refused");
-        assert!(error.contains("newer than this build"), "{error}");
+        assert!(
+            error.contains("unsupported development schema v6"),
+            "{error}"
+        );
         assert_eq!(schema_version_of(&db), "6", "not restamped");
         assert_eq!(schema_shape(&db), shape, "no schema mutation");
         assert_eq!(
@@ -3583,22 +3589,22 @@ fn assert_1_5_5_rows_read_back(store: &MysqlStore) {
             assert_eq!(row.pricing_version, fx_str(w, "pricing_version"), "{w}");
             assert_eq!(
                 row.tokens_input,
-                fx_u64(w, "tokens_input") * 1_000_000,
+                i128::from(fx_u64(w, "tokens_input")) * 1_000_000,
                 "{w}"
             );
             assert_eq!(
                 row.tokens_output,
-                fx_u64(w, "tokens_output") * 1_000_000,
+                i128::from(fx_u64(w, "tokens_output")) * 1_000_000,
                 "{w}"
             );
             assert_eq!(
                 row.tokens_cache_read,
-                fx_u64(w, "tokens_cache_read") * 1_000_000,
+                i128::from(fx_u64(w, "tokens_cache_read")) * 1_000_000,
                 "{w}"
             );
             assert_eq!(
                 row.tokens_cache_write,
-                fx_u64(w, "tokens_cache_write") * 1_000_000,
+                i128::from(fx_u64(w, "tokens_cache_write")) * 1_000_000,
                 "{w}"
             );
             assert_eq!(row.priced_from_ms, 0, "a 1.5.5 row is undated: {w}");
@@ -3637,7 +3643,7 @@ fn assert_1_5_5_rows_read_back(store: &MysqlStore) {
                 .sum::<u64>(),
             "billable requests of {bucket}@{start}"
         );
-        let mut want: Vec<(String, BTreeMap<String, u64>)> = rows
+        let mut want: Vec<(String, BTreeMap<String, i128>)> = rows
             .iter()
             .filter(|w| !fx_str(w, "model").is_empty())
             .map(|w| {
@@ -3648,7 +3654,7 @@ fn assert_1_5_5_rows_read_back(store: &MysqlStore) {
                     (UNIT_CACHE_READ, "tokens_cache_read"),
                     (UNIT_CACHE_WRITE, "tokens_cache_write"),
                 ] {
-                    let v = fx_u64(w, col) * 1_000_000;
+                    let v = i128::from(fx_u64(w, col)) * 1_000_000;
                     if v != 0 {
                         m.insert(unit.to_string(), v);
                     }
@@ -3657,7 +3663,7 @@ fn assert_1_5_5_rows_read_back(store: &MysqlStore) {
             })
             .collect();
         assert!(got.models.iter().all(|model| model.scale == 6));
-        let mut have: Vec<(String, BTreeMap<String, u64>)> = got
+        let mut have: Vec<(String, BTreeMap<String, i128>)> = got
             .models
             .iter()
             .map(|m| (m.model.clone(), m.usage_units.clone()))
@@ -3917,9 +3923,11 @@ fn a_newer_schema_is_refused_at_open() {
 /// Released schema v2 remains an accepted upgrade source.
 #[test]
 fn released_schema_versions_are_accepted() {
-    for version in 0..=SCHEMA_VERSION {
+    for version in (0..=SCHEMA_VERSION).filter(|version| *version != 6) {
         crate::MysqlStore::refuse_unknown_schema(version, None).unwrap();
     }
+    assert!(crate::MysqlStore::refuse_unknown_schema(6, None).is_err());
+    assert!(crate::MysqlStore::refuse_unknown_schema(5, Some(6)).is_err());
     assert!(crate::MysqlStore::refuse_unknown_schema(SCHEMA_VERSION + 1, None).is_err());
 }
 
@@ -4815,3 +4823,5 @@ fn a_failing_rollback_does_not_replace_the_refusal() {
 mod exact_counts;
 
 mod migration_count_bounds;
+
+mod migration_request_counters;

@@ -63,6 +63,7 @@ busbar_contract::statement_extensions!(EXTENSIONS: [
     (busbar_contract::abi::sdk::store::rewrap::INTENT, b"1"),
     (conditional::CAPABILITY, b"1"),
     ("busbar.store.count-scale", b"6"),
+    ("busbar.store.count-range", b"i128"),
     (correction::CAPABILITY, b"1"),
 ]);
 

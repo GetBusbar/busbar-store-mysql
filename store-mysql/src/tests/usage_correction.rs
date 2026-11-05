@@ -19,11 +19,11 @@ const OPEN_UNIT: &str = "audio_seconds";
 const BLOCKED_BUCKET: &str = "b";
 
 fn ledger(count: u64) -> UsageLedger {
-    ledger_parts(count, count)
+    ledger_parts(count, i128::from(count))
 }
 
 /// Request width and quantity width are independent: these fixtures state both explicitly.
-fn ledger_parts(requests: u64, quantity: u64) -> UsageLedger {
+fn ledger_parts(requests: u64, quantity: i128) -> UsageLedger {
     UsageLedger {
         requests,
         billable_requests: requests,
@@ -81,6 +81,35 @@ fn prepare(db: &ScratchDb) -> MysqlStore {
 }
 
 #[test]
+fn i128_correction_boundaries_atomic_refusal_and_reopen() {
+    let _ddl = lock_fresh_database_ddl();
+    let Some(db) = ScratchDb::new("correction_i128") else {
+        return;
+    };
+    let store = prepare(&db);
+    let wide = ledger_parts(u64::MAX, i128::MAX);
+    let request = candidate(901, UsageLedger::default(), wide.clone());
+    assert_eq!(apply(&store, &request), Ok(Decision::Applied));
+    assert_eq!(read(&store, "a"), wide);
+    assert_eq!(apply(&store, &request), Ok(Decision::Applied));
+    let bad = candidate(902, wide.clone(), ledger_parts(0, i128::MIN));
+    assert!(
+        apply(&store, &bad).is_err(),
+        "explicit correction cannot install a negative total"
+    );
+    assert_eq!(read(&store, "a"), wide);
+    assert_eq!(receipt(&db, &bad), None);
+    let downward = candidate(902, wide, ledger_parts(0, i128::from(u64::MAX) + 1));
+    assert_eq!(apply(&store, &downward), Ok(Decision::Applied));
+    let expected = read(&store, "a");
+    drop(store);
+    let reopened = MysqlStore::connect(&db.url).unwrap();
+    assert_eq!(read(&reopened, "a"), expected);
+    assert_eq!(apply(&reopened, &downward), Ok(Decision::Applied));
+    assert_eq!(read(&reopened, "a"), expected);
+}
+
+#[test]
 fn loaded_correction_replaces_unsigned_counts_and_replays_before_predicates() {
     let _ddl = lock_fresh_database_ddl();
     let Some(db) = ScratchDb::new("correction_replay") else {
@@ -89,11 +118,7 @@ fn loaded_correction_replaces_unsigned_counts_and_replays_before_predicates() {
     let store = prepare(&db);
     assert!(busbar_contract::store_calls::StoreCalls::supports_usage_correction(&*store));
     const { assert!(<crate::MysqlStore as StoreSlots>::USAGE_CORRECTION) };
-    let mut request = candidate(
-        1,
-        UsageLedger::default(),
-        ledger_parts(u64::MAX, i64::MAX as u64),
-    );
+    let mut request = candidate(1, UsageLedger::default(), ledger_parts(u64::MAX, i128::MAX));
     request.usage.insert(
         0,
         UsageChange {
@@ -117,7 +142,7 @@ fn loaded_correction_replaces_unsigned_counts_and_replays_before_predicates() {
     }
     let revision = super::credential_rewrap::revision(&db);
     assert_eq!(apply(&store, &request), Ok(Decision::Applied));
-    assert_eq!(read(&store, "a"), ledger_parts(u64::MAX, i64::MAX as u64));
+    assert_eq!(read(&store, "a"), ledger_parts(u64::MAX, i128::MAX));
     assert_eq!(store.get_usage("a", 0).unwrap(), ledger(11));
     assert_eq!(read(&store, correction::ADJUST_UP_BUCKET), ledger(12));
     assert_eq!(read(&store, correction::ADJUST_DOWN_BUCKET), ledger(12));
@@ -623,7 +648,7 @@ fn correction_high_unsigned_counters_survive_ordinary_accrual_refund_and_reopen(
     let request = candidate(
         12,
         UsageLedger::default(),
-        ledger_parts(u64::MAX, i64::MAX as u64),
+        ledger_parts(u64::MAX, i128::MAX),
     );
     assert_eq!(apply(&store, &request), Ok(Decision::Applied));
     let delta = |count| UsageDelta {
@@ -636,24 +661,21 @@ fn correction_high_unsigned_counters_survive_ordinary_accrual_refund_and_reopen(
         }],
     };
     assert!(store.add_usage("a", DAY, &delta(1)).is_err());
-    assert_eq!(read(&store, "a"), ledger_parts(u64::MAX, i64::MAX as u64));
+    assert_eq!(read(&store, "a"), ledger_parts(u64::MAX, i128::MAX));
     store
         .add_usage_op(OpId::from_parts(NODE, 13), "a", DAY, &delta(-1))
         .unwrap();
-    assert_eq!(
-        read(&store, "a"),
-        ledger_parts(u64::MAX - 1, i64::MAX as u64 - 1)
-    );
+    assert_eq!(read(&store, "a"), ledger_parts(u64::MAX - 1, i128::MAX - 1));
     drop(store);
     let reopened = MysqlStore::connect(&db.url).unwrap();
     assert_eq!(
         read(&reopened, "a"),
-        ledger_parts(u64::MAX - 1, i64::MAX as u64 - 1)
+        ledger_parts(u64::MAX - 1, i128::MAX - 1)
     );
     assert_eq!(apply(&reopened, &request), Ok(Decision::Applied));
     assert_eq!(
         read(&reopened, "a"),
-        ledger_parts(u64::MAX - 1, i64::MAX as u64 - 1)
+        ledger_parts(u64::MAX - 1, i128::MAX - 1)
     );
 }
 
@@ -704,13 +726,13 @@ fn empty_model_identity_shares_sentinel_without_losing_requests_tokens_or_open_u
         *count += 1;
     }
     assert_eq!(read(&store, "a"), accrued);
-    let request = candidate(14, accrued, with_empty(u64::MAX, i64::MAX as u64));
+    let request = candidate(14, accrued, with_empty(u64::MAX, i128::MAX));
     assert_eq!(apply(&store, &request), Ok(Decision::Applied));
-    assert_eq!(read(&store, "a"), with_empty(u64::MAX, i64::MAX as u64));
+    assert_eq!(read(&store, "a"), with_empty(u64::MAX, i128::MAX));
     store
         .add_usage_op(OpId::from_parts(NODE, 15), "a", DAY, &delta(-1))
         .unwrap();
-    let mut refunded = with_empty(u64::MAX, i64::MAX as u64);
+    let mut refunded = with_empty(u64::MAX, i128::MAX);
     refunded.requests -= 1;
     refunded.billable_requests -= 1;
     for count in refunded.models[0].usage_units.values_mut() {

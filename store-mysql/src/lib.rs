@@ -8,7 +8,7 @@
 
 use std::sync::{Arc, LazyLock};
 
-use busbar_contract::abi::sdk::store::column::{clamp, storable_i64};
+use busbar_contract::abi::sdk::store::column::storable_i64;
 use busbar_contract::abi::sdk::store::fork;
 use busbar_contract::abi::sdk::store::wire::Pool;
 use mysql_common::params;
@@ -19,9 +19,9 @@ use mysqlwire::{Conn, Error, Opts, Params, Row, Transaction};
 
 use busbar_contract::records::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, ModelTokens,
-    ModelTokensDelta, PlaneDisposition, PlaneRecord, PlaneSelector, RecordStoreError,
-    RecordStoreResult, Retention, ScopeRef, SecretForm, UsageDelta, UsageLedger, VirtualKey,
-    UNIT_CACHE_READ, UNIT_CACHE_WRITE, UNIT_INPUT, UNIT_OUTPUT,
+    PlaneDisposition, PlaneRecord, PlaneSelector, RecordStoreError, RecordStoreResult, Retention,
+    ScopeRef, SecretForm, UsageDelta, UsageLedger, VirtualKey, UNIT_CACHE_READ, UNIT_CACHE_WRITE,
+    UNIT_INPUT, UNIT_OUTPUT,
 };
 use std::collections::BTreeMap;
 
@@ -115,8 +115,35 @@ fn apply_err(e: Error) -> ApplyError {
 }
 
 /// The schema version this build creates and migrates to. An older released database is v3;
-/// v5 converts quantity aggregates to checked micro-units, leaving request counters unchanged.
-pub const SCHEMA_VERSION: u32 = 5;
+/// v7 stores checked i128 micro-units; v5 already stored micro-units and is never rescaled.
+pub const SCHEMA_VERSION: u32 = 7;
+
+const QUANTITY_FORMAT_KEY: &str = "quantity_format";
+const QUANTITY_FORMAT: &str = "i128-scale6-v1";
+const QUANTITY_MAX: &str = "170141183460469231731687303715884105727";
+const WHOLE_QUANTITY_MAX: &str = "170141183460469231731687303715884";
+const QUANTITY_TABLES: &[(&str, &[&str])] = &[
+    (
+        "usage_windows",
+        &[
+            "tokens_input",
+            "tokens_output",
+            "tokens_cache_read",
+            "tokens_cache_write",
+        ],
+    ),
+    ("usage_window_units", &["count"]),
+    (
+        "usage_metering",
+        &[
+            "tokens_input",
+            "tokens_output",
+            "tokens_cache_read",
+            "tokens_cache_write",
+        ],
+    ),
+    ("usage_metering_units", &["count"]),
+];
 
 /// Every key and identity column v11 makes byte-exact, per table, with its v11 definition (v14 subsequently widens the four model columns).
 const V11_EXACT_KEY_COLUMNS: &[(&str, &[(&str, &str)])] = &[
@@ -309,10 +336,10 @@ const SCHEMA: &[&str] = &[
         model VARBINARY(1088) NOT NULL,
         requests BIGINT UNSIGNED NOT NULL DEFAULT 0,
         billable_requests BIGINT UNSIGNED NOT NULL DEFAULT 0,
-        tokens_input BIGINT UNSIGNED NOT NULL DEFAULT 0,
-        tokens_output BIGINT UNSIGNED NOT NULL DEFAULT 0,
-        tokens_cache_read BIGINT UNSIGNED NOT NULL DEFAULT 0,
-        tokens_cache_write BIGINT UNSIGNED NOT NULL DEFAULT 0,
+        tokens_input DECIMAL(39,0) NOT NULL DEFAULT 0,
+        tokens_output DECIMAL(39,0) NOT NULL DEFAULT 0,
+        tokens_cache_read DECIMAL(39,0) NOT NULL DEFAULT 0,
+        tokens_cache_write DECIMAL(39,0) NOT NULL DEFAULT 0,
         PRIMARY KEY (window_start, bucket_scope, bucket_id, model),
         CONSTRAINT ck_uw_scope CHECK (bucket_scope IN ('key','group','global'))
     ) ENGINE=InnoDB",
@@ -325,10 +352,10 @@ const SCHEMA: &[&str] = &[
         pricing_version VARCHAR(64) NOT NULL DEFAULT '',
         requests BIGINT UNSIGNED NOT NULL DEFAULT 0,
         billable_requests BIGINT UNSIGNED NOT NULL DEFAULT 0,
-        tokens_input BIGINT UNSIGNED NOT NULL DEFAULT 0,
-        tokens_output BIGINT UNSIGNED NOT NULL DEFAULT 0,
-        tokens_cache_read BIGINT UNSIGNED NOT NULL DEFAULT 0,
-        tokens_cache_write BIGINT UNSIGNED NOT NULL DEFAULT 0,
+        tokens_input DECIMAL(39,0) NOT NULL DEFAULT 0,
+        tokens_output DECIMAL(39,0) NOT NULL DEFAULT 0,
+        tokens_cache_read DECIMAL(39,0) NOT NULL DEFAULT 0,
+        tokens_cache_write DECIMAL(39,0) NOT NULL DEFAULT 0,
         priced_from_ms BIGINT UNSIGNED NOT NULL DEFAULT 0,
         PRIMARY KEY (key_id, bucket, model, provider, priced_from_ms)
     ) ENGINE=InnoDB",
@@ -402,7 +429,7 @@ const SCHEMA: &[&str] = &[
         bucket_id VARBINARY(128) NOT NULL,
         model VARBINARY(1088) NOT NULL,
         unit VARBINARY(512) NOT NULL,
-        count BIGINT UNSIGNED NOT NULL DEFAULT 0,
+        count DECIMAL(39,0) NOT NULL DEFAULT 0,
         PRIMARY KEY (window_start, bucket_scope, bucket_id, model, unit)
     ) ENGINE=InnoDB",
 
@@ -416,7 +443,7 @@ const SCHEMA: &[&str] = &[
         model VARBINARY(1088) NOT NULL,
         priced_from_ms BIGINT UNSIGNED NOT NULL DEFAULT 0,
         unit VARBINARY(512) NOT NULL,
-        count BIGINT UNSIGNED NOT NULL DEFAULT 0,
+        count DECIMAL(39,0) NOT NULL DEFAULT 0,
         PRIMARY KEY (key_id, bucket, model, provider, priced_from_ms, unit)
     ) ENGINE=InnoDB",
     "CREATE INDEX idx_metering_units_bucket ON usage_metering_units (bucket)",
@@ -817,6 +844,11 @@ impl MysqlStore {
         prior_version: u32,
         migrating_to: Option<u32>,
     ) -> RecordStoreResult<()> {
+        if prior_version == 6 || migrating_to == Some(6) {
+            return Err(store_err(
+                "mysql store: unsupported development schema v6; refusing to open",
+            ));
+        }
         if prior_version > SCHEMA_VERSION {
             return Err(store_err(format!(
                 "mysql store: database schema v{prior_version} is newer than this build \
@@ -925,6 +957,7 @@ impl MysqlStore {
         let migrating_to = Self::read_meta_u32(conn, "store_meta", MIGRATING_TO).await?;
 
         Self::refuse_unknown_schema(prior_version, migrating_to)?;
+        Self::check_quantity_format(conn, prior_version).await?;
         if prior_version == SCHEMA_VERSION && migrating_to.is_none() {
             return Self::apply_schema(conn, prior_version).await;
         }
@@ -947,6 +980,7 @@ impl MysqlStore {
         let prior_version = Self::read_prior_version(conn, "store_meta").await?;
         let migrating_to = Self::read_meta_u32(conn, "store_meta", MIGRATING_TO).await?;
         Self::refuse_unknown_schema(prior_version, migrating_to)?;
+        Self::check_quantity_format(conn, prior_version).await?;
         if prior_version > 0 && prior_version < SCHEMA_VERSION {
             conn.query_drop(format!(
                 "INSERT INTO store_meta (k, v) VALUES ('{MIGRATING_TO}', '{SCHEMA_VERSION}') \
@@ -1119,8 +1153,9 @@ impl MysqlStore {
             Self::run_v13_metering_attribution(conn).await?;
             Self::run_v14_raw_era_models(conn).await?;
         }
-        if prior_version < 5 {
-            Self::migrate_exact_counts(conn).await?;
+        if prior_version < SCHEMA_VERSION {
+            Self::widen_quantity_columns(conn).await?;
+            Self::migrate_exact_counts(conn, prior_version < 5).await?;
         }
 
         conn.query_drop(
@@ -1130,72 +1165,174 @@ impl MysqlStore {
         .await
         .map_err(store_err)?;
 
+        Self::migrate_request_counters(conn).await
+    }
+
+    /// Released stores kept request counters on model rows. Move their aggregate to the
+    /// empty-model row used by current additive writes, without changing any quantities.
+    /// A separate marker also upgrades databases already stamped v5. The ledger sequence
+    /// serializes concurrent booters and live writers; conversion and marker commit together.
+    async fn migrate_request_counters(conn: &mut Conn) -> RecordStoreResult<()> {
+        const MARKER: &str = "usage_request_totals_v1";
+        let mut tx = conn.start_transaction().await.map_err(store_err)?;
+        slots::lock_ledger_sequence(&mut tx)
+            .await
+            .map_err(|error| store_err(error.text))?;
+        let marker: Option<String> = tx
+            .exec_first(
+                "SELECT v FROM store_meta WHERE k=:marker FOR UPDATE",
+                params! { "marker" => MARKER },
+            )
+            .await
+            .map_err(store_err)?;
+        if let Some(value) = marker {
+            if value != "1" {
+                return Err(store_err(
+                    "invalid usage_request_totals_v1 migration marker",
+                ));
+            }
+            return tx.commit().await.map_err(store_err);
+        }
+        // SUM uses decimal arithmetic, so a historical aggregate wider than u64 can be
+        // saturated before insertion. Existing empty-model quantity columns are untouched.
+        tx.query_drop(format!(
+            "INSERT INTO usage_windows
+                (window_start,bucket_scope,bucket_id,model,requests,billable_requests)
+             SELECT window_start,bucket_scope,bucket_id,'',
+                LEAST(SUM(requests),{USAGE_COUNTER_CEILING}),
+                LEAST(SUM(billable_requests),{USAGE_COUNTER_CEILING})
+             FROM usage_windows GROUP BY window_start,bucket_scope,bucket_id
+             ON DUPLICATE KEY UPDATE requests=VALUES(requests),
+                billable_requests=VALUES(billable_requests)"
+        ))
+        .await
+        .map_err(store_err)?;
+        tx.query_drop(
+            "UPDATE usage_windows SET requests=0,billable_requests=0
+             WHERE model<>'' AND (requests<>0 OR billable_requests<>0)",
+        )
+        .await
+        .map_err(store_err)?;
+        tx.exec_drop(
+            "INSERT INTO store_meta(k,v) VALUES(:marker,'1')",
+            params! { "marker" => MARKER },
+        )
+        .await
+        .map_err(store_err)?;
+        tx.commit().await.map_err(store_err)
+    }
+
+    /// A v7 marker cannot be confused with any unreleased development schema.
+    async fn check_quantity_format(conn: &mut Conn, version: u32) -> RecordStoreResult<()> {
+        if version != SCHEMA_VERSION {
+            return Ok(());
+        }
+        let format: Option<String> = conn
+            .exec_first(
+                "SELECT v FROM store_meta WHERE k=:key",
+                params! { "key" => QUANTITY_FORMAT_KEY },
+            )
+            .await
+            .map_err(store_err)?;
+        if format.as_deref() != Some(QUANTITY_FORMAT) {
+            return Err(store_err("mysql store: schema v7 lacks the exact i128 quantity format marker; refusing to open"));
+        }
         Ok(())
     }
 
-    /// All quantity preflight, conversion and the marker commit together. DDL is already
-    /// complete; a failed or interrupted conversion rolls back and can be reopened safely.
-    async fn migrate_exact_counts(conn: &mut Conn) -> RecordStoreResult<()> {
-        // Keep the scanned rows and insertion gaps locked until conversion commits, even
-        // when the server's default isolation level is READ COMMITTED.
+    /// DDL is idempotent and happens before scaling, while the migration lock is held.
+    async fn widen_quantity_columns(conn: &mut Conn) -> RecordStoreResult<()> {
+        for (table, columns) in QUANTITY_TABLES {
+            let mut changes = Vec::new();
+            for column in *columns {
+                let shape: Option<(String, Option<u64>, Option<u64>)> = conn.exec_first(
+                    "SELECT DATA_TYPE,NUMERIC_PRECISION,NUMERIC_SCALE FROM information_schema.columns
+                     WHERE table_schema=DATABASE() AND table_name=:table AND column_name=:column",
+                    params! { "table" => *table, "column" => *column },
+                ).await.map_err(store_err)?;
+                if shape != Some(("decimal".into(), Some(39), Some(0))) {
+                    changes.push(format!(
+                        "MODIFY COLUMN {column} DECIMAL(39,0) NOT NULL DEFAULT 0"
+                    ));
+                }
+            }
+            if !changes.is_empty() {
+                conn.query_drop(format!("ALTER TABLE {table} {}", changes.join(", ")))
+                    .await
+                    .map_err(store_err)?;
+            }
+            let constraint = format!("{table}_quantity_i128");
+            if !Self::exists(
+                conn,
+                "table_constraints",
+                "table_name=:table AND constraint_name=:name",
+                params! { "table" => *table, "name" => &constraint },
+            )
+            .await?
+            {
+                let bounds = columns
+                    .iter()
+                    .map(|column| format!("{column} BETWEEN 0 AND {QUANTITY_MAX}"))
+                    .collect::<Vec<_>>()
+                    .join(" AND ");
+                conn.query_drop(format!(
+                    "ALTER TABLE {table} ADD CONSTRAINT {constraint} CHECK ({bounds})"
+                ))
+                .await
+                .map_err(store_err)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Quantity conversion and both format markers commit together after widening DDL.
+    /// Existing v5 mantissas are already micro-units: validate them, never rescale them.
+    async fn migrate_exact_counts(conn: &mut Conn, whole_units: bool) -> RecordStoreResult<()> {
         conn.query_drop("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
             .await
             .map_err(store_err)?;
         let mut tx = conn.start_transaction().await.map_err(store_err)?;
-        let tables = [
-            (
-                "usage_windows",
-                &[
-                    "tokens_input",
-                    "tokens_output",
-                    "tokens_cache_read",
-                    "tokens_cache_write",
-                ][..],
-            ),
-            ("usage_window_units", &["count"][..]),
-            (
-                "usage_metering",
-                &[
-                    "tokens_input",
-                    "tokens_output",
-                    "tokens_cache_read",
-                    "tokens_cache_write",
-                ][..],
-            ),
-            ("usage_metering_units", &["count"][..]),
-        ];
-        for (table, columns) in tables {
+        let ceiling = if whole_units {
+            WHOLE_QUANTITY_MAX
+        } else {
+            QUANTITY_MAX
+        };
+        for (table, columns) in QUANTITY_TABLES {
             let invalid = columns
                 .iter()
-                .map(|column| format!("{column} > 9223372036854"))
+                .map(|column| format!("{column}<0 OR {column}>{ceiling}"))
                 .collect::<Vec<_>>()
                 .join(" OR ");
-            // A locking aggregate scans and locks every row but returns one result.
-            // Returning the rows themselves would exceed the wire client's per-result
-            // budget on a large database, even when query_drop discards the rows.
-            // Evaluate the preflight in this locking read, not a separate snapshot.
             let invalid: Option<u64> = tx
                 .query_first(format!(
-                    "SELECT COALESCE(MAX({invalid}), 0) FROM {table} FOR UPDATE"
+                    "SELECT COALESCE(MAX({invalid}),0) FROM {table} FOR UPDATE"
                 ))
                 .await
                 .map_err(store_err)?;
             if invalid != Some(0) {
                 return Err(store_err(format!(
-                    "exact count migration: {table} contains a quantity outside the scale-6 range; nothing was converted"
+                    "exact count migration: {table} contains a quantity outside the nonnegative i128 scale-6 range; nothing was converted"
                 )));
             }
         }
-        for (table, columns) in tables {
-            let assignments = columns
-                .iter()
-                .map(|column| format!("{column} = {column} * 1000000"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            tx.query_drop(format!("UPDATE {table} SET {assignments}"))
-                .await
-                .map_err(store_err)?;
+        if whole_units {
+            for (table, columns) in QUANTITY_TABLES {
+                let assignments = columns
+                    .iter()
+                    .map(|column| format!("{column}={column}*1000000"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                tx.query_drop(format!("UPDATE {table} SET {assignments}"))
+                    .await
+                    .map_err(store_err)?;
+            }
         }
+        tx.exec_drop(
+            "INSERT INTO store_meta(k,v) VALUES(:key,:format) ON DUPLICATE KEY UPDATE v=VALUES(v)",
+            params! { "key" => QUANTITY_FORMAT_KEY, "format" => QUANTITY_FORMAT },
+        )
+        .await
+        .map_err(store_err)?;
         Self::stamp_schema_version(&mut tx, "store_meta").await?;
         tx.commit().await.map_err(store_err)
     }
@@ -1625,26 +1762,11 @@ fn split_units<V: Copy + Default>(units: &BTreeMap<String, V>) -> (V, V, V, V, V
     )
 }
 
-/// A signed delta as `(up, down)`: the amount to add and the amount to take off, one of them zero.
-fn split_delta(d: i64) -> (u64, u64) {
-    if d >= 0 {
-        (d.unsigned_abs(), 0)
-    } else {
-        (0, d.unsigned_abs())
-    }
-}
-
-/// The metering family's counter ceiling, `i64::MAX`, independent of raw usage replacement.
-const COUNTER_CEILING: &str = "9223372036854775807";
+/// Whole request counters retain the complete unsigned 64-bit range.
+const COUNTER_CEILING: &str = "18446744073709551615";
 
 /// The raw usage ledger's full unsigned ceiling, matching `UsageLedger::apply_delta`.
 const USAGE_COUNTER_CEILING: &str = "18446744073709551615";
-
-/// SQL for a signed delta over a full `BIGINT UNSIGNED` usage counter, floored at zero and saturated without overflowing an intermediate.
-fn sat_add(col: &str, up: &str, down: &str) -> String {
-    let held = format!("(GREATEST({col}, :{down}) - :{down})");
-    format!("{held} + LEAST(:{up}, {USAGE_COUNTER_CEILING} - {held})")
-}
 
 /// SQL for `col` + the inserted row's `col`, pinned at [`COUNTER_CEILING`] instead of erroring.
 fn sat_values(col: &str) -> String {
@@ -1658,11 +1780,11 @@ fn is_reserved_unit(k: &str) -> bool {
 
 /// Rebuild a name-keyed `usage_units` map from the four reserved columns.
 fn reserved_units(
-    input: u64,
-    output: u64,
-    cache_read: u64,
-    cache_write: u64,
-) -> BTreeMap<String, u64> {
+    input: i128,
+    output: i128,
+    cache_read: i128,
+    cache_write: i128,
+) -> BTreeMap<String, i128> {
     let mut m = BTreeMap::new();
     for (k, v) in [
         (UNIT_INPUT, input),
@@ -1705,112 +1827,10 @@ impl MysqlStore {
             refused: true,
         })?;
 
-        // The window's request counters accumulate ONCE, on the `model = ''` sentinel row,
-        // not once per model. Applied inside the per-model loop instead, a single delta added its
-        // request count once for every model it carried, and a delta with no models recorded
-        // nothing. This is the fleet flush primitive, so both errors compounded permanently across
-        // every node and every flush interval.
-        let ((req_up, req_down), (breq_up, breq_down)) = (
-            split_delta(delta.requests),
-            split_delta(delta.billable_requests),
-        );
-        static STATEMENT_1: LazyLock<String> = LazyLock::new(|| {
-            format!(
-                "INSERT INTO usage_windows
-                    (window_start, bucket_scope, bucket_id, model, requests, billable_requests)
-                 VALUES (:w, 'key', :b, '', GREATEST(0, :req), GREATEST(0, :breq))
-                 ON DUPLICATE KEY UPDATE
-                    requests = {},
-                    billable_requests = {}",
-                sat_add("requests", "req_up", "req_down"),
-                sat_add("billable_requests", "breq_up", "breq_down"),
-            )
-        });
-        tx.exec_drop(
-            STATEMENT_1.as_str(),
-            params! {
-                "w" => window_start, "b" => bucket_id,
-                "req" => delta.requests, "breq" => delta.billable_requests,
-                "req_up" => req_up, "req_down" => req_down,
-                "breq_up" => breq_up, "breq_down" => breq_down,
-            },
-        )
-        .await
-        .map_err(apply_err)?;
-
-        let mut models: Vec<&ModelTokensDelta> = delta.models.iter().collect();
-        models.sort_by(|a, b| a.model.cmp(&b.model));
-        for m in models {
-            let (ti, to, cr, cw, open) = split_units(&m.usage_units);
-            // The VALUES(...) row constructor is type-checked against the target UNSIGNED columns
-            // even on rows where ON DUPLICATE KEY UPDATE will fire instead of the INSERT -- MySQL
-            // validates the whole statement's row shape up front. A refund delta's negative i64
-            // would out-of-range error there even though it's never actually inserted as-is. Clamp
-            // each VALUES(...) literal at 0 with its own `GREATEST(0, :x)` (a negative delta on a
-            // brand-new, never-charged row is nonsensical anyway). The UPDATE arithmetic below binds
-            // `split_delta`'s unsigned (up, down) pair through `sat_add`, which floors at 0; the raw
-            // signed value appears only in the clamped VALUES clause.
-            let (ti_s, to_s, cr_s, cw_s) = (
-                split_delta(ti),
-                split_delta(to),
-                split_delta(cr),
-                split_delta(cw),
-            );
-            static STATEMENT_2: LazyLock<String> = LazyLock::new(|| {
-                format!(
-                    "INSERT INTO usage_windows
-                        (window_start, bucket_scope, bucket_id, model,
-                         tokens_input, tokens_output, tokens_cache_read, tokens_cache_write)
-                     VALUES (:w, 'key', :b, :model,
-                             GREATEST(0, :ti), GREATEST(0, :to_), GREATEST(0, :cr), GREATEST(0, :cw))
-                     ON DUPLICATE KEY UPDATE
-                        tokens_input = {},
-                        tokens_output = {},
-                        tokens_cache_read = {},
-                        tokens_cache_write = {}",
-                    sat_add("tokens_input", "ti_up", "ti_down"),
-                    sat_add("tokens_output", "to_up", "to_down"),
-                    sat_add("tokens_cache_read", "cr_up", "cr_down"),
-                    sat_add("tokens_cache_write", "cw_up", "cw_down"),
-                )
-            });
-            tx.exec_drop(
-                STATEMENT_2.as_str(),
-                params! {
-                    "w" => window_start, "b" => bucket_id, "model" => &m.model,
-                    "ti" => ti, "to_" => to, "cr" => cr, "cw" => cw,
-                    "ti_up" => ti_s.0, "ti_down" => ti_s.1,
-                    "to_up" => to_s.0, "to_down" => to_s.1,
-                    "cr_up" => cr_s.0, "cr_down" => cr_s.1,
-                    "cw_up" => cw_s.0, "cw_down" => cw_s.1,
-                },
-            )
-            .await
-            .map_err(apply_err)?;
-
-            for (unit, d) in open {
-                let (up, down) = split_delta(d);
-                static STATEMENT_3: LazyLock<String> = LazyLock::new(|| {
-                    format!(
-                        "INSERT INTO usage_window_units
-                            (window_start, bucket_scope, bucket_id, model, unit, count)
-                         VALUES (:w, 'key', :b, :model, :unit, GREATEST(0, :d))
-                         ON DUPLICATE KEY UPDATE count = {}",
-                        sat_add("count", "up", "down"),
-                    )
-                });
-                tx.exec_drop(
-                    STATEMENT_3.as_str(),
-                    params! {
-                        "w" => window_start, "b" => bucket_id, "model" => &m.model,
-                        "unit" => unit, "d" => d, "up" => up, "down" => down,
-                    },
-                )
-                .await
-                .map_err(apply_err)?;
-            }
-        }
-        Ok(())
+        // Persist the exact checked aggregate under the caller's ledger lock. This shares
+        // the replacement path with corrections, preserves request-counter saturation and
+        // delegates ordinary refund floor-at-zero semantics to checked_apply_delta.
+        Self::put_usage_on(tx, bucket_id, window_start, &checked).await
     }
 
     /// [`busbar_contract::records::RecordStore::add_metering`] on `tx` (see [`Self::add_usage_on`]).
@@ -1825,28 +1845,43 @@ impl MysqlStore {
             refused: true,
         })?;
         let delta = &delta;
-        if let Some(mut checked) = Self::list_metering_key_on(tx, delta.bucket, Some(&delta.key_id))
-            .await
-            .map_err(|e| ApplyError {
-                text: e.0,
-                server_code: None,
-                refused: true,
-            })?
-            .into_iter()
-            .find(|row| {
-                row.model == delta.model
-                    && row.provider == delta.provider
-                    && row.priced_from_ms == delta.priced_from_ms
-                    && row.key_group_at_use == delta.key_group_at_use
-                    && row.pricing_version == delta.pricing_version
-            })
-        {
+        let quantities = if let Some(mut checked) =
+            Self::list_metering_key_on(tx, delta.bucket, Some(&delta.key_id))
+                .await
+                .map_err(|e| ApplyError {
+                    text: e.0,
+                    server_code: None,
+                    refused: true,
+                })?
+                .into_iter()
+                .find(|row| {
+                    row.model == delta.model
+                        && row.provider == delta.provider
+                        && row.priced_from_ms == delta.priced_from_ms
+                        && row.key_group_at_use == delta.key_group_at_use
+                        && row.pricing_version == delta.pricing_version
+                }) {
             checked.checked_add_delta(delta).map_err(|e| ApplyError {
                 text: e.to_string(),
                 server_code: None,
                 refused: true,
             })?;
-        }
+            (
+                checked.tokens_input,
+                checked.tokens_output,
+                checked.tokens_cache_read,
+                checked.tokens_cache_write,
+                checked.usage_units,
+            )
+        } else {
+            (
+                delta.tokens_input,
+                delta.tokens_output,
+                delta.tokens_cache_read,
+                delta.tokens_cache_write,
+                delta.usage_units.clone(),
+            )
+        };
 
         let bucket = format!("{:010}", delta.bucket);
 
@@ -1859,16 +1894,12 @@ impl MysqlStore {
              ON DUPLICATE KEY UPDATE
                 requests = {r},
                 billable_requests = {br},
-                tokens_input = {ti},
-                tokens_output = {to},
-                tokens_cache_read = {cr},
-                tokens_cache_write = {cw}",
+                tokens_input = VALUES(tokens_input),
+                tokens_output = VALUES(tokens_output),
+                tokens_cache_read = VALUES(tokens_cache_read),
+                tokens_cache_write = VALUES(tokens_cache_write)",
             r = sat_values("requests"),
             br = sat_values("billable_requests"),
-            ti = sat_values("tokens_input"),
-            to = sat_values("tokens_output"),
-            cr = sat_values("tokens_cache_read"),
-            cw = sat_values("tokens_cache_write"),
             )
         });
         tx.exec_drop(
@@ -1877,25 +1908,23 @@ impl MysqlStore {
                 "bucket" => &bucket, "key" => &delta.key_id, "provider" => &delta.provider,
                 "model" => &delta.model, "grp" => &delta.key_group_at_use, "pv" => &delta.pricing_version,
                 "pfm" => delta.priced_from_ms,
-                "req" => clamp(delta.requests), "breq" => clamp(delta.billable_requests),
-                "ti" => clamp(delta.tokens_input), "to_" => clamp(delta.tokens_output),
-                "cr" => clamp(delta.tokens_cache_read), "cw" => clamp(delta.tokens_cache_write),
+                "req" => delta.requests, "breq" => delta.billable_requests,
+                "ti" => quantities.0, "to_" => quantities.1,
+                "cr" => quantities.2, "cw" => quantities.3,
             },
         ).await
         .map_err(apply_err)?;
 
-        for (unit, n) in &delta.usage_units {
-            static STATEMENT_5: LazyLock<String> = LazyLock::new(|| {
-                format!("INSERT INTO usage_metering_units
+        for (unit, n) in &quantities.4 {
+            const STATEMENT_5: &str = "INSERT INTO usage_metering_units
                     (bucket, key_id, provider, model, priced_from_ms, key_group_at_use, pricing_version, unit, count)
                  VALUES (:bucket, :key, :provider, :model, :pfm, :grp, :pv, :unit, :n)
-                 ON DUPLICATE KEY UPDATE count = {}", sat_values("count"))
-            });
+                 ON DUPLICATE KEY UPDATE count = VALUES(count)";
             tx.exec_drop(
-                STATEMENT_5.as_str(),
+                STATEMENT_5,
                 params! {
                     "bucket" => &bucket, "key" => &delta.key_id, "provider" => &delta.provider,
-                    "model" => &delta.model, "pfm" => delta.priced_from_ms, "unit" => unit, "n" => clamp(*n),
+                    "model" => &delta.model, "pfm" => delta.priced_from_ms, "unit" => unit, "n" => *n,
                     "grp" => &delta.key_group_at_use, "pv" => &delta.pricing_version,
                 },
             ).await
@@ -2099,7 +2128,7 @@ impl MysqlStore {
         bucket_id: &str,
         window_start: u64,
     ) -> RecordStoreResult<UsageLedger> {
-        let rows: Vec<(String, u64, u64, u64, u64)> = tx
+        let rows: Vec<(String, i128, i128, i128, i128)> = tx
             .exec(
                 "SELECT model, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write \
                  FROM usage_windows WHERE window_start = :w AND bucket_scope = 'key' \
@@ -2120,7 +2149,7 @@ impl MysqlStore {
             .map_err(store_err)?;
         let (requests, billable_requests) = totals.unwrap_or((0, 0));
 
-        let open: Vec<(String, String, u64)> = tx
+        let open: Vec<(String, String, i128)> = tx
             .exec(
                 "SELECT model, unit, count FROM usage_window_units \
                  WHERE bucket_id = :b AND window_start = :w AND bucket_scope = 'key' \
@@ -2163,11 +2192,13 @@ impl MysqlStore {
             models[idx].usage_units.insert(unit, count);
         }
 
-        Ok(UsageLedger {
+        let mut ledger = UsageLedger {
             requests,
             billable_requests,
             models,
-        })
+        };
+        ledger.normalize_scale6().map_err(store_err)?;
+        Ok(ledger)
     }
 
     pub(crate) async fn purge_usage_before(conn: &mut Conn, before: u64) -> RecordStoreResult<u64> {
@@ -2377,7 +2408,7 @@ impl MysqlStore {
                 params! { "b" => &bucket_s, "key" => key },
             ).await
             .map_err(store_err)?;
-        type MeteringUnitRow = (String, String, String, u64, String, String, String, u64);
+        type MeteringUnitRow = (String, String, String, u64, String, String, String, i128);
         type MeteringCell = (String, String, String, u64, String, String);
         let units: Vec<MeteringUnitRow> = tx
             .exec(
@@ -2394,7 +2425,7 @@ impl MysqlStore {
             .await
             .map_err(store_err)?;
 
-        let mut by_cell: BTreeMap<MeteringCell, BTreeMap<String, u64>> = BTreeMap::new();
+        let mut by_cell: BTreeMap<MeteringCell, BTreeMap<String, i128>> = BTreeMap::new();
         for (key_id, model, provider, pfm, group, version, unit, count) in units {
             if count == 0 {
                 continue;
@@ -2422,7 +2453,7 @@ impl MysqlStore {
                     key_group_at_use.clone(),
                     pricing_version.clone(),
                 );
-                Ok(MeteringRow {
+                let mut row = MeteringRow {
                     scale: 6,
                     usage_units: by_cell.remove(&cell).unwrap_or_default(),
                     key_id,
@@ -2437,7 +2468,9 @@ impl MysqlStore {
                     key_group_at_use,
                     pricing_version,
                     priced_from_ms,
-                })
+                };
+                row.normalize_scale6().map_err(store_err)?;
+                Ok(row)
             })
             .collect()
     }

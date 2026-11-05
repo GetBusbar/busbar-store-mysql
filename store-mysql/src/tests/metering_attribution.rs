@@ -12,16 +12,16 @@ fn attributed_meter(bucket: u64, group: &str, version: &str, n: u64) -> Metering
         bucket,
         model: "model".into(),
         provider: "provider".into(),
-        tokens_input: n,
-        tokens_output: n + 1,
-        tokens_cache_read: n + 2,
-        tokens_cache_write: n + 3,
+        tokens_input: i128::from(n),
+        tokens_output: i128::from(n) + 1,
+        tokens_cache_read: i128::from(n) + 2,
+        tokens_cache_write: i128::from(n) + 3,
         requests: n,
         billable_requests: n,
         key_group_at_use: group.into(),
         pricing_version: version.into(),
         priced_from_ms: 17,
-        usage_units: BTreeMap::from([("audio_seconds".into(), n)]),
+        usage_units: BTreeMap::from([("audio_seconds".into(), i128::from(n))]),
     }
 }
 
@@ -44,15 +44,15 @@ fn assert_attributed_rows(rows: Vec<MeteringRow>) {
         let row = &rows[&(group.into(), version.into())];
         assert_eq!(row.key_id, "attribution-key");
         assert_eq!(row.priced_from_ms, 17);
-        assert_eq!(row.tokens_input, n);
-        assert_eq!(row.tokens_output, n + 3);
-        assert_eq!(row.tokens_cache_read, n + 6);
-        assert_eq!(row.tokens_cache_write, n + 9);
+        assert_eq!(row.tokens_input, i128::from(n));
+        assert_eq!(row.tokens_output, i128::from(n) + 3);
+        assert_eq!(row.tokens_cache_read, i128::from(n) + 6);
+        assert_eq!(row.tokens_cache_write, i128::from(n) + 9);
         assert_eq!(row.requests, n);
         assert_eq!(row.billable_requests, n);
         assert_eq!(
             row.usage_units,
-            BTreeMap::from([("audio_seconds".into(), n)])
+            BTreeMap::from([("audio_seconds".into(), i128::from(n))])
         );
     }
 }

@@ -8,7 +8,7 @@ use busbar_contract::records::{
 };
 use std::collections::BTreeMap;
 
-fn delta(scale: u32, amount: i64, requests: i64) -> UsageDelta {
+fn delta(scale: u32, amount: i128, requests: i64) -> UsageDelta {
     UsageDelta {
         requests,
         billable_requests: requests,
@@ -23,7 +23,7 @@ fn delta(scale: u32, amount: i64, requests: i64) -> UsageDelta {
     }
 }
 
-fn meter(key: &str, scale: u32, amount: u64, requests: u64) -> MeteringDelta {
+fn meter(key: &str, scale: u32, amount: i128, requests: u64) -> MeteringDelta {
     MeteringDelta {
         scale,
         key_id: key.into(),
@@ -82,10 +82,7 @@ fn exercise(store: &dyn RecordStore, key: &str) {
     assert_eq!(got.usage_units["audio_seconds"], 2_123_456);
     let op = OpId::from_parts(0xe81, 3);
     assert!(store
-        .add_metering_batch_deduped(
-            op,
-            &[meter(key, 6, 1, 1), meter(key, 6, i64::MAX as u64, 1)]
-        )
+        .add_metering_batch_deduped(op, &[meter(key, 6, 1, 1), meter(key, 6, i128::MAX, 1)])
         .is_err());
     assert_eq!(
         store.list_metering(0).unwrap(),
@@ -102,7 +99,7 @@ fn exercise(store: &dyn RecordStore, key: &str) {
         models: vec![ModelTokens {
             scale: 6,
             model: "exact-model".into(),
-            usage_units: BTreeMap::from([("input".into(), i64::MAX as u64)]),
+            usage_units: BTreeMap::from([("input".into(), i128::MAX)]),
         }],
     };
     store.put_usage(key, 0, &max).unwrap();
@@ -169,7 +166,7 @@ fn exact_counts_legacy_migration_preflight_reopen_idempotent() {
         "UPDATE store_meta SET v='4' WHERE k='schema_version'",
         "INSERT INTO usage_windows(bucket_scope,bucket_id,window_start,model,requests,billable_requests) VALUES('key','legacy',0,'',7,5)",
         "INSERT INTO usage_windows(bucket_scope,bucket_id,window_start,model,tokens_input) VALUES('key','legacy',0,'exact-model',2)",
-        "INSERT INTO usage_window_units(bucket_scope,bucket_id,window_start,model,unit,count) VALUES('key','legacy',0,'exact-model','audio_seconds',9223372036855)",
+        "INSERT INTO usage_window_units(bucket_scope,bucket_id,window_start,model,unit,count) VALUES('key','legacy',0,'exact-model','audio_seconds',170141183460469231731687303715885)",
         "INSERT INTO usage_metering(key_id,bucket,model,provider,tokens_input,requests) VALUES('legacy','0000000000','exact-model','provider',4,9)",
         "INSERT INTO usage_metering_units(key_id,bucket,model,provider,unit,count) VALUES('legacy','0000000000','exact-model','provider','audio_seconds',5)",
     ] {
@@ -199,4 +196,122 @@ fn exact_counts_legacy_migration_preflight_reopen_idempotent() {
         store.get_usage("legacy", 0).unwrap().models[0].usage_units["input"],
         2_000_001
     );
+}
+
+#[test]
+fn exact_i128_driver_decimal_bytes_and_json_numbers() {
+    use mysql_common::value::{convert::from_value_opt, Value};
+    for amount in [i128::from(u64::MAX) + 1, i128::MAX, i128::MIN] {
+        let value = Value::from(amount);
+        assert_eq!(value, Value::Bytes(amount.to_string().into_bytes()));
+        assert_eq!(from_value_opt::<i128>(value).unwrap(), amount);
+        let input = delta(6, amount, 1);
+        let json = serde_json::to_string(&input).unwrap();
+        assert!(json.contains(&format!("\"input\":{amount}")), "{json}");
+        assert_eq!(serde_json::from_str::<UsageDelta>(&json).unwrap(), input);
+    }
+}
+
+#[test]
+fn exact_i128_wide_refund_min_replay_and_reopen() {
+    let _guard = lock_fresh_database_ddl();
+    let Some(db) = ScratchDb::new("i128_refund") else {
+        return;
+    };
+    let store = MysqlStore::connect(&db.url).unwrap();
+    let wide = i128::from(u64::MAX) + 123_456;
+    let op = OpId::from_parts(0xe82, 1);
+    let cells = [("wide", 0, delta(6, wide, 1))];
+    store.add_usage_batch_deduped(op, &cells).unwrap();
+    store.add_usage_batch_deduped(op, &cells).unwrap();
+    let before = store.get_usage("wide", 0).unwrap();
+    assert_eq!(before.models[0].usage_units["input"], wide);
+    assert_eq!(before.models[0].usage_units["audio_seconds"], wide);
+    assert_eq!(before.requests, 1);
+    let refund = OpId::from_parts(0xe82, 2);
+    let cells = [("wide", 0, delta(6, -wide + 1, -1))];
+    store.add_usage_batch_deduped(refund, &cells).unwrap();
+    store.add_usage_batch_deduped(refund, &cells).unwrap();
+    assert_eq!(
+        store.get_usage("wide", 0).unwrap().models[0].usage_units["input"],
+        1
+    );
+    // Ordinary refunds keep the floor-at-zero contract, even for MIN.
+    store.add_usage("wide", 0, &delta(6, i128::MIN, 0)).unwrap();
+    let zero = store.get_usage("wide", 0).unwrap();
+    assert!(zero
+        .models
+        .iter()
+        .all(|m| m.usage_units.values().all(|v| *v == 0)));
+
+    let meter_op = OpId::from_parts(0xe82, 3);
+    let meters = [meter("wide", 6, wide, u64::MAX)];
+    store.add_metering_batch_deduped(meter_op, &meters).unwrap();
+    store.add_metering_batch_deduped(meter_op, &meters).unwrap();
+    store.add_metering(&meter("wide", 6, 1, 1)).unwrap();
+    let rows = store.list_metering(0).unwrap();
+    assert_eq!(rows[0].tokens_input, wide + 1);
+    assert_eq!(rows[0].usage_units["audio_seconds"], wide + 1);
+    assert_eq!(
+        (rows[0].requests, rows[0].billable_requests),
+        (u64::MAX, u64::MAX)
+    );
+    drop(store);
+    let store = MysqlStore::connect(&db.url).unwrap();
+    assert_eq!(store.get_usage("wide", 0).unwrap(), zero);
+    assert_eq!(store.list_metering(0).unwrap(), rows);
+    store.add_metering_batch_deduped(meter_op, &meters).unwrap();
+    assert_eq!(store.list_metering(0).unwrap(), rows);
+}
+
+#[test]
+fn exact_i128_v5_widens_without_rescaling_and_requires_format_marker() {
+    let _guard = lock_fresh_database_ddl();
+    let Some(db) = ScratchDb::new("i128_v5") else {
+        return;
+    };
+    drop(MysqlStore::connect(&db.url).unwrap());
+    let mut raw = db.conn();
+    // Restore the actual v5 integer shape before opening the new implementation.
+    for (table, columns) in QUANTITY_TABLES {
+        raw.query_drop(format!(
+            "ALTER TABLE {table} DROP CONSTRAINT {table}_quantity_i128"
+        ))
+        .unwrap();
+        let changes = columns
+            .iter()
+            .map(|column| format!("MODIFY COLUMN {column} BIGINT UNSIGNED NOT NULL DEFAULT 0"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        raw.query_drop(format!("ALTER TABLE {table} {changes}"))
+            .unwrap();
+    }
+    raw.query_drop("UPDATE store_meta SET v='5' WHERE k='schema_version'")
+        .unwrap();
+    raw.query_drop("DELETE FROM store_meta WHERE k='quantity_format'")
+        .unwrap();
+    raw.query_drop("INSERT INTO usage_windows(bucket_scope,bucket_id,window_start,model,tokens_input) VALUES('key','micro',0,'exact-model',9223372036854775807)").unwrap();
+    raw.query_drop("INSERT INTO usage_window_units(bucket_scope,bucket_id,window_start,model,unit,count) VALUES('key','micro',0,'exact-model','audio_seconds',9223372036854775807)").unwrap();
+    for _ in 0..2 {
+        let store = MysqlStore::connect(&db.url).unwrap();
+        let row = store.get_usage("micro", 0).unwrap();
+        assert_eq!(row.models[0].usage_units["input"], i128::from(i64::MAX));
+        assert_eq!(
+            row.models[0].usage_units["audio_seconds"],
+            i128::from(i64::MAX)
+        );
+        assert_eq!(schema_version_of(&db), "7");
+        assert_eq!(
+            meta_row(&db, QUANTITY_FORMAT_KEY).as_deref(),
+            Some(QUANTITY_FORMAT)
+        );
+    }
+    raw.query_drop("DELETE FROM store_meta WHERE k='quantity_format'")
+        .unwrap();
+    let before = schema_shape(&db);
+    let error = MysqlStore::connect(&db.url)
+        .err()
+        .expect("missing range marker refuses");
+    assert!(error.contains("quantity format marker"), "{error}");
+    assert_eq!(schema_shape(&db), before);
 }

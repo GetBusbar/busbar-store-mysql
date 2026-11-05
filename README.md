@@ -81,8 +81,10 @@ An operator-selected `socket=` URL permits full authentication over that local c
   byte-for-byte; single-use tokens (`redeem_plane_token`) live in `plane_tokens`. Retention for the
   `task` kind takes each purged task's event chain with it (a terminal-only sweep drops only terminal
   tasks; an age sweep drops every task older than the cutoff), and deleting a task deletes its chain.
-- Raw usage counters preserve the full `u64` range and saturate at `u64::MAX`; metering counters
-  pin at `i64::MAX`. A `u64` the other stores' signed columns could not hold (an append's `seq`/`ts`, an upsert's
+- Raw usage and metering request and billable-request counters preserve the full `u64` range and saturate
+  at `u64::MAX`. Quantities use exact signed-128-bit scale-6
+  mantissas stored as `DECIMAL(39,0)`, with totals from zero through `i128::MAX` micro-units; quantity overflow is
+  refused rather than saturated. A `u64` the other stores' signed columns could not hold (an append's `seq`/`ts`, an upsert's
   `seq`/`ts`, a metering `priced_from_ms`) is refused, never clamped or wrapped. Token redemption
   expiry and clock values retain the full `u64` range, including `u64::MAX`.
 - A revoked credential's secret is destroyed with the revoke (the column is NULL, the form `none`).
@@ -90,8 +92,8 @@ An operator-selected `socket=` URL permits full authentication over that local c
   `api_keys`, as in the other stores.
 - The store v3 tables are `store_ops` (the durable op-id dedupe log) and `store_records` (the
   kernel's records). The store keeps ledger counts, not money: busbar derives money from the counts
-  and its rate card. The released schema v3 upgrades directly to v4. Tables belonging to other applications
-  are preserved; unreleased development schema markers above v4 are refused. The upgrade
+  and its rate card. The released schema v3 upgrades directly to v7. Tables belonging to other applications
+  are preserved; schema 6 and markers above v7 are refused. The upgrade
   retypes every key column to `VARBINARY` (exact keys), lets a revoked credential lose its
   secret and drops
   `fk_metering_key`. The v4 upgrade adds the recorded group and pricing version to metering
@@ -103,7 +105,8 @@ An operator-selected `socket=` URL permits full authentication over that local c
   1024-byte model together with the longest 64-byte exact price-entry carrier. The store
   treats the entire string opaquely; primary keys still compare every byte.
 
-Drain and stop older store processes before upgrading to schema v4. The existing migration
+Drain and stop older store processes before upgrading, including an existing schema-v5
+deployment receiving the request-counter consolidation below. The existing migration
 marker and newer-schema checks refuse incompatible opens, but cannot fence already-open
 processes or older binaries without those checks. Reopen all nodes with this build;
 rollback requires a pre-upgrade backup and its matching binary.
@@ -131,7 +134,7 @@ the column and never the value. Widths are in bytes for `VARBINARY`/`TEXT` and c
 
 This is v1.6.0, built against busbar 1.6.0 (pinned in `.busbar-ref`). The crates
 `busbar-store-mysql` and `busbar-store-mysql-plugin` carry the same version, and the database schema
-version this build creates is **4** (`store_meta.schema_version`).
+version this build creates is **7** (`store_meta.schema_version`).
 
 ## Upgrading an existing database
 
@@ -140,9 +143,8 @@ connection migrates, every other open waits (30 s) and is then refused naming th
 serve a half-migrated schema. A migration marker (`store_meta.migrating_to`) makes a crashed migration
 resume on the next open. A database stamped with a NEWER schema than this build is refused.
 
-The released schema versions 1, 2 and 3 upgrade directly to **4**. The v1 billable-request
-backfill and v2 group-collation repair run before the common upgrade. No development schema
-versions are published or accepted as upgrade sources.
+The released schema versions 1, 2 and 3 upgrade directly to **7**. The v1 billable-request
+backfill and v2 group-collation repair run before the common upgrade. Development schema 6 and schemas above v7 are refused.
 
 The upgrade adds five nullable key columns, `usage_metering.priced_from_ms`, and the neutral
 record tables. It makes keys byte-exact, permits revoked credentials to hold no secret, scrubs
@@ -151,6 +153,34 @@ It preserves each metering cell's recorded attribution, widens pricing versions 
 and model names to 1088 bytes, and resumes interrupted DDL. Unrelated application tables,
 including tables named `tasks`, are preserved. The largest complete primary key is 2812 bytes,
 within the supported InnoDB 3072-byte limit.
+
+Schema v7 widens the ten quantity columns to `DECIMAL(39,0)` with nonnegative i128
+bounds. Parameters and results use exact integer decimal bytes; no floating-point conversion
+is involved. Existing schema-v5 quantities already contain micro-units and remain unchanged.
+Versions 0–4 contain whole units: after widening, the migration multiplies only their
+quantities by 1,000,000. Every released `u64` whole-unit quantity fits the new range. The
+whole-unit ceiling is 170,141,183,460,469,231,731,687,303,715,884; larger values refuse startup.
+Request and billable-request counters remain unscaled. Quantity preflight, conversion,
+`store_meta.quantity_format=i128-scale6-v1`, and the v7 stamp commit together; interrupted
+DDL resumes and failed conversions leave quantities unchanged. A v7 database missing the
+format marker is refused. Do not lower version markers or manually reinterpret micro-units
+as whole units. Keep a pre-upgrade backup; rollback needs that backup and its matching binary.
+
+The plugin attests `busbar.store.count-scale=6` and `busbar.store.count-range=i128`.
+Quantity JSON uses exact numeric tokens. New writes use scale 6; scale-0 inputs are checked
+and normalized. Ordinary signed usage refunds floor at zero, including the most negative
+i128 delta. Explicit corrections accept only nonnegative replacement totals and apply their
+expected-value checks transactionally; an invalid correction leaves no effect or receipt.
+
+The one-time `store_meta.usage_request_totals_v1=1` migration also runs on existing v5
+stores. In one transaction it consolidates each window's historical request/billable totals
+into the empty-model total row, saturating each aggregate at `u64::MAX`, and clears those
+counter fields on other model rows. It preserves every model quantity and open-unit count,
+including quantities whose model name is empty. This makes subsequent signed refunds and
+saturation operate on the same total returned by reads. The marker commits with the
+conversion; interrupted attempts roll back and retry on the next open. The existing ledger
+lock serializes conversion with current writers and other booters. Older processes must be
+stopped because they do not enforce this representation or migration marker.
 
 ## Config
 

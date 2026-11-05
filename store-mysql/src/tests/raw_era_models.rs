@@ -78,7 +78,7 @@ fn meter(model: String, version: String, n: u64) -> MeteringDelta {
         priced_from_ms: 17,
         requests: n,
         billable_requests: n,
-        tokens_input: n,
+        tokens_input: i128::from(n),
         tokens_output: 0,
         tokens_cache_read: 0,
         tokens_cache_write: 0,

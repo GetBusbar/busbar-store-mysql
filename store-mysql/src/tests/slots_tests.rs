@@ -230,7 +230,7 @@ fn usage_request_width_and_checked_quantity_refunds() {
     use busbar_contract::records::{ModelTokens, ModelTokensDelta, UsageLedger};
     let Some(s) = fresh_store() else { return };
     let bucket = fresh("ceiling");
-    let top = i64::MAX as u64;
+    let top = i128::MAX;
     let seed = |requests, quantity| UsageLedger {
         requests,
         billable_requests: requests,
@@ -244,13 +244,17 @@ fn usage_request_width_and_checked_quantity_refunds() {
             .into(),
         }],
     };
-    let delta = |amount| UsageDelta {
+    let delta = |amount: i64| UsageDelta {
         requests: amount,
         billable_requests: amount,
         models: vec![ModelTokensDelta {
             scale: 6,
             model: "m".into(),
-            usage_units: [("tokens_input".into(), amount), ("images".into(), amount)].into(),
+            usage_units: [
+                ("tokens_input".into(), i128::from(amount)),
+                ("images".into(), i128::from(amount)),
+            ]
+            .into(),
         }],
     };
     let read = || s.get_usage(&bucket, 60).unwrap();
@@ -278,12 +282,12 @@ fn usage_request_width_and_checked_quantity_refunds() {
 
 /// A quantity at the signed ceiling refuses increments and never clamps a first write.
 #[test]
-fn metering_quantity_overflow_refuses_at_i64_max() {
+fn metering_quantity_overflow_refuses_at_i128_max() {
     use busbar_contract::records::MeteringDelta;
     let Some(s) = fresh_store() else { return };
     let key = fresh("vk_ceiling");
     s.put_key(&sample_key(&key, "g")).expect("put_key");
-    let cell = |n: u64| MeteringDelta {
+    let cell = |n: i128| MeteringDelta {
         scale: 6,
         key_id: key.clone(),
         bucket: 20_261_031,
@@ -293,15 +297,15 @@ fn metering_quantity_overflow_refuses_at_i64_max() {
         tokens_output: n,
         tokens_cache_read: n,
         tokens_cache_write: n,
-        requests: n,
-        billable_requests: n,
+        requests: u64::MAX,
+        billable_requests: u64::MAX,
         key_group_at_use: "g".into(),
         pricing_version: "v1".into(),
         priced_from_ms: 0,
         usage_units: [("images".to_owned(), n)].into_iter().collect(),
     };
-    assert!(s.add_metering_op(op(11), &[cell(u64::MAX - 2)]).is_err());
-    s.add_metering_op(op(11), &[cell(i64::MAX as u64)])
+    assert!(s.add_metering_op(op(11), &[cell(-1)]).is_err());
+    s.add_metering_op(op(11), &[cell(i128::MAX)])
         .expect("exact ceiling");
     assert!(s.add_metering_op(op(12), &[cell(10)]).is_err());
     let rows: Vec<_> = s
@@ -312,27 +316,26 @@ fn metering_quantity_overflow_refuses_at_i64_max() {
         .collect();
     assert_eq!(rows.len(), 1, "{rows:?}");
     let r = &rows[0];
+    assert_eq!((r.requests, r.billable_requests), (u64::MAX, u64::MAX));
     for v in [
         r.tokens_input,
         r.tokens_output,
         r.tokens_cache_read,
         r.tokens_cache_write,
-        r.requests,
-        r.billable_requests,
         r.usage_units["images"],
     ] {
-        assert_eq!(v, i64::MAX as u64, "{r:?}");
+        assert_eq!(v, i128::MAX, "{r:?}");
     }
 
     // Crossing the ceiling from below also refuses without changing any counter.
     let near = fresh("vk_ceiling_near");
     s.put_key(&sample_key(&near, "g")).expect("put_key");
-    let near_cell = |n: u64| MeteringDelta {
+    let near_cell = |n: i128| MeteringDelta {
         scale: 6,
         key_id: near.clone(),
         ..cell(n)
     };
-    s.add_metering_op(op(14), &[near_cell((i64::MAX - 2) as u64)])
+    s.add_metering_op(op(14), &[near_cell(i128::MAX - 2)])
         .expect("seed just below the ceiling");
     assert!(s.add_metering_op(op(15), &[near_cell(10)]).is_err());
     let rows: Vec<_> = s
@@ -343,16 +346,15 @@ fn metering_quantity_overflow_refuses_at_i64_max() {
         .collect();
     assert_eq!(rows.len(), 1, "{rows:?}");
     let r = &rows[0];
+    assert_eq!((r.requests, r.billable_requests), (u64::MAX, u64::MAX));
     for v in [
         r.tokens_input,
         r.tokens_output,
         r.tokens_cache_read,
         r.tokens_cache_write,
-        r.requests,
-        r.billable_requests,
         r.usage_units["images"],
     ] {
-        assert_eq!(v, i64::MAX as u64 - 2, "{r:?}");
+        assert_eq!(v, i128::MAX - 2, "{r:?}");
     }
 }
 
@@ -1324,7 +1326,7 @@ fn a_metering_op_id_replays_and_a_changed_body_conflicts() {
     let Some(s) = fresh_store() else { return };
     let key = fresh("vk_meter_replay");
     s.put_key(&sample_key(&key, "g")).expect("put_key");
-    let delta = |tokens: u64| MeteringDelta {
+    let delta = |tokens: i128| MeteringDelta {
         scale: 6,
         key_id: key.clone(),
         bucket: 20_261_033,

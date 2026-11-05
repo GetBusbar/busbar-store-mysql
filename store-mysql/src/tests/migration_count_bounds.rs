@@ -3,11 +3,12 @@
 
 use super::*;
 
-fn seed_v4(db: &ScratchDb, last_count: u64) {
+fn seed_v4(db: &ScratchDb, last_count: i128) {
     drop(MysqlStore::connect(&db.url).unwrap());
     let mut raw = db.conn();
     for sql in [
         "UPDATE store_meta SET v='4' WHERE k='schema_version'",
+        "DELETE FROM store_meta WHERE k='usage_request_totals_v1'",
         "INSERT INTO usage_windows(bucket_scope,bucket_id,window_start,model,tokens_input,tokens_output,tokens_cache_read,tokens_cache_write,requests,billable_requests) VALUES('key','legacy',0,'model',2,3,4,5,17,13)",
         "INSERT INTO usage_window_units(bucket_scope,bucket_id,window_start,model,unit,count) VALUES('key','legacy',0,'model','images',7)",
         "INSERT INTO usage_metering(key_id,bucket,model,provider,tokens_input,tokens_output,tokens_cache_read,tokens_cache_write,requests,billable_requests) VALUES('legacy','0','model','provider',11,13,17,19,23,21)",
@@ -21,26 +22,41 @@ fn seed_v4(db: &ScratchDb, last_count: u64) {
     .unwrap();
 }
 
-fn assert_quantities(db: &ScratchDb, factor: u64, last_count: u64) {
+fn assert_quantities(db: &ScratchDb, factor: i128, last_count: i128) {
     let mut raw = db.conn();
-    let windows: Vec<(u64, u64, u64, u64, u64, u64)> = raw
-        .query("SELECT tokens_input,tokens_output,tokens_cache_read,tokens_cache_write,requests,billable_requests FROM usage_windows")
+    let windows: Vec<(i128, i128, i128, i128)> = raw
+        .query("SELECT tokens_input,tokens_output,tokens_cache_read,tokens_cache_write FROM usage_windows WHERE model='model'")
         .unwrap();
-    assert_eq!(
-        windows,
-        [(2 * factor, 3 * factor, 4 * factor, 5 * factor, 17, 13)]
-    );
-    let metering: Vec<(u64, u64, u64, u64, u64, u64)> = raw
+    assert_eq!(windows, [(2 * factor, 3 * factor, 4 * factor, 5 * factor)]);
+    let counters: Option<(u64, u64)> = raw
+        .query_first("SELECT SUM(requests),SUM(billable_requests) FROM usage_windows")
+        .unwrap();
+    assert_eq!(counters, Some((17, 13)));
+    let metering: Vec<(i128, i128, i128, i128, u64, u64)> = raw
         .query("SELECT tokens_input,tokens_output,tokens_cache_read,tokens_cache_write,requests,billable_requests FROM usage_metering")
         .unwrap();
     assert_eq!(
         metering,
         [(11 * factor, 13 * factor, 17 * factor, 19 * factor, 23, 21)]
     );
-    let window_units: Vec<u64> = raw.query("SELECT count FROM usage_window_units").unwrap();
+    let window_units: Vec<i128> = raw.query("SELECT count FROM usage_window_units").unwrap();
     assert_eq!(window_units, [7 * factor]);
-    let meter_units: Vec<u64> = raw.query("SELECT count FROM usage_metering_units").unwrap();
+    let meter_units: Vec<i128> = raw.query("SELECT count FROM usage_metering_units").unwrap();
     assert_eq!(meter_units, [last_count * factor]);
+}
+
+#[test]
+fn migration_count_bounds_full_released_u64_quantity_widens_before_scaling() {
+    let _guard = lock_fresh_database_ddl();
+    let Some(db) = ScratchDb::new("released_u64_counts") else {
+        return;
+    };
+    seed_v4(&db, i128::from(u64::MAX));
+    for _ in 0..2 {
+        drop(MysqlStore::connect(&db.url).unwrap());
+        assert_quantities(&db, 1_000_000, i128::from(u64::MAX));
+        assert_eq!(schema_version_of(&db), "7");
+    }
 }
 
 #[test]
@@ -75,14 +91,14 @@ fn migration_count_bounds_more_than_one_million_rows_reopen_exactly_once() {
         let opened = MysqlStore::connect(&db.url);
         if let Err(error) = &opened {
             assert_eq!(schema_version_of(&db), "4");
-            let values: Option<(u64, u64, u64)> = raw
+            let values: Option<(u64, i128, i128)> = raw
                 .query_first("SELECT COUNT(*),MIN(count),MAX(count) FROM usage_window_units")
                 .unwrap();
             assert_eq!(values, Some((1_000_001, 3, 9_223_372_036_854)));
             panic!("a valid large v4 database must open: {error}");
         }
         drop(opened.unwrap());
-        let values: Option<(u64, u64, u64)> = raw
+        let values: Option<(u64, i128, i128)> = raw
             .query_first("SELECT COUNT(*),MIN(count),MAX(count) FROM usage_window_units")
             .unwrap();
         assert_eq!(
@@ -106,14 +122,17 @@ fn migration_count_bounds_overflow_then_concurrent_startups_convert_once() {
     let Some(db) = ScratchDb::new("countoverflow") else {
         return;
     };
-    seed_v4(&db, 9_223_372_036_855);
+    seed_v4(&db, 170_141_183_460_469_231_731_687_303_715_885);
     let error = MysqlStore::connect(&db.url)
         .err()
         .expect("the last table's overflow must refuse the migration");
-    assert!(error.contains("outside the scale-6 range"), "{error}");
-    assert_quantities(&db, 1, 9_223_372_036_855);
+    assert!(
+        error.contains("outside the nonnegative i128 scale-6 range"),
+        "{error}"
+    );
+    assert_quantities(&db, 1, 170_141_183_460_469_231_731_687_303_715_885);
     assert_eq!(schema_version_of(&db), "4");
-    assert_eq!(meta_row(&db, "migrating_to").as_deref(), Some("5"));
+    assert_eq!(meta_row(&db, "migrating_to").as_deref(), Some("7"));
     db.conn()
         .query_drop("UPDATE usage_metering_units SET count=29")
         .unwrap();
@@ -149,7 +168,7 @@ fn migration_count_bounds_marker_failure_rolls_back_every_quantity() {
     admin
         .query_drop(
             "CREATE TRIGGER refuse_count_stamp BEFORE INSERT ON store_meta FOR EACH ROW
-         BEGIN IF NEW.k='schema_version' AND NEW.v='5' THEN
+         BEGIN IF NEW.k='schema_version' AND NEW.v='7' THEN
          SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='count migration stamp refusal';
          END IF; END",
         )
