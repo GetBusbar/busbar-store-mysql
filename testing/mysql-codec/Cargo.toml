@@ -1,0 +1,15 @@
+[package]
+name = "busbar-mysql-codec-tests"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+mysql_common = { path = "../../vendor/mysql_common", default-features = false }
+byteorder = "1"
+bytes = "1"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+zeroize = "1"
