@@ -77,6 +77,19 @@ impl Drop for SecretRows {
 }
 
 struct SecretBytes(BytesMut);
+
+fn reserve_wiping(buf: &mut BytesMut, additional: usize) {
+    if additional > buf.capacity() - buf.len() {
+        let capacity = buf
+            .len()
+            .checked_add(additional)
+            .expect("buffer capacity overflow");
+        let mut replacement = BytesMut::with_capacity(capacity);
+        replacement.extend_from_slice(buf);
+        buf.as_mut().zeroize();
+        *buf = replacement;
+    }
+}
 impl std::ops::Deref for SecretBytes {
     type Target = BytesMut;
     fn deref(&self) -> &BytesMut {
@@ -641,6 +654,7 @@ impl Io {
             Io::Wire(w) => {
                 let n = w.fill().await.map_err(|e| e.to_string())?;
                 w.input(|i| {
+                    reserve_wiping(into, i.len());
                     into.extend_from_slice(i);
                     i.zeroize();
                 });
@@ -650,6 +664,7 @@ impl Io {
             Io::Tcp(s) => {
                 let mut buf = Zeroizing::new([0_u8; 16 * 1024]);
                 let n = std::io::Read::read(s, &mut *buf).map_err(|e| e.to_string())?;
+                reserve_wiping(into, n);
                 into.extend_from_slice(&buf[..n]);
                 Ok(n)
             }

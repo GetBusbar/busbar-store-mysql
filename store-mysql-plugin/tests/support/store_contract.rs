@@ -418,7 +418,7 @@ fn exercise(
         let answer = ans(b.list_credentials_since(0).map(|mut v| {
             v.sort_by(|x, y| x.meta.id.cmp(&y.meta.id));
             v.into_iter()
-                .map(|c| (c.meta.id, c.meta.revoked_at.is_some()))
+                .map(|c| (c.meta.id.clone(), c.meta.revoked_at.is_some()))
                 .collect::<Vec<_>>()
         }));
         assert_eq!(first() - before, LEASED, "crossings: {}", "creds since");

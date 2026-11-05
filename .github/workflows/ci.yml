@@ -27,12 +27,12 @@ permissions:
 
 jobs:
   ci:
-    uses: GetBusbar/busbar/.github/workflows/plugin-ci.yml@3faee1e368c7b4d158d49d6f46ad52d5370f6c3e
+    uses: GetBusbar/busbar/.github/workflows/plugin-ci.yml@8500300cd64b3901f621416ea31b5766bddf4b76
     with:
       service: mysql
       busbar_checkout: true
       macos_test: "cargo build --locked -p busbar-store-mysql-plugin --lib && env -u CI cargo test --locked -p busbar-store-mysql-plugin --test conformance -- --skip the_linked_and_the_dropped_in_mysql_store_are_one_store"
-      extra_test: ""
+      extra_test: "cargo test --locked --manifest-path testing/mysql-codec/Cargo.toml --lib codec:: -- --test-threads=1"
       plugin_crate: busbar-store-mysql-plugin
       plugin_kind: store
       plugin_alias: mysql

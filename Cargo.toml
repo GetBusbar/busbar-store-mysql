@@ -37,10 +37,10 @@ repository = "https://github.com/GetBusbar/busbar-store-mysql"
 needless_update = "allow"
 
 [workspace.dependencies]
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "3faee1e368c7b4d158d49d6f46ad52d5370f6c3e" }
-busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "3faee1e368c7b4d158d49d6f46ad52d5370f6c3e" }
-"busbar-core-connector" = { "git" = "https://github.com/GetBusbar/busbar", "rev" = "3faee1e368c7b4d158d49d6f46ad52d5370f6c3e" }
-"busbar-transport-tcp" = { "git" = "https://github.com/GetBusbar/busbar-transport-tcp", "rev" = "a259fe4620570d5c713cd896bc8cdb02c7ab437e" }
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "8500300cd64b3901f621416ea31b5766bddf4b76" }
+busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "8500300cd64b3901f621416ea31b5766bddf4b76" }
+"busbar-core-connector" = { "git" = "https://github.com/GetBusbar/busbar", "rev" = "8500300cd64b3901f621416ea31b5766bddf4b76" }
+"busbar-transport-tcp" = { "git" = "https://github.com/GetBusbar/busbar-transport-tcp", "rev" = "0801ed3e106ee0b8867144db85bd2e19a073891e" }
 # busbar's root [workspace.dependencies], third-party rows, at 892773b8ed5d0cc78694bbcf5a10d89346ad61e6
 arc-swap = "1"
 async-trait = "0.1"
@@ -123,7 +123,7 @@ fallible-iterator = "0.2"
 httparse = { version = "1", default-features = false }
 ldap3 = { version = "0.12", default-features = false, features = ["sync"] }
 mysql = { version = "28", default-features = false, features = ["minimal-rust"] }
-mysql_common = { version = "=0.35.5", path = "vendor/mysql_common", default-features = false }
+mysql_common = { version = "=0.35.5", git = "https://github.com/GetBusbar/busbar-store-mysql", rev = "7a8ecfdaba8c4184bd51404bcda3eac5cd04cca5", default-features = false }
 pbjson = "0.9"
 pbjson-build = "0.9"
 percent-encoding = "2"
@@ -139,4 +139,4 @@ ulid = "1"
 
 # Maintained official-release codec security patch; see vendor/mysql_common/BUSBAR-PATCH.md.
 [patch.crates-io]
-mysql_common = { path = "vendor/mysql_common" }
+mysql_common = { git = "https://github.com/GetBusbar/busbar-store-mysql", rev = "7a8ecfdaba8c4184bd51404bcda3eac5cd04cca5" }

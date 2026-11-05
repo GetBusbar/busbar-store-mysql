@@ -618,3 +618,30 @@ fn guarded_rows_parse_text_and_binary_and_reject_partial_secret_rows() {
     }
     assert!(super::parse_row(b"\x01\0\x03one\x03two", columns, true).is_err());
 }
+
+/// Exercise the selected production dependency, so a manifest heal cannot silently
+/// restore the unwiped registry codec while the isolated vendor harness still passes.
+#[test]
+#[allow(unsafe_code)]
+fn production_codec_consumed_plaintext_is_erased() {
+    let secret = b"guarded-production-credential";
+    let mut source = bytes::BytesMut::new();
+    source.extend_from_slice(&[u8::try_from(secret.len()).unwrap(), 0, 0, 0]);
+    source.extend_from_slice(secret);
+    let tail = [1, 0, 0, 1, b'!'];
+    source.extend_from_slice(&tail);
+    let pointer = source.as_ptr();
+    let consumed = 4 + secret.len();
+    let mut decoded = Vec::new();
+    let mut codec = mysql_common::proto::codec::PacketCodec::default();
+    assert!(codec.decode(&mut source, &mut decoded).unwrap());
+    assert_eq!(decoded, secret);
+    assert_eq!(&source[..], &tail);
+    // SAFETY: the untouched tail keeps the original allocation alive. The entire
+    // consumed prefix was initialized before decoding; no freed memory is read.
+    let consumed = unsafe { std::slice::from_raw_parts(pointer, consumed) };
+    assert!(
+        consumed.iter().all(|&byte| byte == 0),
+        "the selected production codec must erase consumed plaintext"
+    );
+}
