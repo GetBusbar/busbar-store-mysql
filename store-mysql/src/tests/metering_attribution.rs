@@ -100,6 +100,7 @@ fn historical_attribution_survives_batch_replay_and_reopen() {
 
 fn legacy_metering(db: &ScratchDb, interruption: u8) {
     let mut raw = db.conn();
+    restore_historical_whole_unit_seed(&mut raw);
     raw.query_drop(
         "CREATE TABLE legacy_metering_units (
         bucket VARBINARY(40) NOT NULL, key_id VARBINARY(64) NOT NULL,
@@ -165,8 +166,10 @@ fn migration_preserves_legacy_attribution_units_and_replay_after_interruption() 
 
         db.conn().query_drop("ALTER TABLE usage_metering MODIFY pricing_version VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT ''").unwrap();
         let version = "😀".repeat(64);
-        let old = attributed_meter(u64::MAX, "historical", &version, 7);
-        let unknown = attributed_meter(17, "", "", 11);
+        let mut old = attributed_meter(u64::MAX, "historical", &version, 7);
+        old.scale = 0;
+        let mut unknown = attributed_meter(17, "", "", 11);
+        unknown.scale = 0;
         let deltas = [old.clone(), unknown.clone()];
         let op = OpId::from_parts(601, 5);
         store.add_metering_op(op, &deltas).unwrap();
@@ -181,18 +184,19 @@ fn migration_preserves_legacy_attribution_units_and_replay_after_interruption() 
             migrated.list_metering(unknown.bucket).unwrap(),
             expected_unknown
         );
-        let new = MeteringDelta {
-            scale: 6,
+        let mut new = MeteringDelta {
             key_group_at_use: "new-group".into(),
             pricing_version: "new-version".into(),
             ..old.clone()
         };
+        new.normalize_scale6().unwrap();
         migrated.add_metering(&new).unwrap();
         let rows = migrated.list_metering(old.bucket).unwrap();
         assert_eq!(rows.len(), 2);
         assert!(rows.contains(&expected[0]));
         for row in rows {
-            assert_eq!(row.usage_units, old.usage_units);
+            assert_eq!(row.scale, 6);
+            assert_eq!(row.usage_units, new.usage_units);
         }
         drop(migrated);
         assert_eq!(
@@ -212,9 +216,9 @@ fn migration_refuses_orphan_metering_units_without_inventing_attribution() {
         return;
     };
     let store = MysqlStore::connect(&db.url).unwrap();
-    store
-        .add_metering(&attributed_meter(17, "group", "version", 7))
-        .unwrap();
+    let mut historical = attributed_meter(17, "group", "version", 7);
+    historical.scale = 0;
+    store.add_metering(&historical).unwrap();
     drop(store);
     legacy_metering(&db, 0);
     db.conn().query_drop("DELETE FROM usage_metering").unwrap();
@@ -223,9 +227,9 @@ fn migration_refuses_orphan_metering_units_without_inventing_attribution() {
             .err()
             .expect("orphan must refuse migration");
         assert!(
-            error
-                .to_string()
-                .contains("metering unit attribution has no parent"),
+            error.to_string().contains(
+                "usage_metering_units contains attribution with no matching usage_metering parent"
+            ),
             "{error}"
         );
         let count: u64 = db

@@ -100,7 +100,7 @@ fn released_v1_and_v2_upgrade_with_their_original_backfill_rules() {
             .unwrap()
             .unwrap();
         assert_eq!(billable, if prior == 1 { 7 } else { 0 });
-        assert_eq!(schema_version_of(&db), "4");
+        assert_eq!(schema_version_of(&db), SCHEMA_VERSION.to_string());
         drop(MysqlStore::connect(&db.url).expect("the current schema reopens"));
         let again: u64 = db
             .conn()

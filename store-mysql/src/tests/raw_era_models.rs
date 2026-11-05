@@ -203,16 +203,27 @@ fn released_model_widening_resumes_each_partial_table_and_preserves_existing_row
         let store = MysqlStore::connect(&db.url).unwrap();
         let models = vec![original_model()];
         let op = OpId::from_parts(0x4552414d5953514c, 3);
-        let change = delta(&models, 7);
+        let mut change = delta(&models, 7);
+        for model in &mut change.models {
+            model.scale = 0;
+        }
         store.add_usage_op(op, "era", DAY, &change).unwrap();
-        let old_meter = meter(original_model(), "😀".repeat(64), 9);
+        let mut old_meter = meter(original_model(), "😀".repeat(64), 9);
+        old_meter.scale = 0;
         let meter_op = OpId::from_parts(0x4552414d5953514c, 4);
         store
             .add_metering_op(meter_op, std::slice::from_ref(&old_meter))
             .unwrap();
+        let mut expected_usage = ledger(&models, 7);
+        for model in &mut expected_usage.models {
+            model.scale = 0;
+        }
+        expected_usage.normalize_scale6().unwrap();
+        assert_eq!(store.get_usage("era", DAY).unwrap(), expected_usage);
         let expected_metering = store.list_metering(DAY).unwrap();
         drop(store);
         let mut raw = db.conn();
+        restore_historical_whole_unit_seed(&mut raw);
 
         for table in TABLES {
             raw.query_drop(format!(
@@ -242,7 +253,7 @@ fn released_model_widening_resumes_each_partial_table_and_preserves_existing_row
             migrated
                 .add_metering_op(meter_op, std::slice::from_ref(&old_meter))
                 .unwrap();
-            assert_ledger(&migrated, &models, 7);
+            assert_eq!(migrated.get_usage("era", DAY).unwrap(), expected_usage);
             let rows = migrated.list_metering(DAY).unwrap();
             assert_eq!(rows.len(), expected_metering.len());
             assert!(expected_metering.iter().all(|row| rows.contains(row)));

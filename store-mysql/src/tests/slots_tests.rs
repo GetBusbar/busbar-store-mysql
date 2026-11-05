@@ -744,8 +744,7 @@ fn record_older_body(conn: &mut mysql::PooledConn, op: OpId, body: &str) {
 /// contract's `Debug` for that type changed and a v9 op's retry would be judged a Conflict: report
 /// it to core; never edit the literal to match.
 const V9_USAGE_BODY: &str = r#"add_usage_batch:[("<ID>", 60, UsageDelta { requests: 3, billable_requests: 2, models: [] })]"#;
-const V9_METERING_BODY: &str = r#"add_metering_batch:[MeteringDelta {
-    scale: 6, key_id: "<ID>", bucket: 20261030, model: "m", provider: "p", tokens_input: 10, tokens_output: 5, tokens_cache_read: 0, tokens_cache_write: 0, requests: 1, billable_requests: 1, key_group_at_use: "g", pricing_version: "v1", priced_from_ms: 0, usage_units: {} }]"#;
+const V9_METERING_BODY: &str = r#"add_metering_batch:[MeteringDelta { key_id: "<ID>", bucket: 20261030, model: "m", provider: "p", tokens_input: 10, tokens_output: 5, tokens_cache_read: 0, tokens_cache_write: 0, requests: 1, billable_requests: 1, key_group_at_use: "g", pricing_version: "v1", priced_from_ms: 0, usage_units: {} }]"#;
 const V9_APPEND_BODY: &str = r#"append_plane_record:PlaneRecordRef { kind: "slots_test", id: "<ID>", parent: Some("<ID>"), seq: 1, ts: 1, disposition: Active, body: [111, 110, 101] }"#;
 
 /// ACROSS AN UPGRADE: an op an older build recorded in its `{:?}` body form replays (nothing applied) and a different op under its id is a conflict, for each of the three slots.
@@ -780,7 +779,7 @@ fn an_op_recorded_in_the_older_body_form_replays_and_a_different_op_conflicts() 
     let key = fresh("vk_older");
     s.put_key(&sample_key(&key, "g")).expect("put_key");
     let meter = MeteringDelta {
-        scale: 6,
+        scale: 0,
         key_id: key.clone(),
         bucket: 20_261_030,
         model: "m".into(),
@@ -803,7 +802,7 @@ fn an_op_recorded_in_the_older_body_form_replays_and_a_different_op_conflicts() 
     s.add_metering_op(metering, &deltas)
         .expect("the older body replays");
     let more = [MeteringDelta {
-        scale: 6,
+        scale: 0,
         tokens_input: 11,
         ..meter.clone()
     }];
@@ -815,7 +814,11 @@ fn an_op_recorded_in_the_older_body_form_replays_and_a_different_op_conflicts() 
         .filter(|r| r.key_id == key)
         .collect();
     assert_eq!(rows.len(), 1, "{rows:?}");
-    assert_eq!(rows[0].tokens_input, 10, "applied exactly once: {rows:?}");
+    assert_eq!(rows[0].scale, 6);
+    assert_eq!(
+        rows[0].tokens_input, 10_000_000,
+        "applied exactly once: {rows:?}"
+    );
 
     let parent = fresh("older-chain");
     let rec = |body: &[u8]| PlaneRecord {

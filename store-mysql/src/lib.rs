@@ -1136,6 +1136,11 @@ impl MysqlStore {
     /// All quantity preflight, conversion and the marker commit together. DDL is already
     /// complete; a failed or interrupted conversion rolls back and can be reopened safely.
     async fn migrate_exact_counts(conn: &mut Conn) -> RecordStoreResult<()> {
+        // Keep the scanned rows and insertion gaps locked until conversion commits, even
+        // when the server's default isolation level is READ COMMITTED.
+        conn.query_drop("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .await
+            .map_err(store_err)?;
         let mut tx = conn.start_transaction().await.map_err(store_err)?;
         let tables = [
             (
@@ -1160,20 +1165,18 @@ impl MysqlStore {
             ("usage_metering_units", &["count"][..]),
         ];
         for (table, columns) in tables {
-            tx.query_drop(format!(
-                "SELECT {} FROM {table} FOR UPDATE",
-                columns.join(", ")
-            ))
-            .await
-            .map_err(store_err)?;
             let invalid = columns
                 .iter()
                 .map(|column| format!("{column} > 9223372036854"))
                 .collect::<Vec<_>>()
                 .join(" OR ");
+            // A locking aggregate scans and locks every row but returns one result.
+            // Returning the rows themselves would exceed the wire client's per-result
+            // budget on a large database, even when query_drop discards the rows.
+            // Evaluate the preflight in this locking read, not a separate snapshot.
             let invalid: Option<u64> = tx
                 .query_first(format!(
-                    "SELECT EXISTS(SELECT 1 FROM {table} WHERE {invalid})"
+                    "SELECT COALESCE(MAX({invalid}), 0) FROM {table} FOR UPDATE"
                 ))
                 .await
                 .map_err(store_err)?;

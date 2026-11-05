@@ -3409,6 +3409,56 @@ fn restore_1_5_5(db: &ScratchDb) {
     assert!(stmt.trim().is_empty(), "the dump ends on a statement");
 }
 
+/// Recreate released whole-unit storage before downgrading a generated migration fixture.
+/// The current store writes micro-units even when the offered delta has historical scale 0.
+fn restore_historical_whole_unit_seed(raw: &mut mysql::PooledConn) {
+    for (table, columns) in [
+        (
+            "usage_windows",
+            &[
+                "tokens_input",
+                "tokens_output",
+                "tokens_cache_read",
+                "tokens_cache_write",
+            ][..],
+        ),
+        ("usage_window_units", &["count"][..]),
+        (
+            "usage_metering",
+            &[
+                "tokens_input",
+                "tokens_output",
+                "tokens_cache_read",
+                "tokens_cache_write",
+            ][..],
+        ),
+        ("usage_metering_units", &["count"][..]),
+    ] {
+        let inexact = columns
+            .iter()
+            .map(|column| format!("{column} % 1000000 <> 0"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let found: Option<u64> = raw
+            .query_first(format!(
+                "SELECT EXISTS(SELECT 1 FROM {table} WHERE {inexact})"
+            ))
+            .unwrap();
+        assert_eq!(
+            found,
+            Some(0),
+            "historical seed {table} must contain whole units"
+        );
+        let assignments = columns
+            .iter()
+            .map(|column| format!("{column} = {column} DIV 1000000"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        raw.query_drop(format!("UPDATE {table} SET {assignments}"))
+            .unwrap();
+    }
+}
+
 fn schema_version_of(db: &ScratchDb) -> String {
     let mut c = db.conn();
     c.query_first("SELECT v FROM store_meta WHERE k = 'schema_version'")
@@ -3428,6 +3478,7 @@ fn assert_recorded_1_5_5_admin_counts(store: &MysqlStore) {
             .iter()
             .filter(|row| row.key_id == expected["id"].as_str().unwrap())
             .collect();
+        assert!(rows.iter().all(|row| row.scale == 6));
         let actual = [
             rows.iter().map(|row| row.requests).sum::<u64>(),
             rows.iter().map(|row| row.tokens_input).sum(),
@@ -3442,7 +3493,9 @@ fn assert_recorded_1_5_5_admin_counts(store: &MysqlStore) {
             "tokens_cache_read",
             "tokens_cache_creation",
         ]
-        .map(|field| expected[field].as_u64().unwrap());
+        .map(|field| {
+            expected[field].as_u64().unwrap() * if field == "requests" { 1 } else { 1_000_000 }
+        });
         assert_eq!(
             actual, expected,
             "migrated metering preserves the recorded fleet usage counts"
@@ -3462,6 +3515,7 @@ fn assert_recorded_1_5_5_admin_counts(store: &MysqlStore) {
             expected["requests"].as_u64().unwrap(),
             "preserve the independently recorded key-window count, including historical differences from metering"
         );
+        assert!(got.models.iter().all(|model| model.scale == 6));
         let tokens: u64 = got
             .models
             .iter()
@@ -3472,7 +3526,7 @@ fn assert_recorded_1_5_5_admin_counts(store: &MysqlStore) {
                     .sum::<u64>()
             })
             .sum();
-        assert_eq!(tokens, expected["tokens"].as_u64().unwrap());
+        assert_eq!(tokens, expected["tokens"].as_u64().unwrap() * 1_000_000);
     }
 }
 
@@ -3522,16 +3576,29 @@ fn assert_1_5_5_rows_read_back(store: &MysqlStore) {
                         && g.provider == fx_str(w, "provider")
                 })
                 .unwrap_or_else(|| panic!("metering row missing after migrate: {w}"));
+            assert_eq!(row.scale, 6, "{w}");
             assert_eq!(row.requests, fx_u64(w, "requests"), "{w}");
             assert_eq!(row.billable_requests, fx_u64(w, "billable_requests"), "{w}");
             assert_eq!(row.key_group_at_use, fx_str(w, "key_group_at_use"), "{w}");
             assert_eq!(row.pricing_version, fx_str(w, "pricing_version"), "{w}");
-            assert_eq!(row.tokens_input, fx_u64(w, "tokens_input"), "{w}");
-            assert_eq!(row.tokens_output, fx_u64(w, "tokens_output"), "{w}");
-            assert_eq!(row.tokens_cache_read, fx_u64(w, "tokens_cache_read"), "{w}");
+            assert_eq!(
+                row.tokens_input,
+                fx_u64(w, "tokens_input") * 1_000_000,
+                "{w}"
+            );
+            assert_eq!(
+                row.tokens_output,
+                fx_u64(w, "tokens_output") * 1_000_000,
+                "{w}"
+            );
+            assert_eq!(
+                row.tokens_cache_read,
+                fx_u64(w, "tokens_cache_read") * 1_000_000,
+                "{w}"
+            );
             assert_eq!(
                 row.tokens_cache_write,
-                fx_u64(w, "tokens_cache_write"),
+                fx_u64(w, "tokens_cache_write") * 1_000_000,
                 "{w}"
             );
             assert_eq!(row.priced_from_ms, 0, "a 1.5.5 row is undated: {w}");
@@ -3581,7 +3648,7 @@ fn assert_1_5_5_rows_read_back(store: &MysqlStore) {
                     (UNIT_CACHE_READ, "tokens_cache_read"),
                     (UNIT_CACHE_WRITE, "tokens_cache_write"),
                 ] {
-                    let v = fx_u64(w, col);
+                    let v = fx_u64(w, col) * 1_000_000;
                     if v != 0 {
                         m.insert(unit.to_string(), v);
                     }
@@ -3589,6 +3656,7 @@ fn assert_1_5_5_rows_read_back(store: &MysqlStore) {
                 (fx_str(w, "model").to_string(), m)
             })
             .collect();
+        assert!(got.models.iter().all(|model| model.scale == 6));
         let mut have: Vec<(String, BTreeMap<String, u64>)> = got
             .models
             .iter()
@@ -4745,3 +4813,5 @@ fn a_failing_rollback_does_not_replace_the_refusal() {
 
 #[path = "tests/exact_counts.rs"]
 mod exact_counts;
+
+mod migration_count_bounds;
