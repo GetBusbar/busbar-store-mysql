@@ -62,11 +62,16 @@ busbar_contract::statement_extensions!(EXTENSIONS: [
     (busbar_contract::abi::mechanism::extensions::EXT_REFERENCE_FIELDS, br#"["url"]"#),
     (busbar_contract::abi::sdk::store::rewrap::INTENT, b"1"),
     (conditional::CAPABILITY, b"1"),
+    ("busbar.store.count-scale", b"6"),
     (correction::CAPABILITY, b"1"),
 ]);
 
 /// The most ops in flight at once, as the door states it: one per kept connection and then some waiting on a free one.
 pub const MAX_INFLIGHT: u32 = 64;
+
+/// The settings accepted by this plugin's lifecycle parser.
+const SETTINGS_SCHEMA: busbar_contract::abi::mechanism::call::Blob =
+    busbar_contract::abi::mechanism::call::Blob::json(include_bytes!("settings.schema.json"));
 
 busbar_contract::store_door!(
     MysqlStore,
@@ -74,7 +79,8 @@ busbar_contract::store_door!(
     env!("CARGO_PKG_VERSION"),
     MAX_INFLIGHT,
     needs: NEEDS,
-    extensions: EXTENSIONS
+    extensions: EXTENSIONS,
+    settings_schema: SETTINGS_SCHEMA
 );
 
 /// Run one op on one of the instance's kept connections (a fresh one when none is idle): open the
@@ -282,6 +288,22 @@ async fn usage_correction_on(
         .await
         .map_err(|e| backend(e.text))?;
     let dedupe = Dedupe::usage_correction(request);
+    let mut normalized_request = request.clone();
+    for row in &mut normalized_request.metering {
+        row.normalize_scale6()
+            .map_err(|e| OpRefused::Refused(e.to_string()))?;
+    }
+    for change in &mut normalized_request.usage {
+        change
+            .expected
+            .normalize_scale6()
+            .map_err(|e| OpRefused::Refused(e.to_string()))?;
+        change
+            .replacement
+            .normalize_scale6()
+            .map_err(|e| OpRefused::Refused(e.to_string()))?;
+    }
+    let request = &normalized_request;
     let recorded: Option<Vec<u8>> = tx
         .exec_first(
             "SELECT body FROM store_ops WHERE op_id=:op FOR UPDATE",
@@ -982,3 +1004,7 @@ fn record(v: Vec<u8>) -> Result<RecordBytes, String> {
 #[cfg(test)]
 #[path = "slots_refusal_tests.rs"]
 mod refusal_tests;
+
+#[cfg(test)]
+#[path = "settings_schema_tests.rs"]
+mod settings_schema_tests;

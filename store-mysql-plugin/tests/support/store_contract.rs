@@ -43,6 +43,7 @@ fn delta(requests: i64, input: i64) -> UsageDelta {
         requests,
         billable_requests: requests,
         models: vec![ModelTokensDelta {
+            scale: 6,
             model: "m".to_string(),
             usage_units: [("input".to_string(), input)].into_iter().collect(),
         }],
@@ -51,6 +52,7 @@ fn delta(requests: i64, input: i64) -> UsageDelta {
 
 fn meter(key_id: &str, provider: &str, input: u64) -> MeteringDelta {
     MeteringDelta {
+        scale: 6,
         key_id: key_id.into(),
         bucket: 86_400,
         model: "m".into(),

@@ -114,8 +114,9 @@ fn apply_err(e: Error) -> ApplyError {
     }
 }
 
-/// The schema version this build creates and migrates to. An older released database is v3.
-pub const SCHEMA_VERSION: u32 = 4;
+/// The schema version this build creates and migrates to. An older released database is v3;
+/// v5 converts quantity aggregates to checked micro-units, leaving request counters unchanged.
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Every key and identity column v11 makes byte-exact, per table, with its v11 definition (v14 subsequently widens the four model columns).
 const V11_EXACT_KEY_COLUMNS: &[(&str, &[(&str, &str)])] = &[
@@ -848,7 +849,7 @@ impl MysqlStore {
             _ => {
                 return Err(store_err(
                     "mysql store: GET_LOCK failed to return a lock outcome",
-                ))
+                ));
             }
         }
         let holder: Option<Option<u64>> = conn
@@ -977,9 +978,17 @@ impl MysqlStore {
             .await
             .map_err(store_err)?;
         match orphan {
-            Some(0) => {},
-            Some(_) => return Err(store_err("mysql store: usage_metering_units contains attribution with no matching usage_metering parent")),
-            None => return Err(store_err("mysql store: metering orphan probe returned no row")),
+            Some(0) => {}
+            Some(_) => {
+                return Err(store_err(
+                    "mysql store: usage_metering_units contains attribution with no matching usage_metering parent",
+                ));
+            }
+            None => {
+                return Err(store_err(
+                    "mysql store: metering orphan probe returned no row",
+                ));
+            }
         }
         Self::ensure_column(
             conn,
@@ -1104,13 +1113,16 @@ impl MysqlStore {
             conn.query_drop("ALTER TABLE usage_metering MODIFY COLUMN key_group_at_use VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT ''")
                 .await.map_err(store_err)?;
         }
-        if prior_version < SCHEMA_VERSION {
+        if prior_version < 4 {
             Self::run_v11_exact_keys(conn).await?;
             Self::run_v12_revoked_secrets(conn).await?;
             Self::run_v13_metering_attribution(conn).await?;
             Self::run_v14_raw_era_models(conn).await?;
         }
-        Self::stamp_schema_version(conn, "store_meta").await?;
+        if prior_version < 5 {
+            Self::migrate_exact_counts(conn).await?;
+        }
+
         conn.query_drop(
             "INSERT INTO store_sequence (id, revision) VALUES (1, 0) \
              ON DUPLICATE KEY UPDATE id = id",
@@ -1119,6 +1131,70 @@ impl MysqlStore {
         .map_err(store_err)?;
 
         Ok(())
+    }
+
+    /// All quantity preflight, conversion and the marker commit together. DDL is already
+    /// complete; a failed or interrupted conversion rolls back and can be reopened safely.
+    async fn migrate_exact_counts(conn: &mut Conn) -> RecordStoreResult<()> {
+        let mut tx = conn.start_transaction().await.map_err(store_err)?;
+        let tables = [
+            (
+                "usage_windows",
+                &[
+                    "tokens_input",
+                    "tokens_output",
+                    "tokens_cache_read",
+                    "tokens_cache_write",
+                ][..],
+            ),
+            ("usage_window_units", &["count"][..]),
+            (
+                "usage_metering",
+                &[
+                    "tokens_input",
+                    "tokens_output",
+                    "tokens_cache_read",
+                    "tokens_cache_write",
+                ][..],
+            ),
+            ("usage_metering_units", &["count"][..]),
+        ];
+        for (table, columns) in tables {
+            tx.query_drop(format!(
+                "SELECT {} FROM {table} FOR UPDATE",
+                columns.join(", ")
+            ))
+            .await
+            .map_err(store_err)?;
+            let invalid = columns
+                .iter()
+                .map(|column| format!("{column} > 9223372036854"))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            let invalid: Option<u64> = tx
+                .query_first(format!(
+                    "SELECT EXISTS(SELECT 1 FROM {table} WHERE {invalid})"
+                ))
+                .await
+                .map_err(store_err)?;
+            if invalid != Some(0) {
+                return Err(store_err(format!(
+                    "exact count migration: {table} contains a quantity outside the scale-6 range; nothing was converted"
+                )));
+            }
+        }
+        for (table, columns) in tables {
+            let assignments = columns
+                .iter()
+                .map(|column| format!("{column} = {column} * 1000000"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            tx.query_drop(format!("UPDATE {table} SET {assignments}"))
+                .await
+                .map_err(store_err)?;
+        }
+        Self::stamp_schema_version(&mut tx, "store_meta").await?;
+        tx.commit().await.map_err(store_err)
     }
 
     /// A `CREATE INDEX`/`CREATE TABLE` that lost a race to a concurrent booter.
@@ -1606,6 +1682,26 @@ impl MysqlStore {
         window_start: u64,
         delta: &UsageDelta,
     ) -> Result<(), ApplyError> {
+        let mut delta = delta.clone();
+        delta.normalize_scale6().map_err(|e| ApplyError {
+            text: e.to_string(),
+            server_code: None,
+            refused: true,
+        })?;
+        let delta = &delta;
+        let mut checked = Self::get_usage_on(tx, bucket_id, window_start)
+            .await
+            .map_err(|e| ApplyError {
+                text: e.0,
+                server_code: None,
+                refused: true,
+            })?;
+        checked.checked_apply_delta(delta).map_err(|e| ApplyError {
+            text: e.to_string(),
+            server_code: None,
+            refused: true,
+        })?;
+
         // The window's request counters accumulate ONCE, on the `model = ''` sentinel row,
         // not once per model. Applied inside the per-model loop instead, a single delta added its
         // request count once for every model it carried, and a delta with no models recorded
@@ -1719,6 +1815,36 @@ impl MysqlStore {
         tx: &mut Conn,
         delta: &MeteringDelta,
     ) -> Result<(), ApplyError> {
+        let mut delta = delta.clone();
+        delta.normalize_scale6().map_err(|e| ApplyError {
+            text: e.to_string(),
+            server_code: None,
+            refused: true,
+        })?;
+        let delta = &delta;
+        if let Some(mut checked) = Self::list_metering_key_on(tx, delta.bucket, Some(&delta.key_id))
+            .await
+            .map_err(|e| ApplyError {
+                text: e.0,
+                server_code: None,
+                refused: true,
+            })?
+            .into_iter()
+            .find(|row| {
+                row.model == delta.model
+                    && row.provider == delta.provider
+                    && row.priced_from_ms == delta.priced_from_ms
+                    && row.key_group_at_use == delta.key_group_at_use
+                    && row.pricing_version == delta.pricing_version
+            })
+        {
+            checked.checked_add_delta(delta).map_err(|e| ApplyError {
+                text: e.to_string(),
+                server_code: None,
+                refused: true,
+            })?;
+        }
+
         let bucket = format!("{:010}", delta.bucket);
 
         static STATEMENT_4: LazyLock<String> = LazyLock::new(|| {
@@ -1854,10 +1980,10 @@ impl MysqlStore {
             if let Some((Some(_),)) = existing {
                 return Err(refusal_after_rollback(
                     store_err(format!(
-                    "put_key: '{}' is tombstoned and its id is never reissued; refusing to clear \
+                        "put_key: '{}' is tombstoned and its id is never reissued; refusing to clear \
                      the tombstone",
-                    key.id
-                )),
+                        key.id
+                    )),
                     tx.rollback().await,
                 ));
             }
@@ -2004,6 +2130,7 @@ impl MysqlStore {
             .into_iter()
             .map(
                 |(model, input, output, cache_read, cache_write)| ModelTokens {
+                    scale: 6,
                     model,
                     usage_units: reserved_units(input, output, cache_read, cache_write),
                 },
@@ -2023,6 +2150,7 @@ impl MysqlStore {
                 None => {
                     by_model.insert(model.clone(), models.len());
                     models.push(ModelTokens {
+                        scale: 6,
                         model,
                         ..Default::default()
                     });
@@ -2135,6 +2263,14 @@ impl MysqlStore {
         window_start: u64,
         ledger: &UsageLedger,
     ) -> Result<(), ApplyError> {
+        let mut ledger = ledger.clone();
+        ledger.normalize_scale6().map_err(|e| ApplyError {
+            text: e.to_string(),
+            server_code: None,
+            refused: true,
+        })?;
+        let ledger = &ledger;
+
         tx.exec_drop(
             "DELETE FROM usage_windows \
              WHERE window_start = :w AND bucket_scope = 'key' AND bucket_id = :b",
@@ -2284,6 +2420,7 @@ impl MysqlStore {
                     pricing_version.clone(),
                 );
                 Ok(MeteringRow {
+                    scale: 6,
                     usage_units: by_cell.remove(&cell).unwrap_or_default(),
                     key_id,
                     model,

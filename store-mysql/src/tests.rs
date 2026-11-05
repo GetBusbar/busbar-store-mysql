@@ -47,10 +47,14 @@ fn test_url() -> Option<String> {
     match std::env::var("BUSBAR_TEST_MYSQL_URL") {
         Ok(u) => Some(u),
         Err(_) if std::env::var_os("CI").is_some() => {
-            panic!("BUSBAR_TEST_MYSQL_URL is unset under CI: the mysql service container must provision it");
+            panic!(
+                "BUSBAR_TEST_MYSQL_URL is unset under CI: the mysql service container must provision it"
+            );
         }
         Err(_) => {
-            eprintln!("skip: set BUSBAR_TEST_MYSQL_URL to run these tests, e.g. mysql://busbar:busbar@127.0.0.1:3307/busbar_test");
+            eprintln!(
+                "skip: set BUSBAR_TEST_MYSQL_URL to run these tests, e.g. mysql://busbar:busbar@127.0.0.1:3307/busbar_test"
+            );
             None
         }
     }
@@ -464,6 +468,7 @@ fn put_and_get_usage_roundtrips() {
         requests: 5,
         billable_requests: 4,
         models: vec![ModelTokens {
+            scale: 6,
             model: "gpt-x".to_string(),
             usage_units: units(&[(UNIT_INPUT, 100), (UNIT_OUTPUT, 50)]),
         }],
@@ -480,6 +485,7 @@ fn put_and_get_usage_roundtrips() {
 fn usage_request_counters_do_not_multiply_with_the_model_count() {
     let Some(s) = fresh_store() else { return };
     let model = |name: &str| ModelTokens {
+        scale: 6,
         model: name.to_string(),
         usage_units: units(&[(UNIT_INPUT, 10), (UNIT_OUTPUT, 5)]),
     };
@@ -506,10 +512,12 @@ fn usage_request_counters_do_not_multiply_with_the_model_count() {
             billable_requests: 1,
             models: vec![
                 busbar_contract::records::ModelTokensDelta {
+                    scale: 6,
                     model: "gpt-x".to_string(),
                     usage_units: units(&[(UNIT_INPUT, 1), (UNIT_OUTPUT, 1)]),
                 },
                 busbar_contract::records::ModelTokensDelta {
+                    scale: 6,
                     model: "gpt-y".to_string(),
                     usage_units: units(&[(UNIT_INPUT, 1), (UNIT_OUTPUT, 1)]),
                 },
@@ -556,6 +564,7 @@ fn a_request_split_across_two_flushes_keeps_its_count_across_a_reconnect() {
         requests: 0,
         billable_requests: 0,
         models: vec![ModelTokensDelta {
+            scale: 6,
             model: "m-split".to_string(),
             usage_units: units(&[(UNIT_INPUT, 11), (UNIT_OUTPUT, 7)]),
         }],
@@ -593,6 +602,7 @@ fn add_usage_accumulates_and_floors_at_zero() {
         requests: 3,
         billable_requests: 3,
         models: vec![ModelTokensDelta {
+            scale: 6,
             model: "m".to_string(),
             usage_units: units(&[(UNIT_INPUT, 10), (UNIT_OUTPUT, 5)]),
         }],
@@ -607,6 +617,7 @@ fn add_usage_accumulates_and_floors_at_zero() {
         requests: -100,
         billable_requests: -100,
         models: vec![ModelTokensDelta {
+            scale: 6,
             model: "m".to_string(),
             usage_units: units(&[(UNIT_INPUT, -1000), (UNIT_OUTPUT, 0)]),
         }],
@@ -629,6 +640,7 @@ fn add_metering_upserts_and_accumulates() {
     let Some(s) = fresh_store() else { return };
     s.put_key(&sample_key("vk_meter", "g")).unwrap();
     let d = MeteringDelta {
+        scale: 6,
         key_id: "vk_meter".to_string(),
 
         bucket: 20260915,
@@ -925,6 +937,7 @@ fn get_usage_ignores_usage_windows_rows_of_another_scope() {
             requests: 2,
             billable_requests: 1,
             models: vec![ModelTokensDelta {
+                scale: 6,
                 model: "m-key-scope".to_string(),
                 usage_units: units(&[(UNIT_INPUT, 10), (UNIT_OUTPUT, 5), ("images", 4)]),
             }],
@@ -987,6 +1000,7 @@ fn list_metering_keeps_model_spellings_apart_and_units_on_their_cell() {
     };
     clean(&mut conn);
     let delta = |model: &str, usage_units: BTreeMap<String, u64>| MeteringDelta {
+        scale: 6,
         key_id: key.to_string(),
         bucket,
         model: model.to_string(),
@@ -2939,6 +2953,7 @@ fn open_usage_units_round_trip_accumulate_and_floor_at_zero() {
         requests: 2,
         billable_requests: 2,
         models: vec![ModelTokens {
+            scale: 6,
             model: "rerank-x".into(),
             usage_units: units(&[(UNIT_INPUT, 7), ("search_units", 3), ("tool_calls", 1)]),
         }],
@@ -2957,6 +2972,7 @@ fn open_usage_units_round_trip_accumulate_and_floor_at_zero() {
             requests: 1,
             billable_requests: 1,
             models: vec![ModelTokensDelta {
+                scale: 6,
                 model: "rerank-x".into(),
                 usage_units: units(&[("search_units", 4), ("tool_calls", -10), ("bytes", 5)]),
             }],
@@ -2982,6 +2998,7 @@ fn open_usage_units_round_trip_accumulate_and_floor_at_zero() {
         requests: 1,
         billable_requests: 1,
         models: vec![ModelTokens {
+            scale: 6,
             model: "rerank-x".into(),
             usage_units: units(&[("search_units", 1)]),
         }],
@@ -2992,6 +3009,7 @@ fn open_usage_units_round_trip_accumulate_and_floor_at_zero() {
 
 fn metering_delta(key: &str, bucket: u64, priced_from_ms: u64) -> MeteringDelta {
     MeteringDelta {
+        scale: 6,
         key_id: key.into(),
         bucket,
         model: "m".into(),
@@ -3439,7 +3457,11 @@ fn assert_recorded_1_5_5_admin_counts(store: &MysqlStore) {
         let got = store
             .get_usage(id, expected["window_start"].as_u64().unwrap())
             .unwrap();
-        assert_eq!(got.requests, expected["requests"].as_u64().unwrap(), "preserve the independently recorded key-window count, including historical differences from metering");
+        assert_eq!(
+            got.requests,
+            expected["requests"].as_u64().unwrap(),
+            "preserve the independently recorded key-window count, including historical differences from metering"
+        );
         let tokens: u64 = got
             .models
             .iter()
@@ -3747,7 +3769,10 @@ fn settings_arrays_are_refused_without_echoing_secrets() {
         <crate::MysqlStore as busbar_contract::abi::sdk::store::StoreSlots>::validate(settings)
             .expect_err("array settings refused"),
     ] {
-        assert_eq!(error, "invalid mysql plugin config: settings: invalid type: sequence, expected struct Settings");
+        assert_eq!(
+            error,
+            "invalid mysql plugin config: settings: invalid type: sequence, expected struct Settings"
+        );
         assert!(!error.contains("ARRAY_PASSWORD_CANARY"));
     }
 }
@@ -4717,3 +4742,6 @@ fn a_failing_rollback_does_not_replace_the_refusal() {
     let clean = refusal_after_rollback(store_err(text), Ok::<(), &str>(()));
     assert_eq!(clean.0, text);
 }
+
+#[path = "tests/exact_counts.rs"]
+mod exact_counts;

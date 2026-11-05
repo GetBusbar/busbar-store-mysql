@@ -35,6 +35,7 @@ fn ledger(models: &[String], count: u64) -> UsageLedger {
         models: models
             .iter()
             .map(|model| ModelTokens {
+                scale: 6,
                 model: model.clone(),
                 usage_units: units(&[(UNIT_INPUT, count), ("audio_seconds", count)]),
             })
@@ -49,6 +50,7 @@ fn delta(models: &[String], count: i64) -> UsageDelta {
         models: models
             .iter()
             .map(|model| ModelTokensDelta {
+                scale: 6,
                 model: model.clone(),
                 usage_units: units(&[(UNIT_INPUT, count), ("audio_seconds", count)]),
             })
@@ -66,6 +68,7 @@ fn assert_ledger(store: &MysqlStore, models: &[String], count: u64) {
 
 fn meter(model: String, version: String, n: u64) -> MeteringDelta {
     MeteringDelta {
+        scale: 6,
         key_id: "era-key".into(),
         bucket: DAY,
         model,

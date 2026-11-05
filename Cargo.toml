@@ -36,10 +36,10 @@ repository = "https://github.com/GetBusbar/busbar-store-mysql"
 needless_update = "allow"
 
 [workspace.dependencies]
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "1a8a677b84a1667fbb6d7603b3586ad6ffe4f23e" }
-busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "1a8a677b84a1667fbb6d7603b3586ad6ffe4f23e" }
-"busbar-core-connector" = { "git" = "https://github.com/GetBusbar/busbar", "rev" = "1a8a677b84a1667fbb6d7603b3586ad6ffe4f23e" }
-"busbar-transport-tcp" = { "git" = "https://github.com/GetBusbar/busbar-transport-tcp", "rev" = "470d9cb7ff543e0dfe4e5a591a43badbde822a50" }
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "3faee1e368c7b4d158d49d6f46ad52d5370f6c3e" }
+busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "3faee1e368c7b4d158d49d6f46ad52d5370f6c3e" }
+"busbar-core-connector" = { "git" = "https://github.com/GetBusbar/busbar", "rev" = "3faee1e368c7b4d158d49d6f46ad52d5370f6c3e" }
+"busbar-transport-tcp" = { "git" = "https://github.com/GetBusbar/busbar-transport-tcp", "rev" = "fa01db91a63e32894a29f7cd506d0cb885edf12f" }
 # busbar's root [workspace.dependencies], third-party rows, at 892773b8ed5d0cc78694bbcf5a10d89346ad61e6
 arc-swap = "1"
 async-trait = "0.1"
@@ -135,6 +135,3 @@ redis = { version = "1", default-features = false, features = ["script"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 sonic-number = "=0.1.3"
 ulid = "1"
-
-[patch."https://github.com/GetBusbar/busbar"]
-"busbar-contract" = { "git" = "https://github.com/GetBusbar/busbar", "rev" = "1a8a677b84a1667fbb6d7603b3586ad6ffe4f23e" }

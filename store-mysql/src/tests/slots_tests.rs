@@ -122,6 +122,7 @@ fn an_empty_model_identity_keeps_independent_counters_and_replays_once() {
         requests: 1,
         billable_requests: 1,
         models: vec![ModelTokensDelta {
+            scale: 6,
             model: String::new(),
             usage_units: [("tokens_input".to_owned(), 5)].into_iter().collect(),
         }],
@@ -130,6 +131,7 @@ fn an_empty_model_identity_keeps_independent_counters_and_replays_once() {
         requests: 1,
         billable_requests: 1,
         models: vec![ModelTokens {
+            scale: 6,
             model: String::new(),
             usage_units: [("tokens_input".to_owned(), 5)].into_iter().collect(),
         }],
@@ -202,6 +204,7 @@ fn a_value_the_columns_cannot_hold_is_refused_and_records_nothing() {
         requests: 1,
         billable_requests: 1,
         models: vec![ModelTokensDelta {
+            scale: 6,
             model,
             usage_units: [("tokens_input".to_owned(), 5)].into_iter().collect(),
         }],
@@ -221,88 +224,67 @@ fn a_value_the_columns_cannot_hold_is_refused_and_records_nothing() {
         .expect("the same op_id with a valid body applies");
 }
 
-/// Raw usage keeps the full unsigned replacement range and saturates there; a signed refund still floors at zero.
+/// Request counters retain u64 width while quantity overflow refuses the complete write.
 #[test]
-fn usage_counters_preserve_u64_max_and_signed_refunds() {
+fn usage_request_width_and_checked_quantity_refunds() {
     use busbar_contract::records::{ModelTokens, ModelTokensDelta, UsageLedger};
     let Some(s) = fresh_store() else { return };
     let bucket = fresh("ceiling");
-    let top = u64::MAX;
-    let units = |n: u64| -> std::collections::BTreeMap<String, u64> {
-        [("tokens_input".to_owned(), n), ("images".to_owned(), n)]
-            .into_iter()
-            .collect()
-    };
-    let seed = |n: u64| UsageLedger {
-        requests: n,
-        billable_requests: n,
+    let top = i64::MAX as u64;
+    let seed = |requests, quantity| UsageLedger {
+        requests,
+        billable_requests: requests,
         models: vec![ModelTokens {
+            scale: 6,
             model: "m".into(),
-            usage_units: units(n),
+            usage_units: [
+                ("tokens_input".into(), quantity),
+                ("images".into(), quantity),
+            ]
+            .into(),
         }],
     };
-    let delta = |d: i64| UsageDelta {
-        requests: d,
-        billable_requests: d,
+    let delta = |amount| UsageDelta {
+        requests: amount,
+        billable_requests: amount,
         models: vec![ModelTokensDelta {
+            scale: 6,
             model: "m".into(),
-            usage_units: [("tokens_input".to_owned(), d), ("images".to_owned(), d)]
-                .into_iter()
-                .collect(),
+            usage_units: [("tokens_input".into(), amount), ("images".into(), amount)].into(),
         }],
     };
-    let read = || s.get_usage(&bucket, 60).expect("get_usage");
-    let check = |want: u64, what: &str| {
-        let l = read();
-        assert_eq!((l.requests, l.billable_requests), (want, want), "{what}");
-        for unit in ["tokens_input", "images"] {
-            let got = l.models[0].usage_units.get(unit).copied().unwrap_or(0);
-            assert_eq!(got, want, "{what}: {unit}");
-        }
-    };
-    s.put_usage(&bucket, 60, &seed(u64::MAX)).expect("seed");
-    check(top, "put_usage preserves the full unsigned counter");
-    s.put_usage(&bucket, 60, &seed(top - 2)).expect("seed");
-    s.add_usage_op(op(6), &bucket, 60, &delta(5))
-        .expect("add across the ceiling");
-    check(top, "an add across u64::MAX pins");
-    s.add_usage_op(op(7), &bucket, 60, &delta(-3))
-        .expect("refund");
-    check(top - 3, "a refund off the ceiling");
-    s.put_usage(&bucket, 60, &seed(top - 2)).expect("seed");
-    s.add_usage_op(op(8), &bucket, 60, &delta(i64::MAX))
-        .expect("pins");
-    check(top, "pinned at the ceiling");
-    s.add_usage_op(op(9), &bucket, 60, &delta(1))
-        .expect("stays pinned");
-    check(top, "stays at the ceiling");
-
-    {
-        let mut c = s.pool.get_conn().expect("conn");
-        c.exec_drop(
-            "UPDATE usage_windows SET requests = 18446744073709551615, \
-             billable_requests = 18446744073709551615 WHERE bucket_id = ? AND model = ''",
-            (&bucket,),
-        )
-        .expect("legacy row");
-    }
-    s.add_usage_op(op(13), &bucket, 60, &delta(1))
-        .expect("an unsigned row at the ceiling adds");
-    assert_eq!(read().requests, top);
-    s.put_usage(&bucket, 60, &seed(4)).expect("seed");
+    let read = || s.get_usage(&bucket, 60).unwrap();
+    s.put_usage(&bucket, 60, &seed(u64::MAX - 2, top - 2))
+        .unwrap();
+    assert!(s.add_usage_op(op(6), &bucket, 60, &delta(5)).is_err());
+    assert_eq!(read(), seed(u64::MAX - 2, top - 2));
+    s.add_usage_op(op(6), &bucket, 60, &delta(2)).unwrap();
+    assert_eq!(read(), seed(u64::MAX, top));
+    s.add_usage_op(op(7), &bucket, 60, &delta(-3)).unwrap();
+    assert_eq!(read(), seed(u64::MAX - 3, top - 3));
+    s.put_usage(&bucket, 60, &seed(u64::MAX, top - 3)).unwrap();
+    s.add_usage_op(op(13), &bucket, 60, &delta(1)).unwrap();
+    assert_eq!(read(), seed(u64::MAX, top - 2));
+    s.put_usage(&bucket, 60, &seed(4, 4)).unwrap();
     s.add_usage_op(op(10), &bucket, 60, &delta(i64::MIN))
-        .expect("floors");
-    check(0, "a negative delta floors at zero");
+        .unwrap();
+    let cleared = read();
+    assert_eq!((cleared.requests, cleared.billable_requests), (0, 0));
+    assert!(cleared
+        .models
+        .iter()
+        .all(|row| row.usage_units.values().all(|n| *n == 0)));
 }
 
-/// M7/TA4/R17: a metering counter at the ceiling pins at `i64::MAX` instead of erroring; a first write above it clamps.
+/// A quantity at the signed ceiling refuses increments and never clamps a first write.
 #[test]
-fn metering_counters_pin_at_i64_max() {
+fn metering_quantity_overflow_refuses_at_i64_max() {
     use busbar_contract::records::MeteringDelta;
     let Some(s) = fresh_store() else { return };
     let key = fresh("vk_ceiling");
     s.put_key(&sample_key(&key, "g")).expect("put_key");
     let cell = |n: u64| MeteringDelta {
+        scale: 6,
         key_id: key.clone(),
         bucket: 20_261_031,
         model: "m".into(),
@@ -318,10 +300,10 @@ fn metering_counters_pin_at_i64_max() {
         priced_from_ms: 0,
         usage_units: [("images".to_owned(), n)].into_iter().collect(),
     };
-    s.add_metering_op(op(11), &[cell(u64::MAX - 2)])
-        .expect("seed");
-    s.add_metering_op(op(12), &[cell(10)])
-        .expect("pins, no error");
+    assert!(s.add_metering_op(op(11), &[cell(u64::MAX - 2)]).is_err());
+    s.add_metering_op(op(11), &[cell(i64::MAX as u64)])
+        .expect("exact ceiling");
+    assert!(s.add_metering_op(op(12), &[cell(10)]).is_err());
     let rows: Vec<_> = s
         .list_metering(20_261_031)
         .expect("list_metering")
@@ -342,17 +324,17 @@ fn metering_counters_pin_at_i64_max() {
         assert_eq!(v, i64::MAX as u64, "{r:?}");
     }
 
-    // An add that CROSSES the ceiling from just below it pins too (not only clamp-on-first-write).
+    // Crossing the ceiling from below also refuses without changing any counter.
     let near = fresh("vk_ceiling_near");
     s.put_key(&sample_key(&near, "g")).expect("put_key");
     let near_cell = |n: u64| MeteringDelta {
+        scale: 6,
         key_id: near.clone(),
         ..cell(n)
     };
     s.add_metering_op(op(14), &[near_cell((i64::MAX - 2) as u64)])
         .expect("seed just below the ceiling");
-    s.add_metering_op(op(15), &[near_cell(10)])
-        .expect("crosses the ceiling, pins");
+    assert!(s.add_metering_op(op(15), &[near_cell(10)]).is_err());
     let rows: Vec<_> = s
         .list_metering(20_261_031)
         .expect("list_metering")
@@ -370,7 +352,7 @@ fn metering_counters_pin_at_i64_max() {
         r.billable_requests,
         r.usage_units["images"],
     ] {
-        assert_eq!(v, i64::MAX as u64, "{r:?}");
+        assert_eq!(v, i64::MAX as u64 - 2, "{r:?}");
     }
 }
 
@@ -389,6 +371,7 @@ fn a_batch_applies_in_one_global_order() {
     assert_eq!(got, [("a", 3), ("a", 9), ("b", 1), ("b", 2)]);
 
     let m = |bucket: u64, key: &str, model: &str, pfm: u64| MeteringDelta {
+        scale: 6,
         key_id: key.into(),
         bucket,
         model: model.into(),
@@ -481,6 +464,7 @@ fn get_usage_reads_one_snapshot() {
         requests: 0,
         billable_requests: 0,
         models: vec![ModelTokens {
+            scale: 6,
             model: "m".into(),
             usage_units: [("tokens_input".to_owned(), 0), ("images".to_owned(), 0)]
                 .into_iter()
@@ -529,6 +513,7 @@ fn list_metering_reads_one_snapshot() {
     let key = fresh("vk_snap");
     s.put_key(&sample_key(&key, "g")).expect("put_key");
     let delta = MeteringDelta {
+        scale: 6,
         key_id: key.clone(),
         bucket: 20_261_032,
         model: "m".into(),
@@ -759,7 +744,8 @@ fn record_older_body(conn: &mut mysql::PooledConn, op: OpId, body: &str) {
 /// contract's `Debug` for that type changed and a v9 op's retry would be judged a Conflict: report
 /// it to core; never edit the literal to match.
 const V9_USAGE_BODY: &str = r#"add_usage_batch:[("<ID>", 60, UsageDelta { requests: 3, billable_requests: 2, models: [] })]"#;
-const V9_METERING_BODY: &str = r#"add_metering_batch:[MeteringDelta { key_id: "<ID>", bucket: 20261030, model: "m", provider: "p", tokens_input: 10, tokens_output: 5, tokens_cache_read: 0, tokens_cache_write: 0, requests: 1, billable_requests: 1, key_group_at_use: "g", pricing_version: "v1", priced_from_ms: 0, usage_units: {} }]"#;
+const V9_METERING_BODY: &str = r#"add_metering_batch:[MeteringDelta {
+    scale: 6, key_id: "<ID>", bucket: 20261030, model: "m", provider: "p", tokens_input: 10, tokens_output: 5, tokens_cache_read: 0, tokens_cache_write: 0, requests: 1, billable_requests: 1, key_group_at_use: "g", pricing_version: "v1", priced_from_ms: 0, usage_units: {} }]"#;
 const V9_APPEND_BODY: &str = r#"append_plane_record:PlaneRecordRef { kind: "slots_test", id: "<ID>", parent: Some("<ID>"), seq: 1, ts: 1, disposition: Active, body: [111, 110, 101] }"#;
 
 /// ACROSS AN UPGRADE: an op an older build recorded in its `{:?}` body form replays (nothing applied) and a different op under its id is a conflict, for each of the three slots.
@@ -794,6 +780,7 @@ fn an_op_recorded_in_the_older_body_form_replays_and_a_different_op_conflicts() 
     let key = fresh("vk_older");
     s.put_key(&sample_key(&key, "g")).expect("put_key");
     let meter = MeteringDelta {
+        scale: 6,
         key_id: key.clone(),
         bucket: 20_261_030,
         model: "m".into(),
@@ -816,6 +803,7 @@ fn an_op_recorded_in_the_older_body_form_replays_and_a_different_op_conflicts() 
     s.add_metering_op(metering, &deltas)
         .expect("the older body replays");
     let more = [MeteringDelta {
+        scale: 6,
         tokens_input: 11,
         ..meter.clone()
     }];
@@ -914,6 +902,7 @@ fn unsupported_prerelease_schema_refusal_preserves_money_dead_slot_tables_and_op
     let key = fresh("vk_v10");
     iso.s().put_key(&sample_key(&key, "g")).expect("put_key");
     let meter = MeteringDelta {
+        scale: 6,
         key_id: key.clone(),
         bucket: 20_261_030,
         model: "m".into(),
@@ -1170,6 +1159,7 @@ fn put_usage_survives_a_gap_lock_deadlock_with_a_first_write() {
         requests: 7,
         billable_requests: 7,
         models: vec![ModelTokens {
+            scale: 6,
             model: "m".into(),
             usage_units: [("tokens_input".to_owned(), 3)].into_iter().collect(),
         }],
@@ -1332,6 +1322,7 @@ fn a_metering_op_id_replays_and_a_changed_body_conflicts() {
     let key = fresh("vk_meter_replay");
     s.put_key(&sample_key(&key, "g")).expect("put_key");
     let delta = |tokens: u64| MeteringDelta {
+        scale: 6,
         key_id: key.clone(),
         bucket: 20_261_033,
         model: "m".into(),

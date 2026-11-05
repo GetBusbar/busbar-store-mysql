@@ -94,6 +94,7 @@ _ct_path_lease() {
 # Keep current versions, two recent inactive installations per tool, and every active lease.
 # Lease files remain stable so opening a lease can never race with replacing its lock inode.
 _ct_prune() {
+  _ct_scratch_prune || return 1
   python3 -I - "$_ct_root" "$_ct_node_ver" "$_ct_rustup_ver" <<'PYCACHE'
 import fcntl, os, pathlib, re, shutil, sys
 root = pathlib.Path(sys.argv[1])
@@ -141,6 +142,49 @@ except OSError as error:
 PYCACHE
 }
 
+# Scratch creation and reaping share a stable namespace lock. Descriptor 6 holds the
+# operation lease until its shell and every inherited child have exited, including SIGKILL.
+# No PID or file age is used to infer whether work is abandoned.
+_ct_scratch_start() {
+  mkdir -p "$_ct_root/.scratch" || return 1
+  exec 5>"$_ct_root/.scratch/.lock" || return 1
+  python3 -I -c 'import fcntl; fcntl.flock(5, fcntl.LOCK_EX)' || return 1
+  _ct_work="$(mktemp -d "$_ct_root/.scratch/run.XXXXXX")" || return 1
+  exec 6>"$_ct_work/.lease" || return 1
+  python3 -I -c 'import fcntl; fcntl.flock(6, fcntl.LOCK_EX)' || return 1
+  python3 -I -c 'import fcntl; fcntl.flock(5, fcntl.LOCK_UN)' || return 1
+  exec 5>&-
+  trap 'rm -rf "$_ct_work"' EXIT
+  trap 'exit 1' HUP INT TERM
+}
+
+_ct_scratch_prune() {
+  python3 -I - "$_ct_root/.scratch" <<'PYSCRATCH'
+import fcntl, os, pathlib, re, shutil, sys
+root = pathlib.Path(sys.argv[1])
+if not root.is_dir():
+    sys.exit(0)
+try:
+    with (root / ".lock").open("a") as namespace:
+        fcntl.flock(namespace, fcntl.LOCK_EX)
+        for entry in root.iterdir():
+            if re.fullmatch(r"run\.[A-Za-z0-9]{6}", entry.name) is None or entry.is_symlink() or not entry.is_dir():
+                continue
+            marker = entry / ".lease"
+            if marker.is_symlink() or not marker.is_file():
+                continue
+            with marker.open("r+") as lease:
+                try:
+                    fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    continue
+                shutil.rmtree(entry)
+except OSError as error:
+    print(f"tools.sh: cannot prune managed scratch: {error}", file=sys.stderr)
+    sys.exit(1)
+PYSCRATCH
+}
+
 _ct_sha256() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi
 }
@@ -149,9 +193,8 @@ _ct_sha256() {
 _ct_fetch() (
   [ -f "$3" ] && [ "$(_ct_sha256 "$3")" = "$2" ] && exit 0
   mkdir -p "$(dirname "$3")" || exit 1
-  part="$(mktemp "$3.part.XXXXXX")" || exit 1
-  trap 'rm -f "$part"' EXIT
-  trap 'exit 1' HUP INT TERM
+  _ct_scratch_start || exit 1
+  part="$_ct_work/download"
   curl -fsSL --retry 3 --retry-max-time 660 --max-time 600 --max-filesize 536870912 --connect-timeout 30 --speed-limit 1024 --speed-time 60 -o "$part" "$1" || { echo "tools.sh: download failed" >&2; exit 1; }
   got="$(_ct_sha256 "$part")"
   [ "$got" = "$2" ] || { echo "tools.sh: sha256 mismatch: expected $2, got $got" >&2; exit 1; }
@@ -236,9 +279,9 @@ _ct_node() {
   if [ ! -x "$dir/bin/node" ] || [ ! -f "$dir/.busbar-tool.json" ]; then
     _ct_fetch "https://nodejs.org/dist/$_ct_node_ver/node-$_ct_node_ver-$plat.tar.gz" "$sha" "$_ct_root/node-$_ct_node_ver-$plat.tar.gz" || return 1
     (
-      stage="$(mktemp -d "$_ct_root/.node-stage.XXXXXX")" || exit 1
-      trap 'rm -rf "$stage"' EXIT
-      trap 'exit 1' HUP INT TERM
+      _ct_scratch_start || exit 1
+      stage="$_ct_work/node"
+      mkdir "$stage" || exit 1
       tar -xzf "$_ct_root/node-$_ct_node_ver-$plat.tar.gz" -C "$stage" || exit 1
       _ct_integrity seal "$stage/node-$_ct_node_ver-$plat" bin/node || exit 1
       _ct_publish "$stage/node-$_ct_node_ver-$plat" "$dir" bin/node
@@ -277,9 +320,9 @@ _ct_rust() {
     _ct_fetch "https://static.rust-lang.org/rustup/archive/$_ct_rustup_ver/$t/rustup-init" "$sha" "$_ct_root/rustup-init-$_ct_rustup_ver-$t" || return 1
     chmod +x "$_ct_root/rustup-init-$_ct_rustup_ver-$t" || { echo "tools.sh: cannot make rustup installer executable" >&2; return 1; }
     (
-      stage="$(mktemp -d "$_ct_root/.rustup-stage.XXXXXX")" || exit 1
-      trap 'rm -rf "$stage"' EXIT
-      trap 'exit 1' HUP INT TERM
+      _ct_scratch_start || exit 1
+      stage="$_ct_work/rustup"
+      mkdir "$stage" || exit 1
       RUSTUP_HOME="$stage/rustup" CARGO_HOME="$stage/cargo" "$_ct_root/rustup-init-$_ct_rustup_ver-$t" -y --no-modify-path --default-toolchain none || exit 1
       _ct_integrity seal "$stage" cargo/bin/cargo || exit 1
       _ct_publish "$stage" "$home" cargo/bin/cargo

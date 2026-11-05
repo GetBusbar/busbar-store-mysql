@@ -40,6 +40,7 @@ serde_json = { workspace = true }
 serde = { workspace = true }
 
 [dev-dependencies]
+jsonschema = { workspace = true }
 # Backend-owned tests exercise tombstones, credentials and plane records.
 ulid = { workspace = true }
 # The live tests open the store the way the host does: its door through the REAL loader on a

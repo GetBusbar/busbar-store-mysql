@@ -19,12 +19,18 @@ const OPEN_UNIT: &str = "audio_seconds";
 const BLOCKED_BUCKET: &str = "b";
 
 fn ledger(count: u64) -> UsageLedger {
+    ledger_parts(count, count)
+}
+
+/// Request width and quantity width are independent: these fixtures state both explicitly.
+fn ledger_parts(requests: u64, quantity: u64) -> UsageLedger {
     UsageLedger {
-        requests: count,
-        billable_requests: count,
+        requests,
+        billable_requests: requests,
         models: vec![ModelTokens {
+            scale: 6,
             model: MODEL.into(),
-            usage_units: units(&[(UNIT_INPUT, count), (OPEN_UNIT, count)]),
+            usage_units: units(&[(UNIT_INPUT, quantity), (OPEN_UNIT, quantity)]),
         }],
     }
 }
@@ -83,7 +89,11 @@ fn loaded_correction_replaces_unsigned_counts_and_replays_before_predicates() {
     let store = prepare(&db);
     assert!(busbar_contract::store_calls::StoreCalls::supports_usage_correction(&*store));
     const { assert!(<crate::MysqlStore as StoreSlots>::USAGE_CORRECTION) };
-    let mut request = candidate(1, UsageLedger::default(), ledger(u64::MAX));
+    let mut request = candidate(
+        1,
+        UsageLedger::default(),
+        ledger_parts(u64::MAX, i64::MAX as u64),
+    );
     request.usage.insert(
         0,
         UsageChange {
@@ -107,7 +117,7 @@ fn loaded_correction_replaces_unsigned_counts_and_replays_before_predicates() {
     }
     let revision = super::credential_rewrap::revision(&db);
     assert_eq!(apply(&store, &request), Ok(Decision::Applied));
-    assert_eq!(read(&store, "a"), ledger(u64::MAX));
+    assert_eq!(read(&store, "a"), ledger_parts(u64::MAX, i64::MAX as u64));
     assert_eq!(store.get_usage("a", 0).unwrap(), ledger(11));
     assert_eq!(read(&store, correction::ADJUST_UP_BUCKET), ledger(12));
     assert_eq!(read(&store, correction::ADJUST_DOWN_BUCKET), ledger(12));
@@ -220,6 +230,7 @@ fn present_and_absent_prestate_races_accept_one_correction() {
 
 fn meter() -> MeteringDelta {
     MeteringDelta {
+        scale: 6,
         key_id: KEY.into(),
         bucket: DAY,
         model: MODEL.into(),
@@ -609,27 +620,41 @@ fn correction_high_unsigned_counters_survive_ordinary_accrual_refund_and_reopen(
         return;
     };
     let store = prepare(&db);
-    let request = candidate(12, UsageLedger::default(), ledger(u64::MAX));
+    let request = candidate(
+        12,
+        UsageLedger::default(),
+        ledger_parts(u64::MAX, i64::MAX as u64),
+    );
     assert_eq!(apply(&store, &request), Ok(Decision::Applied));
     let delta = |count| UsageDelta {
         requests: count,
         billable_requests: count,
         models: vec![ModelTokensDelta {
+            scale: 6,
             model: MODEL.into(),
             usage_units: units(&[(UNIT_INPUT, count), (OPEN_UNIT, count)]),
         }],
     };
-    store.add_usage("a", DAY, &delta(1)).unwrap();
-    assert_eq!(read(&store, "a"), ledger(u64::MAX));
+    assert!(store.add_usage("a", DAY, &delta(1)).is_err());
+    assert_eq!(read(&store, "a"), ledger_parts(u64::MAX, i64::MAX as u64));
     store
         .add_usage_op(OpId::from_parts(NODE, 13), "a", DAY, &delta(-1))
         .unwrap();
-    assert_eq!(read(&store, "a"), ledger(u64::MAX - 1));
+    assert_eq!(
+        read(&store, "a"),
+        ledger_parts(u64::MAX - 1, i64::MAX as u64 - 1)
+    );
     drop(store);
     let reopened = MysqlStore::connect(&db.url).unwrap();
-    assert_eq!(read(&reopened, "a"), ledger(u64::MAX - 1));
+    assert_eq!(
+        read(&reopened, "a"),
+        ledger_parts(u64::MAX - 1, i64::MAX as u64 - 1)
+    );
     assert_eq!(apply(&reopened, &request), Ok(Decision::Applied));
-    assert_eq!(read(&reopened, "a"), ledger(u64::MAX - 1));
+    assert_eq!(
+        read(&reopened, "a"),
+        ledger_parts(u64::MAX - 1, i64::MAX as u64 - 1)
+    );
 }
 
 #[test]
@@ -639,16 +664,17 @@ fn empty_model_identity_shares_sentinel_without_losing_requests_tokens_or_open_u
         return;
     };
     let store = prepare(&db);
-    let with_empty = |count| {
-        let mut row = ledger(count);
+    let with_empty = |requests, quantity| {
+        let mut row = ledger_parts(requests, quantity);
         row.models.insert(
             0,
             ModelTokens {
+                scale: 6,
                 model: String::new(),
                 usage_units: units(&[
-                    (UNIT_INPUT, count),
-                    (UNIT_CACHE_WRITE, count),
-                    (OPEN_UNIT, count),
+                    (UNIT_INPUT, quantity),
+                    (UNIT_CACHE_WRITE, quantity),
+                    (OPEN_UNIT, quantity),
                 ]),
             },
         );
@@ -658,6 +684,7 @@ fn empty_model_identity_shares_sentinel_without_losing_requests_tokens_or_open_u
         requests: count,
         billable_requests: count,
         models: vec![ModelTokensDelta {
+            scale: 6,
             model: String::new(),
             usage_units: units(&[
                 (UNIT_INPUT, count),
@@ -667,23 +694,23 @@ fn empty_model_identity_shares_sentinel_without_losing_requests_tokens_or_open_u
         }],
     };
 
-    store.put_usage("a", DAY, &with_empty(10)).unwrap();
-    assert_eq!(read(&store, "a"), with_empty(10));
+    store.put_usage("a", DAY, &with_empty(10, 10)).unwrap();
+    assert_eq!(read(&store, "a"), with_empty(10, 10));
     store.add_usage("a", DAY, &delta(1)).unwrap();
-    let mut accrued = with_empty(10);
+    let mut accrued = with_empty(10, 10);
     accrued.requests += 1;
     accrued.billable_requests += 1;
     for count in accrued.models[0].usage_units.values_mut() {
         *count += 1;
     }
     assert_eq!(read(&store, "a"), accrued);
-    let request = candidate(14, accrued, with_empty(u64::MAX));
+    let request = candidate(14, accrued, with_empty(u64::MAX, i64::MAX as u64));
     assert_eq!(apply(&store, &request), Ok(Decision::Applied));
-    assert_eq!(read(&store, "a"), with_empty(u64::MAX));
+    assert_eq!(read(&store, "a"), with_empty(u64::MAX, i64::MAX as u64));
     store
         .add_usage_op(OpId::from_parts(NODE, 15), "a", DAY, &delta(-1))
         .unwrap();
-    let mut refunded = with_empty(u64::MAX);
+    let mut refunded = with_empty(u64::MAX, i64::MAX as u64);
     refunded.requests -= 1;
     refunded.billable_requests -= 1;
     for count in refunded.models[0].usage_units.values_mut() {
@@ -715,6 +742,7 @@ fn empty_model_identity_shares_sentinel_without_losing_requests_tokens_or_open_u
         requests: 7,
         billable_requests: 6,
         models: vec![ModelTokens {
+            scale: 6,
             model: String::new(),
             usage_units: units(&[(OPEN_UNIT, 5)]),
         }],

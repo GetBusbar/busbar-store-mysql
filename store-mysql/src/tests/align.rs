@@ -393,6 +393,7 @@ fn r7_the_schema_step_lets_a_v11_database_destroy_secrets_and_keeps_its_rows() {
 /// A metering delta for `key_id` in `bucket`, with one request.
 fn meter(key_id: &str, bucket: u64) -> MeteringDelta {
     MeteringDelta {
+        scale: 6,
         key_id: key_id.to_string(),
         bucket,
         model: "m".to_string(),
