@@ -498,7 +498,7 @@ fn get_usage_reads_one_snapshot() {
                 m.get("tokens_input").copied().unwrap_or(0),
                 m.get("images").copied().unwrap_or(0),
             );
-            if l.requests == t && t == i {
+            if i128::from(l.requests) == t && t == i {
                 Ok(())
             } else {
                 Err(format!("{l:?}"))
