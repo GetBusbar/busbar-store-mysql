@@ -39,7 +39,7 @@ needless_update = "allow"
 busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "3faee1e368c7b4d158d49d6f46ad52d5370f6c3e" }
 busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "3faee1e368c7b4d158d49d6f46ad52d5370f6c3e" }
 "busbar-core-connector" = { "git" = "https://github.com/GetBusbar/busbar", "rev" = "3faee1e368c7b4d158d49d6f46ad52d5370f6c3e" }
-"busbar-transport-tcp" = { "git" = "https://github.com/GetBusbar/busbar-transport-tcp", "rev" = "fa01db91a63e32894a29f7cd506d0cb885edf12f" }
+"busbar-transport-tcp" = { "git" = "https://github.com/GetBusbar/busbar-transport-tcp", "rev" = "30200e06503c2f14948731b167dcbe8d229476d7" }
 # busbar's root [workspace.dependencies], third-party rows, at 892773b8ed5d0cc78694bbcf5a10d89346ad61e6
 arc-swap = "1"
 async-trait = "0.1"
