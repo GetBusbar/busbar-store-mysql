@@ -16,12 +16,12 @@ Every busbar plugin repo has the same skeleton. This one is a two-crate Cargo wo
 pinned to the commit in `.busbar-ref`. The CI, release, dependency and lint configuration
 are rendered by `busbar-release plugin heal` from the fleet template (GetBusbar/busbar-release
 `template/`), [busbar's plugin registry](https://github.com/GetBusbar/busbar/blob/main/plugins.yaml)
-and busbar's dependency policy (`.github/fleet/deps.toml` and the root `[workspace.dependencies]`
+and busbar's dependency policy (`fleet/deps.toml` and the root `[workspace.dependencies]`
 at the pin); change them there, not here.
 
 ## This repo tests itself against busbar
 
-CI calls busbar's reusable `plugin-ci.yml` at the commit in `.busbar-ref`. It runs formatting,
+Internal CI tests against the commit in `.busbar-ref`. It runs formatting,
 strict Clippy, dependency checks and this repository's ordinary Rust tests. The tests load the
 actual linked door and the freshly built library through the public plugin loader. CI exports the
 absolute library path as `BUSBAR_PLUGIN_CDYLIB`; a missing library fails the tests.

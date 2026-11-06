@@ -7,7 +7,6 @@ First-party signed kind:store plugin cdylib: the MySQL/MariaDB backend for busba
 |---|---|---|---|---|
 | `store` | `mysql` | `busbar-store-mysql-plugin` | 1.6.0 (pinned in `.busbar-ref`) | Apache-2.0 |
 
-[![ci](https://github.com/GetBusbar/busbar-store-mysql/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/GetBusbar/busbar-store-mysql/actions/workflows/ci.yml)
 <!-- fleet:header:end -->
 
 ## What it is for

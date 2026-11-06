@@ -1,5 +1,5 @@
 # RENDERED by `busbar-release plugin heal` from GetBusbar/busbar-release template/ and busbar's
-# `.github/fleet/deps.toml` at 16530bfbda93e34caa5bbf81b8e6c65307305477; a hand edit is overwritten by the next sync. CI runs
+# `fleet/deps.toml` at 16530bfbda93e34caa5bbf81b8e6c65307305477; a hand edit is overwritten by the next sync. CI runs
 # `cargo deny check` on it (busbar's plugin-ci.yml at the pin). The license allowlist is busbar's own;
 # reviewed git sources are the pinned core, declared transport test dependencies and explicit
 # dependency-policy exceptions listed below.
@@ -45,7 +45,7 @@ confidence-threshold = 0.9
 multiple-versions = "deny"
 wildcards = "deny"
 allow-wildcard-paths = true
-# busbar .github/fleet/deps.toml [bans].deny (one stack per concern), then ONE VERSION OF EVERYTHING
+# busbar fleet/deps.toml [bans].deny (one stack per concern), then ONE VERSION OF EVERYTHING
 # BUSBAR USES (OWNER 2026-10-02): for each shared crate (a third-party row of busbar's
 # [workspace.dependencies]; a crate busbar's Cargo.lock reaches only transitively is not one), every
 # version outside the line(s) busbar's own Cargo.lock resolves it to, at the pin. A range a
