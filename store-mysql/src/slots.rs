@@ -289,21 +289,8 @@ async fn usage_correction_on(
         .await
         .map_err(|e| backend(e.text))?;
     let dedupe = Dedupe::usage_correction(request);
-    let mut normalized_request = request.clone();
-    for row in &mut normalized_request.metering {
-        row.normalize_scale6()
-            .map_err(|e| OpRefused::Refused(e.to_string()))?;
-    }
-    for change in &mut normalized_request.usage {
-        change
-            .expected
-            .normalize_scale6()
-            .map_err(|e| OpRefused::Refused(e.to_string()))?;
-        change
-            .replacement
-            .normalize_scale6()
-            .map_err(|e| OpRefused::Refused(e.to_string()))?;
-    }
+    let normalized_request =
+        correction::normalized(request).map_err(|e| OpRefused::Refused(e.to_string()))?;
     let request = &normalized_request;
     let recorded: Option<Vec<u8>> = tx
         .exec_first(
@@ -816,8 +803,8 @@ impl StoreSlots for MysqlStore {
         cx: &mut Op<'_>,
         secret: &CredentialSecret,
     ) -> Step<RecordStoreResult<()>> {
-        let request = busbar_contract::abi::sdk::store::rewrap::Request::new(secret, "");
-        op!(self, cx, put_credential(&request.expected))
+        let secret = secret.clone();
+        op!(self, cx, put_credential(&secret))
     }
 
     fn rewrap_credential(
@@ -841,8 +828,8 @@ impl StoreSlots for MysqlStore {
         secret: &CredentialSecret,
     ) -> Step<RecordStoreResult<()>> {
         let key = key.clone();
-        let request = busbar_contract::abi::sdk::store::rewrap::Request::new(secret, "");
-        op!(self, cx, put_key_with_credential(&key, &request.expected))
+        let secret = secret.clone();
+        op!(self, cx, put_key_with_credential(&key, &secret))
     }
 
     fn list_credentials(
