@@ -493,3 +493,40 @@ fn a_statement_that_is_not_the_librarys_own_is_refused() {
     let e = error.to_string();
     assert!(e.contains("repack the plugin"), "{e}");
 }
+
+/// Minimal actual-image lifecycle through both doors. A successful LoadedStore::open includes
+/// the loader's ready handshake; dropping the LoadedStore calls the actual lifecycle close.
+#[test]
+fn actual_linked_and_dropped_mysql_images_open_ready_read_and_close() {
+    let url = std::env::var("BUSBAR_TEST_MYSQL_URL").expect(
+        "the lifecycle witness requires an owned live MySQL fixture; skipping is forbidden",
+    );
+    assert!(
+        !url.trim().is_empty(),
+        "the lifecycle fixture URL must be nonempty"
+    );
+    let lib = cdylib();
+    let stated = packed_rendering(&lib);
+    assert_eq!(
+        stated,
+        LinkedRow::of(busbar_store_mysql::door)
+            .expect("the linked row")
+            .statement,
+        "the dropped image states the exact linked Statement"
+    );
+    let settings = serde_json::json!({ "url": url }).to_string();
+    let absent = format!("vk_lifecycle_absent_{}", common::node());
+    for (door, (plugin, dispatcher)) in [("linked", linked()), ("dropped", dropped(&lib, &stated))]
+    {
+        let store = LoadedStore::open(plugin, dispatcher, settings.as_bytes(), mint)
+            .unwrap_or_else(|_| panic!("{door} actual image must open and become ready"));
+        assert!(
+            store
+                .get_key(&absent)
+                .expect("one benign read through the actual image")
+                .is_none(),
+            "{door}: the unique witness key must be absent"
+        );
+        drop(store);
+    }
+}
