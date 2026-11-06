@@ -121,7 +121,8 @@ fn request_counter_migration_rolls_back_before_marker_and_retries() {
          VALUES(0,'key','key','named',17,13,7)",
     )
     .unwrap();
-    raw.query_drop(
+    let mut ddl = db.admin_conn();
+    ddl.query_drop(
         "CREATE TRIGGER refuse_counter_migration BEFORE UPDATE ON usage_windows
          FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='blocked counter migration'",
     )
@@ -132,7 +133,7 @@ fn request_counter_migration_rolls_back_before_marker_and_retries() {
         .query("SELECT model,requests,billable_requests,tokens_input FROM usage_windows")
         .unwrap();
     assert_eq!(physical, [("named".into(), 17, 13, 7)]);
-    raw.query_drop("DROP TRIGGER refuse_counter_migration")
+    ddl.query_drop("DROP TRIGGER refuse_counter_migration")
         .unwrap();
     let store = MysqlStore::connect(&db.url).unwrap();
     let ledger = store.get_usage("key", 0).unwrap();

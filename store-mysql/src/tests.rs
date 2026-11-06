@@ -4353,10 +4353,11 @@ fn v11_respells_children_onto_their_parents_keys() {
         (rows[0].model.as_str(), rows[0].provider.as_str()),
         ("GPT-4o", "P")
     );
+    assert_eq!(rows[0].scale, 6);
     assert_eq!(
         rows[0].usage_units.get("tool_calls"),
-        Some(&5),
-        "the unit is on its cell"
+        Some(&5_000_000),
+        "the legacy whole unit is on its cell at scale 6"
     );
 
     let n: u64 = db
@@ -4722,14 +4723,23 @@ fn usage_cleanup_rolls_back_both_tables_when_the_second_delete_is_refused() {
 fn usage_cleanup_waits_for_a_writer_then_removes_its_complete_old_window() {
     use busbar_contract::store_calls::StoreCalls;
     use std::sync::{mpsc, Arc};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
     let _ddl_guard = lock_fresh_database_ddl();
     let Some(db) = ScratchDb::new("purge_writer") else {
         return;
     };
     let store = Arc::new(MysqlStore::connect(&db.url).unwrap());
     let mut writer = db.conn();
+    let holder: u64 = writer
+        .query_first("SELECT CONNECTION_ID()")
+        .unwrap()
+        .unwrap();
     writer.query_drop("START TRANSACTION").unwrap();
+    // Every store usage writer takes this lock before inserting either table.
+    // Hold the same authority while the raw fixture models its in-flight write.
+    writer
+        .query_drop("SELECT revision FROM store_sequence WHERE id=1 FOR UPDATE")
+        .unwrap();
     writer.query_drop("INSERT INTO usage_windows (window_start,bucket_scope,bucket_id,model,requests) VALUES (7,'key','writer','model',19)").unwrap();
     writer.query_drop("INSERT INTO usage_window_units (window_start,bucket_scope,bucket_id,model,unit,count) VALUES (7,'key','writer','model','images',31)").unwrap();
     let (finished, result) = mpsc::channel();
@@ -4739,30 +4749,14 @@ fn usage_cleanup_waits_for_a_writer_then_removes_its_complete_old_window() {
             &**calls, 10,
         )));
     });
-    let mut observer = db.root.get_conn().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let mut waited = false;
-    while Instant::now() < deadline {
-        let waiting: u64 = observer.exec_first(
-            "SELECT COUNT(*) FROM performance_schema.data_lock_waits w JOIN performance_schema.data_locks l ON l.ENGINE_LOCK_ID = w.BLOCKING_ENGINE_LOCK_ID WHERE l.OBJECT_SCHEMA = :db AND l.OBJECT_NAME = 'usage_windows'",
-            params! { "db" => &db.name },
-        ).unwrap().unwrap();
-        if waiting > 0 {
-            waited = true;
-            break;
-        }
-        if cleanup.is_finished() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    let waited = conditional_records::waiting_connection(&db, holder, "store_sequence");
     writer.query_drop("COMMIT").unwrap();
     let removed = result
         .recv_timeout(Duration::from_secs(10))
         .expect("cleanup completes after the writer commits");
     cleanup.join().unwrap();
     assert!(
-        waited,
+        waited.unwrap().is_some(),
         "cleanup must synchronize with the server's in-flight usage transaction"
     );
     assert_eq!(removed.unwrap(), 1);
