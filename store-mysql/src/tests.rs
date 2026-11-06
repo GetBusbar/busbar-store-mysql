@@ -3486,7 +3486,9 @@ fn assert_recorded_1_5_5_admin_counts(store: &MysqlStore) {
             .collect();
         assert!(rows.iter().all(|row| row.scale == 6));
         let actual = [
-            rows.iter().map(|row| row.requests).sum::<u64>(),
+            rows.iter()
+                .map(|row| i128::from(row.requests))
+                .sum::<i128>(),
             rows.iter().map(|row| row.tokens_input).sum(),
             rows.iter().map(|row| row.tokens_output).sum(),
             rows.iter().map(|row| row.tokens_cache_read).sum(),
@@ -3500,7 +3502,8 @@ fn assert_recorded_1_5_5_admin_counts(store: &MysqlStore) {
             "tokens_cache_creation",
         ]
         .map(|field| {
-            expected[field].as_u64().unwrap() * if field == "requests" { 1 } else { 1_000_000 }
+            i128::from(expected[field].as_u64().unwrap())
+                * if field == "requests" { 1 } else { 1_000_000 }
         });
         assert_eq!(
             actual, expected,
@@ -3522,17 +3525,20 @@ fn assert_recorded_1_5_5_admin_counts(store: &MysqlStore) {
             "preserve the independently recorded key-window count, including historical differences from metering"
         );
         assert!(got.models.iter().all(|model| model.scale == 6));
-        let tokens: u64 = got
+        let tokens: i128 = got
             .models
             .iter()
             .map(|model| {
                 [UNIT_INPUT, UNIT_OUTPUT, UNIT_CACHE_READ, UNIT_CACHE_WRITE]
                     .iter()
                     .map(|unit| model.usage_units.get(*unit).copied().unwrap_or(0))
-                    .sum::<u64>()
+                    .sum::<i128>()
             })
             .sum();
-        assert_eq!(tokens, expected["tokens"].as_u64().unwrap() * 1_000_000);
+        assert_eq!(
+            tokens,
+            i128::from(expected["tokens"].as_u64().unwrap()) * 1_000_000
+        );
     }
 }
 

@@ -276,3 +276,9 @@ tokens_input) = (1,1,0)` plus `usage_window_units` empty model / exact unit
 full ledger equality, counters, one receipt and replay assertions are unchanged.
 The earlier guessed token-column placement was a fixture error; no payload or
 production policy changed. Source-only formatting/whitespace review here.
+
+Retired receipt correction: frozen v9 Debug bodies remain byte-identical evidence, but
+current SDK digest matching rejects both original and changed inputs with Conflict.
+The renamed retired receipt test checks state and receipt preservation; the separate
+current-digest metering replay test continues to require successful replay. This case
+is staged and remains PENDING native execution against the final qualified SDK.

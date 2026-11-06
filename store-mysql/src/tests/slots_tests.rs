@@ -554,7 +554,7 @@ fn list_metering_reads_one_snapshot() {
         || {
             let rows = s.list_metering(20_261_032).map_err(|e| e.to_string())?;
             let r = rows.iter().find(|r| r.key_id == key).expect("the cell");
-            if r.requests + 1 == r.usage_units.get("images").copied().unwrap_or(0) {
+            if i128::from(r.requests) + 1 == r.usage_units.get("images").copied().unwrap_or(0) {
                 Ok(())
             } else {
                 Err(format!("{r:?}"))
@@ -724,7 +724,7 @@ fn an_op_id_plane_append_dedupes_and_still_refuses_a_fork() {
     assert_eq!(chain, vec![b"one".to_vec()]);
 }
 
-/// Put `body` under `op` in `store_ops`, as a build before the SDK body recorded it (the slot's name, `:`, its values' `{:?}`).
+/// Seed a retired development Debug receipt; current SDK digest matching must reject it.
 fn record_older_body(conn: &mut mysql::PooledConn, op: OpId, body: &str) {
     conn.exec_drop(
         "UPDATE store_ops SET body = ? WHERE op_id = ?",
@@ -738,20 +738,25 @@ fn record_older_body(conn: &mut mysql::PooledConn, op: OpId, body: &str) {
     assert_eq!(stored, body.as_bytes());
 }
 
-/// FROZEN: the exact text a v9 build recorded as the body of its three deduped ops, for the fixed
-/// fixture values of the tests below (`<ID>` is the one random part, the fixture's id). These are
-/// byte literals, NOT built from the contract types' current `{:?}`: the contract's older-form check
-/// compares against that very output, so a live-built "older" body could never show rows a real v9
-/// build wrote ceasing to match. If one of these goes red after a `busbar-contract` bump, the
-/// contract's `Debug` for that type changed and a v9 op's retry would be judged a Conflict: report
-/// it to core; never edit the literal to match.
+fn retired_receipt(conn: &mut mysql::PooledConn, op: OpId) -> (u64, Vec<u8>, Vec<u8>) {
+    conn.exec_first(
+        "SELECT recorded_at, body, answer FROM store_ops WHERE op_id = ?",
+        (&op.0[..],),
+    )
+    .expect("read unchanged receipt")
+    .expect("receipt remains recorded")
+}
+
+/// FROZEN: exact retired v9 development Debug receipts (`<ID>` substitutes only the fixture id).
+/// Preserve these literal bytes independently of current Debug output. The current SDK accepts
+/// matching raw32/lowerhex64 digests only; these retired bodies must conflict without mutation.
 const V9_USAGE_BODY: &str = r#"add_usage_batch:[("<ID>", 60, UsageDelta { requests: 3, billable_requests: 2, models: [] })]"#;
 const V9_METERING_BODY: &str = r#"add_metering_batch:[MeteringDelta { key_id: "<ID>", bucket: 20261030, model: "m", provider: "p", tokens_input: 10, tokens_output: 5, tokens_cache_read: 0, tokens_cache_write: 0, requests: 1, billable_requests: 1, key_group_at_use: "g", pricing_version: "v1", priced_from_ms: 0, usage_units: {} }]"#;
 const V9_APPEND_BODY: &str = r#"append_plane_record:PlaneRecordRef { kind: "slots_test", id: "<ID>", parent: Some("<ID>"), seq: 1, ts: 1, disposition: Active, body: [111, 110, 101] }"#;
 
-/// ACROSS AN UPGRADE: an op an older build recorded in its `{:?}` body form replays (nothing applied) and a different op under its id is a conflict, for each of the three slots.
+/// Retired Debug receipts reject both original and changed inputs without mutating state or receipts.
 #[test]
-fn an_op_recorded_in_the_older_body_form_replays_and_a_different_op_conflicts() {
+fn retired_debug_receipts_conflict_for_original_and_changed_inputs_without_mutation() {
     use busbar_contract::records::{MeteringDelta, PlaneDisposition, PlaneRecord, PlaneSelector};
     let Some(s) = fresh_store() else { return };
     let mut c = s.conn().expect("a raw connection");
@@ -765,8 +770,17 @@ fn an_op_recorded_in_the_older_body_form_replays_and_a_different_op_conflicts() 
     let usage = op(31);
     s.add_usage_op(usage, &bucket, 60, &delta).expect("applies");
     record_older_body(&mut c, usage, &V9_USAGE_BODY.replace("<ID>", &bucket));
-    s.add_usage_op(usage, &bucket, 60, &delta)
-        .expect("the older body replays");
+    let usage_receipt = retired_receipt(&mut c, usage);
+    let usage_before = format!("{:?}", s.get_usage(&bucket, 60).expect("before"));
+    assert_eq!(
+        s.add_usage_op(usage, &bucket, 60, &delta),
+        Err(OpRefused::Conflict)
+    );
+    assert_eq!(
+        format!("{:?}", s.get_usage(&bucket, 60).expect("after")),
+        usage_before
+    );
+    assert_eq!(retired_receipt(&mut c, usage), usage_receipt);
     let other = UsageDelta {
         requests: 4,
         ..delta.clone()
@@ -775,7 +789,9 @@ fn an_op_recorded_in_the_older_body_form_replays_and_a_different_op_conflicts() 
         s.add_usage_op(usage, &bucket, 60, &other),
         Err(OpRefused::Conflict)
     );
+    assert_eq!(retired_receipt(&mut c, usage), usage_receipt);
     let ledger = s.get_usage(&bucket, 60).expect("get_usage");
+    assert_eq!(format!("{ledger:?}"), usage_before);
     assert_eq!(ledger.requests, 3, "applied exactly once: {ledger:?}");
 
     let key = fresh("vk_older");
@@ -801,14 +817,31 @@ fn an_op_recorded_in_the_older_body_form_replays_and_a_different_op_conflicts() 
     let deltas = [meter.clone()];
     s.add_metering_op(metering, &deltas).expect("applies");
     record_older_body(&mut c, metering, &V9_METERING_BODY.replace("<ID>", &key));
-    s.add_metering_op(metering, &deltas)
-        .expect("the older body replays");
+    let metering_receipt = retired_receipt(&mut c, metering);
+    let metering_before = format!("{:?}", s.list_metering(meter.bucket).expect("before"));
+    assert_eq!(
+        s.add_metering_op(metering, &deltas),
+        Err(OpRefused::Conflict)
+    );
+    assert_eq!(
+        format!("{:?}", s.list_metering(meter.bucket).expect("after")),
+        metering_before
+    );
+    assert_eq!(retired_receipt(&mut c, metering), metering_receipt);
     let more = [MeteringDelta {
         scale: 0,
         tokens_input: 11,
         ..meter.clone()
     }];
     assert_eq!(s.add_metering_op(metering, &more), Err(OpRefused::Conflict));
+    assert_eq!(retired_receipt(&mut c, metering), metering_receipt);
+    assert_eq!(
+        format!(
+            "{:?}",
+            s.list_metering(meter.bucket).expect("after changed")
+        ),
+        metering_before
+    );
     let rows: Vec<_> = s
         .list_metering(meter.bucket)
         .expect("list_metering")
@@ -836,12 +869,17 @@ fn an_op_recorded_in_the_older_body_form_replays_and_a_different_op_conflicts() 
     s.append_plane_record_op(append, rec(b"one").view())
         .expect("applies");
     record_older_body(&mut c, append, &V9_APPEND_BODY.replace("<ID>", &parent));
-    s.append_plane_record_op(append, rec(b"one").view())
-        .expect("the older body replays");
+    let append_receipt = retired_receipt(&mut c, append);
+    assert_eq!(
+        s.append_plane_record_op(append, rec(b"one").view()),
+        Err(OpRefused::Conflict)
+    );
+    assert_eq!(retired_receipt(&mut c, append), append_receipt);
     assert_eq!(
         s.append_plane_record_op(append, rec(b"two").view()),
         Err(OpRefused::Conflict)
     );
+    assert_eq!(retired_receipt(&mut c, append), append_receipt);
     let chain = s
         .list_plane_records("slots_test", &PlaneSelector::Parent(parent.as_str().into()))
         .expect("list");
