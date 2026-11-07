@@ -8,11 +8,10 @@
 #[path = "../../../store-mysql/tests-support/mysql_io.rs"]
 pub mod mysql_io;
 
-use mysql::params;
 use std::path::PathBuf;
 use std::process::Command;
 
-/// A node id no earlier run or instance used, for `LoadedStore::open`: its bridge mints each op id as `(node, counter from 0)`, and this store's dedupe is DURABLE, so two instances sharing a node would replay each other's op ids (the kernel draws the node from the OS CSPRNG per process).
+/// A unique fixture identity for instances and disposable databases.
 pub fn node() -> u64 {
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let t = std::time::SystemTime::now()
@@ -22,17 +21,6 @@ pub fn node() -> u64 {
     (t ^ (u64::from(std::process::id()) << 32))
         .wrapping_add(N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) << 48)
         | 1
-}
-
-/// The node's one `op_id` allocator (`LoadedStore::open` mints the bridge's writes from it): a node half no earlier run used (the dedupe is durable) and one counter.
-pub fn mint() -> busbar_contract::abi::store::OpId {
-    static NODE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let node = *NODE.get_or_init(node);
-    busbar_contract::abi::store::OpId::from_parts(
-        node,
-        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
-    )
 }
 
 /// The newest mtime across every workspace crate's `src/` — "how fresh must a cdylib be to be the one this source tree describes".
@@ -120,20 +108,6 @@ pub fn plugin_path() -> PathBuf {
         "busbar-store-mysql-plugin"
     );
     fresh
-}
-
-pub fn cleanup(url: &str, id: &str) {
-    if let Ok(mut conn) =
-        mysql::Conn::new(mysql::Opts::from_url(&crate::common::raw_mysql_url(url)).unwrap())
-    {
-        use mysql::prelude::*;
-        let _: Result<(), _> = conn.exec_drop(
-            "DELETE FROM credentials WHERE key_id=:id",
-            params! { "id" => id },
-        );
-        let _: Result<(), _> =
-            conn.exec_drop("DELETE FROM api_keys WHERE id=:id", params! { "id" => id });
-    }
 }
 
 /// The busbar checkout the real binaries are built from: `$BUSBAR_CHECKOUT`, else a sibling `busbar/` beside this repo (ci.yml checks GetBusbar/busbar out there at the `.busbar-ref` pin).
@@ -225,26 +199,81 @@ pub const E2E_RELEASE_PRIVKEY: &str =
     "290f2453f236650ab21b85a95d49b9dab088518e829e4d524b01e441636ab327";
 
 /// Open the store through its COMPILED-IN door (`busbar_store_mysql::door`) on `url`, the way the host opens a store: the connect step creates the schema on an empty database.
-pub fn connect_linked(url: &str) -> Result<busbar_plugin_loader::store_v3::LoadedStore, String> {
-    use busbar_plugin_loader::dispatch::kinds::store::Store;
+pub fn connect_linked(
+    url: &str,
+) -> Result<busbar_plugin_loader::store_v4::LoadedPersistence, String> {
+    let (plugin, dispatcher) = native_plugin(None)?;
+    open_native(plugin, dispatcher, url)
+}
+
+pub fn block<T>(future: impl std::future::Future<Output = T>) -> T {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(future)
+}
+pub fn native_plugin(
+    library: Option<&std::path::Path>,
+) -> Result<
+    (
+        busbar_plugin_loader::dispatch::Plugin<
+            busbar_plugin_loader::dispatch::kinds::store_v4::StoreV4,
+        >,
+        std::sync::Arc<busbar_plugin_loader::dispatch::Dispatcher>,
+    ),
+    String,
+> {
+    use busbar_plugin_loader::dispatch::kinds::store_v4::StoreV4;
     use busbar_plugin_loader::dispatch::{
-        load_linked, Bind, ConnTable, DispatchConfig, Dispatcher, LinkedRow, NoSink,
+        load_dropped, load_linked, rendering_of_library, Bind, ConnTable, DispatchConfig,
+        Dispatcher, LinkedRow, NoSink,
     };
     use std::sync::Arc;
     let dispatcher = Arc::new(Dispatcher::new(DispatchConfig::default()));
-    let conns: Arc<dyn busbar_contract::conn::DeclaredConns> =
-        mysql_io::host(dispatcher.conn_waker(), Default::default());
     let bind = Bind {
-        instance: Arc::from("store-mysql-common-direct"),
+        instance: Arc::from(format!("mysql-native-image-{}", node())),
         max_inflight_cap: 64,
         sink: Arc::new(NoSink),
         dispatcher: dispatcher.adopter(),
-        conns: ConnTable::Host(conns),
+        conns: ConnTable::Host(mysql_io::host(dispatcher.conn_waker(), Default::default())),
     };
-    let row = LinkedRow::of(busbar_store_mysql::door).map_err(|e| e.to_string())?;
-    let plugin = load_linked::<Store>(&row, bind).map_err(|e| e.to_string())?;
-    let cfg = serde_json::json!({ "url": url }).to_string();
-    busbar_plugin_loader::store_v3::LoadedStore::open(plugin, dispatcher, cfg.as_bytes(), mint)
+    let plugin = if let Some(library) = library {
+        let stated = rendering_of_library(library)
+            .map_err(|e| e.to_string())?
+            .ok_or("missing door")?;
+        load_dropped::<StoreV4>(library, &stated, bind)
+    } else {
+        let row = LinkedRow::of_kind::<StoreV4>(
+            busbar_store_mysql::door as busbar_contract::abi::mechanism::door::DoorFn,
+        )
+        .map_err(|e| e.to_string())?;
+        load_linked::<StoreV4>(&row, bind)
+    }
+    .map_err(|e| e.to_string())?;
+    Ok((plugin, dispatcher))
+}
+pub fn open_native(
+    plugin: busbar_plugin_loader::dispatch::Plugin<
+        busbar_plugin_loader::dispatch::kinds::store_v4::StoreV4,
+    >,
+    dispatcher: std::sync::Arc<busbar_plugin_loader::dispatch::Dispatcher>,
+    url: &str,
+) -> Result<busbar_plugin_loader::store_v4::LoadedPersistence, String> {
+    use busbar_plugin_loader::store_v4::{Limits, LoadedPersistence};
+    let settings = serde_json::json!({"url":url,"input_budget":67108864}).to_string();
+    block(LoadedPersistence::open(
+        plugin,
+        dispatcher,
+        settings.as_bytes(),
+        Limits {
+            descriptor_bytes: 67108864,
+            output_items: 1024,
+            output_bytes: 67108864,
+            decode_bytes: 67108864,
+        },
+    ))
+    .map_err(|e| e.to_string())
 }
 
 /// A private database for real child-boot proofs; no production constructor creates its schema.

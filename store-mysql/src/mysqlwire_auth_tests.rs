@@ -6,6 +6,7 @@
 use std::cell::RefCell;
 use std::collections::{HashSet, VecDeque};
 
+use crate::v4::backend::MysqlV4;
 use busbar_contract::abi::host::conn::connector::{self, ConnectorSlots};
 use busbar_contract::abi::host::conn::connector::{EstablishIn, FactsIn, IoIn, StreamFacts};
 use busbar_contract::abi::host::service::ServiceOut;
@@ -15,7 +16,7 @@ use busbar_contract::abi::mechanism::lifecycle::{CancelIn, CancelOut, OpenIn, Op
 use busbar_contract::abi::mechanism::ticket::{CompletionHandle, Ticket};
 use busbar_contract::abi::mechanism::ticket::{HostCtx, HostTables};
 use busbar_contract::abi::sdk::door::{blank_in, blank_out};
-use busbar_contract::abi::sdk::store::StoreSlots;
+use busbar_contract::abi::sdk::store::v4::backend::Backend;
 use mysql_common::constants::CapabilityFlags;
 use mysql_common::io::ParseBuf;
 use mysql_common::packets::{AuthPlugin, HandshakeResponse};
@@ -25,6 +26,7 @@ use std::marker::PhantomData;
 use std::mem::size_of;
 
 use super::tests::packet;
+use super::Opts;
 
 const PASSWORD: &str = "CANARY-auth-17";
 const NONCE: &[u8; 20] = b"12345678abcdefghijkl";
@@ -262,12 +264,7 @@ struct Handshake<'h> {
 #[allow(unsafe_code)]
 fn ops() -> &'static busbar_contract::abi::mechanism::lifecycle::OpsHead {
     // SAFETY: the actual macro door's static table starts with OpsHead.
-    unsafe {
-        &*busbar_contract::abi::mechanism::door::Door::read_parts(
-            crate::slots::MACRO_DOOR.door_fn()()
-        )
-        .ops
-    }
+    unsafe { &*busbar_contract::abi::mechanism::door::Door::read_parts(crate::door()).ops }
 }
 #[allow(unsafe_code)]
 fn open_entry<'h>(host: &'h HostTables, url: &'h [u8]) -> Handshake<'h> {
@@ -289,8 +286,8 @@ fn open_entry<'h>(host: &'h HostTables, url: &'h [u8]) -> Handshake<'h> {
     };
     input.settings = unsafe {
         Blob::from_raw_parts(
-            br#"{"url":{"$secret":0}}"#.as_ptr(),
-            br#"{"url":{"$secret":0}}"#.len(),
+            br#"{"url":{"$secret":0},"input_budget":1048576}"#.as_ptr(),
+            br#"{"url":{"$secret":0},"input_budget":1048576}"#.len(),
             busbar_contract::abi::mechanism::call::BLOB_JSON,
             0,
         )
@@ -399,29 +396,31 @@ fn dsn(options: &str) -> String {
 #[test]
 fn literal_and_lent_dsn_capture_keep_only_public_configuration() {
     let url = dsn("&secure_auth=false&enable_cleartext_plugin=true");
-    let settings = serde_json::json!({"url": url.as_str()}).to_string();
-    let literal = crate::MysqlStore::from_settings(settings.as_bytes()).unwrap();
-    let lent = <crate::MysqlStore as StoreSlots>::open_with_secrets(
-        br#"{"url":{"$secret":0}}"#,
+    let settings = serde_json::json!({"url": url.as_str(), "input_budget":1048576}).to_string();
+    let literal = MysqlV4::open(settings.as_bytes(), &[], None).unwrap();
+    let lent = MysqlV4::open(
+        br#"{"url":{"$secret":0},"input_budget":1048576}"#,
         &[url.as_bytes()],
         None,
     )
     .unwrap();
     assert_eq!(literal.opts.as_ref(), lent.opts.as_ref());
-    let padded = serde_json::json!({"url": format!("  {url} \n")}).to_string();
-    let padded = crate::MysqlStore::from_settings(padded.as_bytes()).unwrap();
+    let padded =
+        serde_json::json!({"url": format!("  {url} \n"), "input_budget":1048576}).to_string();
+    let padded = MysqlV4::open(padded.as_bytes(), &[], None).unwrap();
     assert_eq!(
         padded.opts.as_ref(),
         literal.opts.as_ref(),
         "settings trim before password and auth-floor capture"
     );
     let query_url = "mysql://u@db/d?secure_auth=false&password=p+q";
-    let query = serde_json::json!({"url": format!("  {query_url} \n")}).to_string();
-    let query = crate::MysqlStore::from_settings(query.as_bytes()).unwrap();
-    let exact = crate::MysqlStore::new(query_url).unwrap();
+    let query =
+        serde_json::json!({"url": format!("  {query_url} \n"), "input_budget":1048576}).to_string();
+    let query = MysqlV4::open(query.as_bytes(), &[], None).unwrap();
+    let exact = Opts::from_url(query_url).unwrap();
     assert_eq!(
         query.opts.as_ref(),
-        exact.opts.as_ref(),
+        &exact,
         "query password trailing whitespace is outside the DSN"
     );
     assert!(!lent.opts.secure_auth && lent.opts.enable_cleartext_plugin);
@@ -433,10 +432,9 @@ fn literal_and_lent_dsn_capture_keep_only_public_configuration() {
         br#"{"url":99}"#,
         br#"{"url":"x","unknown":"CANARY-auth-17"}"#,
     ] {
-        let error =
-            <crate::MysqlStore as StoreSlots>::open_with_secrets(bytes, &[url.as_bytes()], None)
-                .err()
-                .expect("bad settings");
+        let error = MysqlV4::open(bytes, &[url.as_bytes()], None)
+            .err()
+            .expect("bad settings");
         assert!(!error.contains(PASSWORD), "{error}");
     }
 }

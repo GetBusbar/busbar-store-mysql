@@ -5,14 +5,14 @@ version = "1.6.0"
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "The MySQL/MariaDB backend for busbar's durable governance store — the shared, multi-node db plugin. Serves the store v3 door over the host's connector (no socket of its own): the MySQL client protocol over kept connections."
+description = "The MySQL/MariaDB backend for busbar's durable governance store — the shared, multi-node db plugin. Serves the native primitive store door over the host's connector (no socket of its own): the MySQL client protocol over kept connections."
 license.workspace = true
 
 [lints]
 workspace = true
 
 [lib]
-# rlib: THE LOGIC, and the store's door (`store_door!` over its `StoreSlots`: `door`, the row a
+# rlib: native primitives and their v4 door (`door`, the row a
 # busbar build that links this crate registers). The sibling `busbar-store-mysql-plugin` cdylib
 # exports the same `door` as the dropped-in door. One source, both doors (DECISIONS #2 rule (1)).
 crate-type = ["rlib"]
@@ -38,13 +38,13 @@ percent-encoding = { workspace = true }
 serde_json = { workspace = true }
 # Typed settings capture seals the DSN while the SDK reads it.
 serde = { workspace = true }
+sha2 = { workspace = true }
+getrandom = { workspace = true }
 
 [dev-dependencies]
 jsonschema = { workspace = true }
-# Backend-owned tests exercise tombstones, credentials and plane records.
-ulid = { workspace = true }
 # The live tests open the store the way the host does: its door through the REAL loader on a
-# dispatcher (`load_linked`, `LoadedStore`) and the actual connector/TCP carrier. The 1.5.5 `mysql` driver verifies what landed INDEPENDENTLY of the
+# dispatcher (`load_linked`, `LoadedPersistence`) and the actual connector/TCP carrier. The 1.5.5 `mysql` driver verifies what landed INDEPENDENTLY of the
 # store (tests only; never in the shipped image).
 busbar-plugin-loader = { workspace = true }
 mysql = { workspace = true }

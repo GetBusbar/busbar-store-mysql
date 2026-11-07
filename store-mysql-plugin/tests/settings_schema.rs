@@ -13,6 +13,6 @@ fn settings_schema_is_carried_by_statement() {
     );
     assert_eq!(
         statement.settings_schema.bytes,
-        include_bytes!("../../store-mysql/src/settings.schema.json")
+        include_bytes!("../../store-mysql/src/v4/settings.schema.json")
     );
 }

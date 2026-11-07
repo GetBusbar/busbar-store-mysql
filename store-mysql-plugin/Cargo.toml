@@ -21,7 +21,7 @@ workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# THE STORE, same repo. Its `store_door!` is the store's door; this crate only exports that door
+# THE STORE, same repo. Its native v4 door is the store's door; this crate only exports that door
 # as a loadable library.
 busbar-store-mysql = { path = "../store-mysql" }
 # `export_door!`. Same pinned rev as the logic crate's, so one busbar source resolves.
@@ -33,7 +33,7 @@ busbar-contract = { workspace = true }
 # pinned rev as the logic crate's busbar-contract, so one busbar source resolves.
 busbar-plugin-loader = { workspace = true }
 serde_json = { workspace = true }
-# Drives the store v3 slots (`StoreCalls`, async) to completion on a current-thread runtime.
+# Drives native primitive calls on a current-thread runtime.
 tokio = { workspace = true, features = ["rt"] }
 mysql = { workspace = true }
 # For admin_api_e2e.rs: drives the real busbar admin HTTP API (install/mint) against an

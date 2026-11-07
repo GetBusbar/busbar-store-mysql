@@ -37,10 +37,10 @@ repository = "https://github.com/GetBusbar/busbar-store-mysql"
 needless_update = "allow"
 
 [workspace.dependencies]
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "a2de9cc5dabc538e4c8a5cce748d2fb7e15f00d2" }
-busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "a2de9cc5dabc538e4c8a5cce748d2fb7e15f00d2" }
-"busbar-core-connector" = { "git" = "https://github.com/GetBusbar/busbar", "rev" = "a2de9cc5dabc538e4c8a5cce748d2fb7e15f00d2" }
-"busbar-transport-tcp" = { "git" = "https://github.com/GetBusbar/busbar-transport-tcp", "rev" = "ce4be9a321f83c0c482012789163dd575a0b1b3c" }
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "24b15da367cced369a6cccfd6adeb2bd2adb38c0" }
+busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "24b15da367cced369a6cccfd6adeb2bd2adb38c0" }
+"busbar-core-connector" = { git = "https://github.com/GetBusbar/busbar", rev = "24b15da367cced369a6cccfd6adeb2bd2adb38c0" }
+"busbar-transport-tcp" = { git = "https://github.com/GetBusbar/busbar-transport-tcp", rev = "c73467f16f1d2cab2801517328d1d5942b7d1530" }
 # busbar's root [workspace.dependencies], third-party rows, at 892773b8ed5d0cc78694bbcf5a10d89346ad61e6
 arc-swap = "1"
 async-trait = "0.1"

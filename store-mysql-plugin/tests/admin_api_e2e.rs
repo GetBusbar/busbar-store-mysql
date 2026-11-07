@@ -1,34 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! THE prod-ready end-to-end bar for this plugin, driven the way a real OPERATOR installs and uses
-//! it in production — never a file dropped onto disk before boot (see `e2e.rs` for that path, still
-//! real and still kept as its own proof), but the REAL admin HTTP API. Mirrors
-//! store-postgres-plugin's own `admin_api_e2e.rs` exactly (same wire shapes, same two-boot
-//! restart-to-activate flow), adapted only where MySQL's real schema differs from Postgres':
-//! `api_keys` (not `keys` — `KEYS` is a MySQL/MariaDB reserved word, see `busbar-store-mysql`'s own
-//! module doc) and MySQL's `information_schema.tables` for the boot-time schema-existence poll.
-//!
-//!   1. Boot a real `busbar` process (no `--validate`) with its admin listener up and the compiled-in
-//!      `memory` store active (`store: {module: memory}`: busbar 1.6.0 requires the block).
-//!   2. `POST /api/v1/admin/plugins` with the REAL built cdylib, base64-encoded, guarded by a real
-//!      `x-admin-token` — the exact wire shape `crates/busbar/src/admin/v1/json/handlers.rs`'s
-//!      `install_plugin` uses.
-//!   3. `GET /api/v1/admin/plugins?type=store` confirms the install landed in the real catalog.
-//!   4. Stop that process, rewrite `config.yaml` to point `store: module: mysql` at the real MySQL,
-//!      using the SAME plugins.dir the admin API itself wrote the tarball to in step 2.
-//!   5. Boot a SECOND real `busbar` process against that config — its first-boot store resolution
-//!      dlopens the admin-installed plugin and runs `RecordStore::connect()`/schema init. Poll — via a RAW
-//!      independent `mysql::Conn`, never `MysqlStore::connect` — for the schema to appear.
-//!   6. `POST /api/v1/admin/keys` (with `issue_aws_credential: true`) against this SECOND process.
-//!   7. Independently verify — a fresh RAW `mysql::Pool`, bypassing the plugin/ABI/admin-API
-//!      entirely — that both the `api_keys` and `credentials` rows actually landed.
+//! Installs the actual plugin over HTTP, restarts with a fresh native target,
+//! mints a key and credential, then checks the HTTP result and physical records
+//! and receipts independently through MySQL.
 
 mod common;
 
 use base64::Engine as _;
-use common::{build_real_binaries, cleanup, plugin_path, E2E_RELEASE_PRIVKEY};
-use mysql::params;
+use common::{build_real_binaries, plugin_path, E2E_RELEASE_PRIVKEY};
 use mysql::prelude::*;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -76,18 +56,6 @@ fn spawn_busbar(cmd: &mut Command, log: PathBuf, what: &str) -> ChildGuard {
     ChildGuard(child, log)
 }
 
-/// Cleans up the REAL minted row (by its real random id) on drop -- including on panic-unwind, since Rust runs local guards' `Drop` during a panicking stack unwind.
-struct CleanupGuard {
-    url: String,
-    id: String,
-}
-
-impl Drop for CleanupGuard {
-    fn drop(&mut self) {
-        cleanup(&self.url, &self.id);
-    }
-}
-
 fn mysql_url() -> Option<String> {
     match std::env::var("BUSBAR_TEST_MYSQL_URL") {
         Ok(url) => Some(url),
@@ -111,64 +79,6 @@ fn free_port() -> u16 {
         .local_addr()
         .unwrap()
         .port()
-}
-
-/// Proves `CleanupGuard` actually cleans up on a PANICKING exit, not just the normal-return path -- direct SQL against a real row, bypassing the (expensive, real-binary-building) full e2e flow, so this stays fast.
-#[test]
-fn cleanup_guard_removes_the_row_even_when_the_scope_holding_it_panics() {
-    let Some(url) = mysql_url() else { return };
-    let id = format!(
-        "vk_cleanupguard_panic_test_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
-
-    drop(common::connect_linked(&url).expect("the store creates its schema"));
-    let pool =
-        mysql::Pool::new(mysql::Opts::from_url(&crate::common::raw_mysql_url(&url)).unwrap())
-            .unwrap();
-    let mut conn = pool.get_conn().unwrap();
-    conn.exec_drop(
-        "INSERT INTO api_keys \
-         (id, name, key_group, allowed_pools, labels, enabled, generation_hash, \
-          created_at, updated_at, expires_at, deleted_at, revision) \
-         VALUES (:id, 'cleanup-guard-test', '', NULL, '{}', 1, '', 1000, 1000, NULL, NULL, 0)",
-        params! { "id" => &id },
-    )
-    .unwrap();
-
-    let exists = |conn: &mut mysql::PooledConn, id: &str| -> bool {
-        conn.exec_first::<u8, _, _>(
-            "SELECT 1 FROM api_keys WHERE id=:id",
-            params! { "id" => id },
-        )
-        .unwrap()
-        .is_some()
-    };
-    assert!(
-        exists(&mut conn, &id),
-        "sanity: the row must exist before the panic test"
-    );
-
-    let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _guard = CleanupGuard {
-            url: url.clone(),
-            id: id.clone(),
-        };
-        panic!("deliberate panic while the guard is in scope -- proves Drop still runs");
-    }));
-    assert!(
-        panic_result.is_err(),
-        "the inner closure must have actually panicked"
-    );
-
-    assert!(
-        !exists(&mut conn, &id),
-        "CleanupGuard's Drop must have removed the row even though the scope panicked"
-    );
 }
 
 fn wait_for_admin_listener(
@@ -224,8 +134,6 @@ fn install_over_admin_api_then_mint_a_key_and_verify_mysql_directly() {
         "only boot #2 may initialize this private schema"
     );
     let so_path = plugin_path();
-    let key_id = "vk_mysql_adminapi_e2e";
-    cleanup(&url, key_id);
 
     let (busbar_bin, pack_bin) = build_real_binaries();
 
@@ -378,7 +286,7 @@ fn install_over_admin_api_then_mint_a_key_and_verify_mysql_directly() {
     let config2 = work.join("config2.yaml");
     std::fs::write(
         &config2,
-        format!("{pinned_common}store:\n  module: mysql\n  settings: {{ url: \"{url}\" }}\n"),
+        format!("{pinned_common}store:\n  module: mysql\n  settings: {{ url: \"{url}\", input_budget: 67108864 }}\n"),
     )
     .unwrap();
 
@@ -395,30 +303,19 @@ fn install_over_admin_api_then_mint_a_key_and_verify_mysql_directly() {
     );
 
     let deadline = Instant::now() + Duration::from_secs(15);
-    let expected_schema = busbar_store_mysql::SCHEMA_VERSION.to_string();
     let booted = loop {
         let tables: u64 = schema_observer
             .query_first(
                 "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE()
-             AND table_name IN ('api_keys','credentials','store_meta','store_sequence')",
+             AND table_name IN ('busbar_v4_meta','busbar_v4_records','busbar_v4_receipts')",
             )
             .unwrap()
             .unwrap();
-        if tables == 4 {
-            let version: Option<String> = schema_observer
-                .query_first("SELECT v FROM store_meta WHERE k='schema_version'")
+        if tables == 3 {
+            let ready: Option<Vec<u8>> = schema_observer
+                .query_first("SELECT ready FROM busbar_v4_meta")
                 .unwrap();
-            let migrating: Option<String> = schema_observer
-                .query_first("SELECT v FROM store_meta WHERE k='migrating_to'")
-                .unwrap();
-            let singleton: u64 = schema_observer
-                .query_first("SELECT COUNT(*) FROM store_sequence WHERE id=1")
-                .unwrap()
-                .unwrap();
-            if version.as_deref() == Some(expected_schema.as_str())
-                && migrating.is_none()
-                && singleton == 1
-            {
+            if ready.as_deref() == Some(&[1]) {
                 break true;
             }
         }
@@ -432,10 +329,19 @@ fn install_over_admin_api_then_mint_a_key_and_verify_mysql_directly() {
     };
     assert!(
         booted,
-        "boot #2, restarted onto the admin-installed mysql plugin, must create the `api_keys` \
+        "boot #2, restarted onto the admin-installed mysql plugin, must admit the native primitive \
          table within 15s -- proof the real dlopen+connect path executed"
     );
     wait_for_admin_listener(&client, &admin_base, admin_token, &mut guard2, "boot #2");
+
+    let records_before: u64 = schema_observer
+        .query_first("SELECT COUNT(*) FROM busbar_v4_records")
+        .unwrap()
+        .unwrap();
+    let receipts_before: u64 = schema_observer
+        .query_first("SELECT COUNT(*) FROM busbar_v4_receipts")
+        .unwrap()
+        .unwrap();
 
     let mint_body = serde_json::json!({
         "name": "smysql-adminapi-e2e-key",
@@ -470,10 +376,6 @@ fn install_over_admin_api_then_mint_a_key_and_verify_mysql_directly() {
         .expect("minted key response has an id")
         .to_string();
 
-    let _cleanup_guard = CleanupGuard {
-        url: url.clone(),
-        id: minted_id.clone(),
-    };
     let access_key_id = mint_json["aws_access_key_id"]
         .as_str()
         .expect("issue_aws_credential:true must return an aws_access_key_id")
@@ -483,36 +385,33 @@ fn install_over_admin_api_then_mint_a_key_and_verify_mysql_directly() {
         "issue_aws_credential:true must also return an aws_secret_access_key: {redacted_mint_json}"
     );
 
-    let pool =
-        mysql::Pool::new(mysql::Opts::from_url(&crate::common::raw_mysql_url(&url)).unwrap())
-            .expect("connect directly to confirm persistence, bypassing the plugin entirely");
-    let mut conn = pool.get_conn().unwrap();
-    let key_row: Option<(String, bool)> = conn
-        .exec_first(
-            "SELECT name, enabled FROM api_keys WHERE id=:id",
-            params! { "id" => &minted_id },
-        )
+    let observed: serde_json::Value = client
+        .get(format!("{admin_base}/keys/{minted_id}"))
+        .header("x-admin-token", admin_token)
+        .send()
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
         .unwrap();
-    let (stored_name, stored_enabled) =
-        key_row.expect("the minted key must be a real row in the real api_keys table");
-    assert_eq!(stored_name, "smysql-adminapi-e2e-key");
-    assert!(stored_enabled);
-
-    let cred_row: Option<(String, String)> = conn
-        .exec_first(
-            "SELECT kind, public_id FROM credentials WHERE key_id=:id",
-            params! { "id" => &minted_id },
-        )
+    assert_eq!(observed["name"], "smysql-adminapi-e2e-key");
+    assert_eq!(observed["enabled"], true);
+    assert!(!access_key_id.is_empty());
+    // Inspect physical persistence without decoding core-owned identity records.
+    let records: u64 = schema_observer
+        .query_first("SELECT COUNT(*) FROM busbar_v4_records")
+        .unwrap()
         .unwrap();
-    let (stored_kind, stored_public_id) = cred_row
-        .expect("the minted AWS credential must be a real row in the real credentials table");
-    assert_eq!(stored_kind, "sigv4");
-    assert_eq!(
-        stored_public_id, access_key_id,
-        "the credential row's public_id must be the SAME access key id the admin API returned"
+    let receipts: u64 = schema_observer
+        .query_first("SELECT COUNT(*) FROM busbar_v4_receipts")
+        .unwrap()
+        .unwrap();
+    assert!(
+        records > records_before && receipts > receipts_before,
+        "confirmed identity publication has native records and receipts"
     );
 
     drop(guard2);
-    drop(conn);
+    drop(schema_observer);
     let _ = std::fs::remove_dir_all(&work);
 }

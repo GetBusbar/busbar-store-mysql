@@ -6,14 +6,14 @@
 use std::sync::Arc;
 
 use busbar_contract::secret_fields::resolve_declared_fields;
-use busbar_plugin_loader::dispatch::kinds::store::Store;
+use busbar_plugin_loader::dispatch::kinds::store_v4::StoreV4;
 use busbar_plugin_loader::dispatch::{
     load_linked, Bind, ConnTable, DispatchConfig, Dispatcher, LinkedRow, NoSink, Plugin,
 };
 
 const URL: &str = "mysql://busbar@db.internal:3306/busbar";
 
-fn linked() -> (Plugin<Store>, Arc<Dispatcher>) {
+fn linked() -> (Plugin<StoreV4>, Arc<Dispatcher>) {
     let d = Arc::new(Dispatcher::new(DispatchConfig::default()));
     let bind = Bind {
         instance: Arc::from("reference-url"),
@@ -22,8 +22,14 @@ fn linked() -> (Plugin<Store>, Arc<Dispatcher>) {
         dispatcher: d.adopter(),
         conns: ConnTable::Probe,
     };
-    let row = LinkedRow::of(busbar_store_mysql::door).expect("the row renders");
-    (load_linked::<Store>(&row, bind).expect("the door loads"), d)
+    let row = LinkedRow::of_kind::<StoreV4>(
+        busbar_store_mysql::door as busbar_contract::abi::mechanism::door::DoorFn,
+    )
+    .expect("the row renders");
+    (
+        load_linked::<StoreV4>(&row, bind).expect("the door loads"),
+        d,
+    )
 }
 
 #[test]

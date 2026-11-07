@@ -275,7 +275,7 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 [[package]]
 name = "busbar-contract"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=a2de9cc5dabc538e4c8a5cce748d2fb7e15f00d2#a2de9cc5dabc538e4c8a5cce748d2fb7e15f00d2"
+source = "git+https://github.com/GetBusbar/busbar?rev=24b15da367cced369a6cccfd6adeb2bd2adb38c0#24b15da367cced369a6cccfd6adeb2bd2adb38c0"
 dependencies = [
  "async-trait",
  "aws-lc-sys",
@@ -306,7 +306,7 @@ dependencies = [
 [[package]]
 name = "busbar-core-connector"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=a2de9cc5dabc538e4c8a5cce748d2fb7e15f00d2#a2de9cc5dabc538e4c8a5cce748d2fb7e15f00d2"
+source = "git+https://github.com/GetBusbar/busbar?rev=24b15da367cced369a6cccfd6adeb2bd2adb38c0#24b15da367cced369a6cccfd6adeb2bd2adb38c0"
 dependencies = [
  "arc-swap",
  "base64 0.22.1",
@@ -331,13 +331,14 @@ dependencies = [
  "tracing",
  "url",
  "webpki-roots",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 
 [[package]]
 name = "busbar-kernel"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=a2de9cc5dabc538e4c8a5cce748d2fb7e15f00d2#a2de9cc5dabc538e4c8a5cce748d2fb7e15f00d2"
+source = "git+https://github.com/GetBusbar/busbar?rev=24b15da367cced369a6cccfd6adeb2bd2adb38c0#24b15da367cced369a6cccfd6adeb2bd2adb38c0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -350,7 +351,6 @@ dependencies = [
  "busbar-kernel-egress",
  "busbar-kernel-identity",
  "busbar-kernel-ledger",
- "busbar-kernel-seams",
  "busbar-kernel-wal",
  "bytes",
  "crc32fast",
@@ -384,7 +384,7 @@ dependencies = [
 [[package]]
 name = "busbar-kernel-audit"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=a2de9cc5dabc538e4c8a5cce748d2fb7e15f00d2#a2de9cc5dabc538e4c8a5cce748d2fb7e15f00d2"
+source = "git+https://github.com/GetBusbar/busbar?rev=24b15da367cced369a6cccfd6adeb2bd2adb38c0#24b15da367cced369a6cccfd6adeb2bd2adb38c0"
 dependencies = [
  "busbar-contract",
  "ed25519-dalek",
@@ -396,7 +396,7 @@ dependencies = [
 [[package]]
 name = "busbar-kernel-breaker"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=a2de9cc5dabc538e4c8a5cce748d2fb7e15f00d2#a2de9cc5dabc538e4c8a5cce748d2fb7e15f00d2"
+source = "git+https://github.com/GetBusbar/busbar?rev=24b15da367cced369a6cccfd6adeb2bd2adb38c0#24b15da367cced369a6cccfd6adeb2bd2adb38c0"
 dependencies = [
  "busbar-contract",
 ]
@@ -404,7 +404,7 @@ dependencies = [
 [[package]]
 name = "busbar-kernel-egress"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=a2de9cc5dabc538e4c8a5cce748d2fb7e15f00d2#a2de9cc5dabc538e4c8a5cce748d2fb7e15f00d2"
+source = "git+https://github.com/GetBusbar/busbar?rev=24b15da367cced369a6cccfd6adeb2bd2adb38c0#24b15da367cced369a6cccfd6adeb2bd2adb38c0"
 dependencies = [
  "busbar-contract",
  "busbar-kernel-breaker",
@@ -413,7 +413,7 @@ dependencies = [
 [[package]]
 name = "busbar-kernel-identity"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=a2de9cc5dabc538e4c8a5cce748d2fb7e15f00d2#a2de9cc5dabc538e4c8a5cce748d2fb7e15f00d2"
+source = "git+https://github.com/GetBusbar/busbar?rev=24b15da367cced369a6cccfd6adeb2bd2adb38c0#24b15da367cced369a6cccfd6adeb2bd2adb38c0"
 dependencies = [
  "busbar-contract",
  "hex",
@@ -423,24 +423,16 @@ dependencies = [
 [[package]]
 name = "busbar-kernel-ledger"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=a2de9cc5dabc538e4c8a5cce748d2fb7e15f00d2#a2de9cc5dabc538e4c8a5cce748d2fb7e15f00d2"
+source = "git+https://github.com/GetBusbar/busbar?rev=24b15da367cced369a6cccfd6adeb2bd2adb38c0#24b15da367cced369a6cccfd6adeb2bd2adb38c0"
 dependencies = [
  "busbar-contract",
  "serde",
 ]
 
 [[package]]
-name = "busbar-kernel-seams"
-version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=a2de9cc5dabc538e4c8a5cce748d2fb7e15f00d2#a2de9cc5dabc538e4c8a5cce748d2fb7e15f00d2"
-dependencies = [
- "busbar-contract",
-]
-
-[[package]]
 name = "busbar-kernel-wal"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=a2de9cc5dabc538e4c8a5cce748d2fb7e15f00d2#a2de9cc5dabc538e4c8a5cce748d2fb7e15f00d2"
+source = "git+https://github.com/GetBusbar/busbar?rev=24b15da367cced369a6cccfd6adeb2bd2adb38c0#24b15da367cced369a6cccfd6adeb2bd2adb38c0"
 dependencies = [
  "busbar-contract",
  "ring",
@@ -448,8 +440,8 @@ dependencies = [
 
 [[package]]
 name = "busbar-plugin-loader"
-version = "1.5.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=a2de9cc5dabc538e4c8a5cce748d2fb7e15f00d2#a2de9cc5dabc538e4c8a5cce748d2fb7e15f00d2"
+version = "1.6.0"
+source = "git+https://github.com/GetBusbar/busbar?rev=24b15da367cced369a6cccfd6adeb2bd2adb38c0#24b15da367cced369a6cccfd6adeb2bd2adb38c0"
 dependencies = [
  "arc-swap",
  "busbar-contract",
@@ -466,6 +458,7 @@ dependencies = [
  "tar",
  "tokio",
  "tracing",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 
@@ -479,15 +472,16 @@ dependencies = [
  "busbar-transport-tcp",
  "bytes",
  "flate2",
+ "getrandom 0.3.4",
  "jsonschema",
  "mysql",
  "mysql_common 0.35.5",
  "percent-encoding",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tracing",
- "ulid",
  "url",
  "zeroize",
 ]
@@ -511,7 +505,7 @@ dependencies = [
 [[package]]
 name = "busbar-transport-tcp"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar-transport-tcp?rev=ce4be9a321f83c0c482012789163dd575a0b1b3c#ce4be9a321f83c0c482012789163dd575a0b1b3c"
+source = "git+https://github.com/GetBusbar/busbar-transport-tcp?rev=c73467f16f1d2cab2801517328d1d5942b7d1530#c73467f16f1d2cab2801517328d1d5942b7d1530"
 dependencies = [
  "busbar-contract",
 ]
@@ -2922,16 +2916,6 @@ name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
-
-[[package]]
-name = "ulid"
-version = "1.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "470dbf6591da1b39d43c14523b2b469c86879a53e8b758c8e090a470fe7b1fbe"
-dependencies = [
- "rand 0.9.5",
- "web-time",
-]
 
 [[package]]
 name = "unicode-bidi"

@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":false,"required":["url","input_budget"],"properties":{"url":{"type":"string","minLength":1},"input_budget":{"type":"integer","minimum":1}}}

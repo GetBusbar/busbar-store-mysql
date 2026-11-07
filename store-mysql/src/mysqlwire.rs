@@ -19,9 +19,8 @@ use mysql_common::named_params::ParsedNamedParams;
 use mysql_common::packets::NullBitmap;
 use mysql_common::packets::{
     AuthPlugin, AuthSwitchRequest, Column, ComStmtClose, ComStmtExecuteRequestBuilder,
-    ComStmtSendLongData, CommonOkPacket, ErrPacket, HandshakePacket, OkPacket,
-    OkPacketDeserializer, OkPacketKind, OldAuthSwitchRequest, OldEofPacket, ResultSetTerminator,
-    StmtPacket,
+    ComStmtSendLongData, CommonOkPacket, ErrPacket, HandshakePacket, OkPacketDeserializer,
+    OkPacketKind, OldAuthSwitchRequest, OldEofPacket, ResultSetTerminator, StmtPacket,
 };
 use mysql_common::proto::codec::{Compression, PacketCodec};
 use mysql_common::proto::MySerialize;
@@ -435,6 +434,7 @@ fn decode(s: &str) -> String {
 
 impl Opts {
     /// Capture the password from a `mysql://user:pass@host:port/db?key=value&...` URL, then parse its public connection options with the driver's validation and refusals.
+    #[cfg(test)]
     pub fn from_url(url_str: &str) -> Result<Opts, UrlError> {
         let captured = CredUrl::parse(url_str.trim_matches(|ch: char| ch <= ' '))
             .map_err(|_| UrlError::BadUrl)?;
@@ -709,7 +709,6 @@ struct State {
     /// Each query text's parse into (positional text, named-parameter order), so a repeated query is not re-parsed per execute.
     parsed: HashMap<String, Arc<ParsedQuery>>,
     /// The last OK packet (affected rows, last insert id).
-    ok: Option<OkPacket<'static>>,
     has_results: bool,
     /// The connection is a unix socket (the driver sent a cleartext password over one).
     socket: bool,
@@ -790,7 +789,6 @@ impl State {
             auth_plugin: AuthPlugin::MysqlNativePassword,
             stmts: HashMap::new(),
             parsed: HashMap::new(),
-            ok: None,
             has_results: false,
             socket,
         }
@@ -816,11 +814,6 @@ impl Conn {
         Self::open_unscrubbed(wire, opts, need, init)
             .await
             .map_err(|e| e.scrubbed(opts))
-    }
-
-    /// `text` with this connection's URL password redacted.
-    pub(crate) fn scrub(&self, text: String) -> String {
-        self.st.opts.scrub(text)
     }
 
     async fn open_unscrubbed(
@@ -1020,14 +1013,12 @@ impl Conn {
             .map_err(|e| self.parse_err(e))?
             .into_inner();
         self.st.status = ok.status_flags();
-        self.st.ok = Some(ok.into_owned());
         Ok(())
     }
 
     fn handle_err(&mut self) {
         self.st.status = StatusFlags::empty();
         self.st.has_results = false;
-        self.st.ok = None;
     }
 
     fn more_results_exists(&self) -> bool {
@@ -1672,16 +1663,6 @@ impl Conn {
     pub async fn ping(&mut self) -> Result<()> {
         self.write_command(Command::COM_PING, &[]).await?;
         self.drop_packet().await
-    }
-
-    /// The rows the last statement affected.
-    #[must_use]
-    pub fn affected_rows(&self) -> u64 {
-        self.st
-            .ok
-            .as_ref()
-            .map(OkPacket::affected_rows)
-            .unwrap_or_default()
     }
 
     /// `START TRANSACTION` (the driver's `TxOpts::default()`: the server's isolation level).
