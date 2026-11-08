@@ -230,7 +230,10 @@ pub fn native_plugin(
         Dispatcher, LinkedRow, NoSink,
     };
     use std::sync::Arc;
-    let dispatcher = Arc::new(Dispatcher::new(DispatchConfig::default()));
+    let dispatcher = Arc::new(Dispatcher::new(
+        DispatchConfig::default(),
+        busbar_contract::services::test_caller_binding(),
+    ));
     let bind = Bind {
         instance: Arc::from(format!("mysql-native-image-{}", node())),
         max_inflight_cap: 64,

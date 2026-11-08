@@ -139,6 +139,7 @@ fn a_statement_that_is_not_the_librarys_own_is_refused() {
     changed[at] ^= 1;
     let dispatcher = Arc::new(dispatch::Dispatcher::new(
         dispatch::DispatchConfig::default(),
+        busbar_contract::services::test_caller_binding(),
     ));
     let bind = dispatch::Bind {
         instance: Arc::from("mysql-mismatch"),
@@ -159,6 +160,7 @@ fn a_store_library_loaded_as_another_kind_is_refused() {
     let stated = dispatch::rendering_of_library(&library).unwrap().unwrap();
     let dispatcher = Arc::new(dispatch::Dispatcher::new(
         dispatch::DispatchConfig::default(),
+        busbar_contract::services::test_caller_binding(),
     ));
     let bind = dispatch::Bind {
         instance: Arc::from("mysql-wrong-kind"),

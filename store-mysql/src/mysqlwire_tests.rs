@@ -84,7 +84,8 @@ pub(super) fn write_sealed_tcp(
         ..unsafe { std::mem::zeroed() }
     };
     // SAFETY: tables and connector slots remain live through the sole sealed write below.
-    let host = unsafe { Host::from_raw(&tables) };
+    let host =
+        unsafe { Host::<busbar_contract::plugin::markers::StoreKind>::test_from_raw(&tables) };
     let mut connector = host.connector(Ticket {
         slot: 1,
         generation: 1,

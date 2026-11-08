@@ -29,7 +29,10 @@ fn reactor() -> tokio::runtime::Handle {
 fn transport_dispatcher() -> &'static Arc<Dispatcher> {
     static ONE: OnceLock<Arc<Dispatcher>> = OnceLock::new();
     ONE.get_or_init(|| {
-        let dispatcher = Dispatcher::new(DispatchConfig::default());
+        let dispatcher = Dispatcher::new(
+            DispatchConfig::default(),
+            busbar_contract::services::test_caller_binding(),
+        );
         dispatcher.install_runtime(reactor());
         dispatcher.install_io(busbar_core_connector::hostio::process());
         Arc::new(dispatcher)

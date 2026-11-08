@@ -24,7 +24,10 @@ fn run<F: std::future::Future>(future: F) -> F::Output {
 fn open(url: &str) -> Arc<LoadedPersistence> {
     // Independent dispatchers model separate native writers. A shared default
     // dispatcher has one worker and serializes calls before database admission.
-    let dispatcher = Arc::new(Dispatcher::new(DispatchConfig::default()));
+    let dispatcher = Arc::new(Dispatcher::new(
+        DispatchConfig::default(),
+        busbar_contract::services::test_caller_binding(),
+    ));
     let conns = mysql_io::host(dispatcher.conn_waker(), Default::default());
     let row =
         LinkedRow::of_kind::<StoreV4>(super::door as busbar_contract::abi::mechanism::door::DoorFn)

@@ -4,10 +4,9 @@
 //! The coordinator must establish the external writer/DDL fence before opening and
 //! match the returned catalogue to its registered historical schema edge. A cursor
 //! belongs to this live snapshot only; reconnecting requires a new import attempt.
+#[cfg(test)]
 use std::sync::Arc;
 
-use busbar_contract::abi::sdk::cred::MysqlUrl;
-use busbar_contract::abi::sdk::store::wire::Wire;
 use busbar_contract::persistence::legacy_row::{self, Cell};
 use busbar_contract::redacted::OwnerSeal;
 use busbar_contract::Secret;
@@ -16,7 +15,9 @@ use mysql_common::params;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
-use crate::mysqlwire::{Conn, Opts, Row, Value};
+#[cfg(test)]
+use crate::mysqlwire::Opts;
+use crate::mysqlwire::{Conn, Row, Value};
 
 pub mod lifecycle;
 
@@ -74,13 +75,13 @@ pub struct Table {
 /// Source locator digest and exact physical format facts. No business decoding.
 #[derive(Debug, Clone)]
 pub struct Metadata {
-    pub source: [u8; 32],
+    pub _source: [u8; 32],
     /// Stable native server identity and exact database name; no guessed fallback.
     pub native_identity: Vec<u8>,
     pub snapshot: [u8; 16],
     pub catalogue_digest: [u8; 32],
     pub schema_version: u32,
-    pub quantity_format: Option<String>,
+    pub _quantity_format: Option<String>,
     pub catalogue: Vec<Table>,
 }
 
@@ -94,6 +95,7 @@ pub struct Cursor {
 
 /// Durable position; the coordinator separately verifies unchanged source content
 /// and fencing before resuming it in a newly opened snapshot.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Checkpoint {
     pub source: [u8; 32],
@@ -118,20 +120,6 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// Open through the existing host wire, bypassing MysqlStore::connect_step.
-    pub async fn open(wire: Wire, url: MysqlUrl, need: u32) -> Result<Self, Error> {
-        let opts = Arc::new(Opts::from_captured(url.0).map_err(|_| Error::Native)?);
-        let conn = Conn::open(
-            wire,
-            &opts,
-            need,
-            &["SET SESSION character_set_results = binary"],
-        )
-        .await
-        .map_err(|_| Error::Native)?;
-        Self::on_connection(conn).await
-    }
-
     pub(crate) async fn on_connection(conn: Conn) -> Result<Self, Error> {
         Self::on_connection_inner(conn, None).await
     }
@@ -188,11 +176,11 @@ impl Snapshot {
         Ok(Self {
             conn,
             metadata: Metadata {
-                source: hash.finalize().into(),
+                _source: hash.finalize().into(),
                 native_identity,
                 snapshot,
                 schema_version,
-                quantity_format,
+                _quantity_format: quantity_format,
                 catalogue_digest: catalogue_digest(&catalogue),
                 catalogue,
             },
@@ -217,6 +205,7 @@ impl Snapshot {
         &self.metadata
     }
 
+    #[cfg(test)]
     pub fn checkpoint(&self, cursor: &Cursor) -> Result<Checkpoint, Error> {
         if !self.admitted
             || self.poisoned
@@ -226,7 +215,7 @@ impl Snapshot {
             return Err(Error::Cursor);
         }
         Ok(Checkpoint {
-            source: self.metadata.source,
+            source: self.metadata._source,
             catalogue: self.metadata.catalogue_digest,
             schema_version: self.metadata.schema_version,
             table: cursor.table,
@@ -236,10 +225,11 @@ impl Snapshot {
 
     /// Restore an explicit durable checkpoint only after external unchanged-source
     /// verification. A locator/catalogue match alone cannot prove content identity.
+    #[cfg(test)]
     pub fn resume(&self, checkpoint: &Checkpoint) -> Result<Cursor, Error> {
         if !self.admitted
             || self.poisoned
-            || checkpoint.source != self.metadata.source
+            || checkpoint.source != self.metadata._source
             || checkpoint.catalogue != self.metadata.catalogue_digest
             || checkpoint.schema_version != self.metadata.schema_version
             || checkpoint.table >= self.metadata.catalogue.len()
@@ -460,6 +450,7 @@ impl Snapshot {
     }
 
     /// Explicitly finish without committing any transaction.
+    #[cfg(test)]
     pub async fn close(mut self) -> Result<(), Error> {
         self.conn
             .query_drop("ROLLBACK")

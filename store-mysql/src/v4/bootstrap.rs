@@ -663,7 +663,9 @@ impl State {
                     source
                         .page::<Own>(
                             &start,
-                            usize::try_from(bounds.items).map_err(|_| l::Error::Bounds)?.min(legacy::MAX_ROWS),
+                            usize::try_from(bounds.items)
+                                .map_err(|_| l::Error::Bounds)?
+                                .min(legacy::MAX_ROWS),
                             usize::try_from(bounds.bytes / 2).map_err(|_| l::Error::Bounds)?,
                         )
                         .await

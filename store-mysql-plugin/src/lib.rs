@@ -5,7 +5,7 @@
 
 #![deny(unsafe_code)]
 
-pub use busbar_store_mysql::*;
+pub use busbar_store_mysql::{door, MACRO_DOOR};
 
 /// The exported door: the macro's `#[no_mangle]` symbol is the one exemption.
 #[allow(unsafe_code)]

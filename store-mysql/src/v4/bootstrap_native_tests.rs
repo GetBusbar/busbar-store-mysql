@@ -57,7 +57,10 @@ async fn applied(store: &dyn PersistenceBackend, candidate: p::PreparedCandidate
     );
 }
 fn prepared(url: &str) -> LoadedPrepared {
-    let dispatcher = Arc::new(Dispatcher::new(DispatchConfig::default()));
+    let dispatcher = Arc::new(Dispatcher::new(
+        DispatchConfig::default(),
+        busbar_contract::services::test_caller_binding(),
+    ));
     dispatcher.install_runtime(tokio::runtime::Handle::current());
     dispatcher.install_io(busbar_core_connector::hostio::process());
     let conns = crate::test_mysql_io::host(dispatcher.conn_waker(), Default::default());

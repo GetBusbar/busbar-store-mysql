@@ -75,7 +75,11 @@ impl Backend for MysqlV4 {
     fn validate(settings: &[u8]) -> Result<(), String> {
         Self::open(settings, &[], None).map(drop)
     }
-    fn open(settings: &[u8], secrets: &[&[u8]], _: Option<Host>) -> Result<Self, String> {
+    fn open(
+        settings: &[u8],
+        secrets: &[&[u8]],
+        _: Option<Host<busbar_contract::plugin::markers::StoreKind>>,
+    ) -> Result<Self, String> {
         let settings: Settings = busbar_contract::abi::sdk::cred::settings_lent(settings, secrets)
             .map_err(|_| "invalid primitive MySQL settings".to_owned())?;
         if settings.input_budget == 0 {

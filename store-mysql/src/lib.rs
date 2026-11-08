@@ -9,15 +9,15 @@
 /// The package name stated by both linked and loadable doors.
 pub const NAME: &str = "busbar-store-mysql";
 /// Maximum retained host connections.
-pub const KEPT_CONNECTIONS: usize = 8;
+pub(crate) const KEPT_CONNECTIONS: usize = 8;
 /// MySQL duplicate-key error, interpreted by the physical transport.
 pub(crate) const ER_DUP_ENTRY: u16 = 1062;
 
-pub mod legacy;
+pub(crate) mod legacy;
 pub(crate) mod mysqlwire;
 /// Native primitive persistence door and implementation.
-pub mod v4;
-pub use v4::door;
+pub(crate) mod v4;
+pub use v4::{door, MACRO_DOOR};
 
 #[cfg(test)]
 mod settings_schema_tests;

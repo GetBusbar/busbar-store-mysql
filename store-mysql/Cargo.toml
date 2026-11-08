@@ -46,9 +46,10 @@ jsonschema = { workspace = true }
 # The live tests open the store the way the host does: its door through the REAL loader on a
 # dispatcher (`load_linked`, `LoadedPersistence`) and the actual connector/TCP carrier. The 1.5.5 `mysql` driver verifies what landed INDEPENDENTLY of the
 # store (tests only; never in the shipped image).
-busbar-plugin-loader = { workspace = true }
+busbar-plugin-loader = { workspace = true , features = ["test-support"] }
 mysql = { workspace = true }
 
 busbar-core-connector = { workspace = true }
 busbar-transport-tcp = { workspace = true }
 tokio = { workspace = true, features = ["rt", "net", "time"] }
+busbar-contract = { workspace = true, features = ["test-seal"] }
