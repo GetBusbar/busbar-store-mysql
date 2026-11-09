@@ -120,51 +120,62 @@ fn scan_request(info: BackendInfo, namespace: NamespaceId, prefix: Vec<u8>) -> S
         max_bytes: 65536,
     }
 }
+fn raw_options(url: &str) -> mysql::Opts {
+    // The independent SQL driver does not implement the SDK's RSA pin option.
+    let (base, query) = url.split_once('?').unwrap_or((url, ""));
+    let query = query
+        .split('&')
+        .filter(|pair| {
+            !pair.is_empty() && pair.split('=').next() != Some("server_public_key_sha256")
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    let url = if query.is_empty() {
+        base.to_owned()
+    } else {
+        format!("{base}?{query}")
+    };
+    mysql::Opts::from_url(&url).unwrap()
+}
 fn raw(url: &str) -> mysql::Conn {
-    mysql::Conn::new(mysql::Opts::from_url(url).unwrap()).unwrap()
+    mysql::Conn::new(raw_options(url)).unwrap()
+}
+fn observer(url: &str) -> mysql::Conn {
+    // Native lock-wait metadata is a privileged fixture observation. Keep the
+    // store under its scoped user; only this independent observer uses root.
+    let password =
+        std::env::var("BUSBAR_TEST_MYSQL_ROOT_PASSWORD").unwrap_or_else(|_| "busbar".into());
+    let opts = mysql::OptsBuilder::from_opts(raw_options(url))
+        .user(Some("root"))
+        .pass(Some(password));
+    mysql::Conn::new(opts).unwrap()
 }
 fn native_wait(conn: &mut mysql::Conn, at: &Address, statement: &str) -> u64 {
     let deadline = Instant::now() + Duration::from_secs(15);
-    let digest = address_hash(at);
-    let hex = |bytes: &[u8]| {
-        bytes
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
-    };
-    let namespace = format!("hex {};", hex(&at.namespace));
-    // InnoDB displays at most the first thirty bytes of a binary index field.
-    // Bind that displayed digest, the full namespace, query and native thread id
-    // to this test's known exact locator; there is only one fixture-held row.
-    let index = format!("hex {};", hex(&digest[..30]));
+    let digest = address_hash(at)
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<String>();
     loop {
-        let (_, _, status): (String, String, String) = conn
-            .query_first("SHOW ENGINE INNODB STATUS")
-            .unwrap()
+        // MySQL 8.4 can display a waiting read-only transaction as "not started"
+        // in SHOW ENGINE. Its actual lock-wait edge remains explicit here.
+        // Match the complete address digest (which includes the namespace),
+        // primary index, real wait edge and expected statement together.
+        let waits: Vec<(String, u64, String)> = conn
+            .query(
+                "SELECT l.LOCK_DATA,t.PROCESSLIST_ID,t.PROCESSLIST_INFO \
+             FROM performance_schema.data_lock_waits w \
+             JOIN performance_schema.data_locks l \
+               ON l.ENGINE=w.ENGINE AND l.ENGINE_LOCK_ID=w.REQUESTING_ENGINE_LOCK_ID \
+             JOIN performance_schema.threads t ON t.THREAD_ID=l.THREAD_ID \
+             WHERE l.OBJECT_SCHEMA=DATABASE() AND l.OBJECT_NAME='busbar_v4_records' \
+               AND l.INDEX_NAME='PRIMARY' AND l.LOCK_TYPE='RECORD' \
+               AND l.LOCK_STATUS='WAITING' AND l.LOCK_DATA IS NOT NULL \
+               AND t.PROCESSLIST_ID IS NOT NULL AND t.PROCESSLIST_INFO IS NOT NULL",
+            )
             .unwrap();
-        // Never count the historical LATEST DETECTED DEADLOCK section.
-        let current = status
-            .split("LIST OF TRANSACTIONS FOR EACH SESSION:")
-            .nth(1)
-            .unwrap()
-            .split("FILE I/O")
-            .next()
-            .unwrap();
-        for transaction in current.split("---TRANSACTION").skip(1) {
-            if transaction.contains("\nLOCK WAIT ")
-                && transaction.contains(&namespace)
-                && transaction.contains(&index)
-                && transaction.contains(statement)
-            {
-                let thread = transaction
-                    .split("thread id ")
-                    .nth(1)
-                    .unwrap()
-                    .split(',')
-                    .next()
-                    .unwrap()
-                    .parse::<u64>()
-                    .unwrap();
+        for (data, thread, query) in waits {
+            if data.to_ascii_uppercase().contains(&digest) && query.contains(statement) {
                 return thread;
             }
         }
@@ -175,6 +186,7 @@ fn native_wait(conn: &mut mysql::Conn, at: &Address, statement: &str) -> u64 {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+
 fn wait_until(conn: &mut mysql::Conn, expiry: u64) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -369,7 +381,7 @@ fn native_door_primitives_replay_and_serialization_boundaries() {
     assert_eq!(page.rows[0].0.key, make(&[0, 1]));
 
     let mut fixture = raw(&url);
-    let mut observer = raw(&url);
+    let mut observer = observer(&url);
     eprintln!("native stage: blocked commit expiry");
     // Commit guard must sample after the writer's exclusive lock is released.
     lock_record(&mut fixture, &writer);

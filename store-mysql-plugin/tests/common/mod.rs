@@ -110,7 +110,7 @@ pub fn plugin_path() -> PathBuf {
     fresh
 }
 
-/// The busbar checkout the real binaries are built from: `$BUSBAR_CHECKOUT`, else a sibling `busbar/` beside this repo (ci.yml checks GetBusbar/busbar out there at the `.busbar-ref` pin).
+/// The exact assembled host checkout; `.busbar-ref` selects its independently pinned SDK.
 pub fn busbar_root() -> PathBuf {
     let root = std::env::var_os("BUSBAR_CHECKOUT")
         .map(PathBuf::from)
@@ -127,16 +127,47 @@ pub fn busbar_root() -> PathBuf {
         .next()
         .expect(".busbar-ref field 1 is the pinned busbar sha")
         .to_string();
+    let host_revision = std::env::var("BUSBAR_ADMISSION_CORE_REVISION")
+        .expect("BUSBAR_ADMISSION_CORE_REVISION must select the exact assembled host");
+    assert!(
+        host_revision.len() == 40 && host_revision.bytes().all(|b| b.is_ascii_hexdigit()),
+        "BUSBAR_ADMISSION_CORE_REVISION must be a full SHA"
+    );
     let head = Command::new("git")
         .args(["-C", root.to_str().unwrap(), "rev-parse", "HEAD"])
         .output()
         .expect("git rev-parse the busbar checkout");
+    assert!(head.status.success(), "resolve the assembled host revision");
     let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
     assert_eq!(
         head,
-        pin,
-        "the busbar checkout at {} is not at the .busbar-ref pin",
+        host_revision,
+        "the busbar checkout at {} is not at the admitted host revision",
         root.display()
+    );
+    let dirty = Command::new("git")
+        .args([
+            "-C",
+            root.to_str().unwrap(),
+            "status",
+            "--porcelain",
+            "--untracked-files=no",
+        ])
+        .output()
+        .expect("inspect assembled host source");
+    assert!(
+        dirty.status.success() && dirty.stdout.is_empty(),
+        "assembled host has modified source"
+    );
+    let vector: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(root.join("scripts/ci-product-pins.json"))
+            .expect("read assembled host SDK vector"),
+    )
+    .expect("parse assembled host SDK vector");
+    assert_eq!(
+        vector["sdk"].as_str(),
+        Some(pin.as_str()),
+        "assembled host and plugin SDK differ; qualify a coherent cohort"
     );
     root
 }
