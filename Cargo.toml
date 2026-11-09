@@ -37,9 +37,9 @@ repository = "https://github.com/GetBusbar/busbar-store-mysql"
 needless_update = "allow"
 
 [workspace.dependencies]
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "a29e8974a5e5ceff78841bd1bc851d182c0f2965" }
-busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "a29e8974a5e5ceff78841bd1bc851d182c0f2965" }
-"busbar-core-connector" = { git = "https://github.com/GetBusbar/busbar", rev = "a29e8974a5e5ceff78841bd1bc851d182c0f2965" }
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "b0ae4cafc8bb7db78541e0d9c3b14cf0a6a7dcec" }
+busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "b0ae4cafc8bb7db78541e0d9c3b14cf0a6a7dcec" }
+"busbar-core-connector" = { git = "https://github.com/GetBusbar/busbar", rev = "b0ae4cafc8bb7db78541e0d9c3b14cf0a6a7dcec" }
 "busbar-transport-tcp" = { git = "https://github.com/GetBusbar/busbar-transport-tcp", rev = "1d93867534bbe5e727454d338e47acbb731f85e8" }
 # busbar's root [workspace.dependencies], third-party rows, at 892773b8ed5d0cc78694bbcf5a10d89346ad61e6
 arc-swap = "1"
