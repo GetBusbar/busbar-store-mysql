@@ -646,3 +646,204 @@ fn production_codec_consumed_plaintext_is_erased() {
         "the selected production codec must erase consumed plaintext"
     );
 }
+
+fn expect_query(stream: &mut TcpStream, expected: &str) {
+    let mut head = [0; 4];
+    stream.read_exact(&mut head).unwrap();
+    assert_eq!(head[3], 0);
+    let len = usize::from(head[0]) | (usize::from(head[1]) << 8) | (usize::from(head[2]) << 16);
+    let mut body = vec![0; len];
+    stream.read_exact(&mut body).unwrap();
+    assert_eq!(body.first(), Some(&3));
+    assert_eq!(&body[1..], expected.as_bytes());
+}
+fn sql_error(stream: &mut TcpStream, code: u16) {
+    let mut error = vec![0xff];
+    error.extend_from_slice(&code.to_le_bytes());
+    error.extend_from_slice(b"#HY000fixture SQL refusal");
+    stream.write_all(&packet(1, &error)).unwrap();
+}
+fn sql_ok(stream: &mut TcpStream) {
+    stream
+        .write_all(&packet(1, &[0, 0, 0, 2, 0, 0, 0]))
+        .unwrap();
+}
+fn text_result(stream: &mut TcpStream, columns: usize, rows: &[Vec<Option<&[u8]>>]) {
+    use mysql_common::{constants::ColumnType, packets::Column, proto::MySerialize};
+    stream.write_all(&packet(1, &[columns as u8])).unwrap();
+    let mut seq = 2;
+    for _ in 0..columns {
+        let mut column = Vec::new();
+        Column::new(ColumnType::MYSQL_TYPE_VAR_STRING).serialize(&mut column);
+        stream.write_all(&packet(seq, &column)).unwrap();
+        seq += 1;
+    }
+    stream.write_all(&packet(seq, &[0xfe, 0, 0, 2, 0])).unwrap();
+    seq += 1;
+    for row in rows {
+        let mut body = Vec::new();
+        for cell in row {
+            match cell {
+                None => body.push(0xfb),
+                Some(value) => {
+                    if value.len() < 251 {
+                        body.push(value.len() as u8);
+                    } else {
+                        body.push(0xfc);
+                        body.extend_from_slice(&(value.len() as u16).to_le_bytes());
+                    }
+                    body.extend_from_slice(value);
+                }
+            }
+        }
+        stream.write_all(&packet(seq, &body)).unwrap();
+        seq += 1;
+    }
+    stream.write_all(&packet(seq, &[0xfe, 0, 0, 2, 0])).unwrap();
+}
+
+#[test]
+fn native_initialization_batches_or_replays_the_exact_supported_commands() {
+    for refusal in [
+        None,
+        Some(1064),
+        Some(1142),
+        Some(1143),
+        Some(1193),
+        Some(1227),
+    ] {
+        let (mut conn, server) = fake_server(move |mut stream| {
+            expect_query(&mut stream, super::BATCH_NATIVE_INIT);
+            if let Some(code) = refusal {
+                sql_error(&mut stream, code);
+                for command in super::NATIVE_INIT {
+                    expect_query(&mut stream, command);
+                    sql_ok(&mut stream);
+                }
+            } else {
+                sql_ok(&mut stream);
+            }
+        });
+        conn.st.caps = mysql_common::constants::CapabilityFlags::CLIENT_PROTOCOL_41;
+        run(conn.initialize(super::NATIVE_INIT)).unwrap();
+        drop(conn);
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn native_initialization_never_retries_faults_or_ignores_a_fallback_refusal() {
+    for fault in [0, 1105, 1193] {
+        let (mut conn, server) = fake_server(move |mut stream| {
+            expect_query(&mut stream, super::BATCH_NATIVE_INIT);
+            match fault {
+                0 => stream.write_all(&packet(1, &[])).unwrap(),
+                1105 => sql_error(&mut stream, 1105),
+                _ => {
+                    sql_error(&mut stream, 1193);
+                    expect_query(&mut stream, super::NATIVE_INIT[0]);
+                    sql_error(&mut stream, 1227);
+                }
+            }
+            let mut extra = [0];
+            assert_eq!(
+                stream.read(&mut extra).unwrap(),
+                0,
+                "no extra command after refusal"
+            );
+        });
+        conn.st.caps = mysql_common::constants::CapabilityFlags::CLIENT_PROTOCOL_41;
+        assert!(run(conn.initialize(super::NATIVE_INIT)).is_err());
+        drop(conn);
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn native_identity_batch_and_mariadb_fallback_preserve_exact_bytes_and_bounds() {
+    for mode in 0..3 {
+        let maria = mode == 1;
+        let (mut conn, server) = fake_server(move |mut stream| {
+            expect_query(&mut stream, "SELECT @@GLOBAL.server_uuid,DATABASE()");
+            if mode != 0 {
+                sql_error(&mut stream, if maria { 1193 } else { 1227 });
+                expect_query(&mut stream, "SHOW GLOBAL VARIABLES LIKE 'server_uuid'");
+                if maria {
+                    text_result(&mut stream, 2, &[]);
+                    expect_query(&mut stream, "SHOW GLOBAL VARIABLES LIKE 'server_uid'");
+                    text_result(
+                        &mut stream,
+                        2,
+                        &[vec![Some(b"server_uid"), Some(b"instance")]],
+                    );
+                } else {
+                    text_result(
+                        &mut stream,
+                        2,
+                        &[vec![Some(b"server_uuid"), Some(b"instance")]],
+                    );
+                }
+                expect_query(&mut stream, "SELECT DATABASE()");
+                text_result(&mut stream, 1, &[vec![Some(b"fixture")]]);
+            } else {
+                text_result(&mut stream, 2, &[vec![Some(b"instance"), Some(b"fixture")]]);
+            }
+        });
+        conn.st.caps = mysql_common::constants::CapabilityFlags::CLIENT_PROTOCOL_41;
+        let bytes = run(crate::legacy::native_identity(&mut conn)).unwrap();
+        let kind = if maria {
+            "mariadb-server-uid"
+        } else {
+            "mysql-server-uuid"
+        };
+        assert_eq!(bytes, format!(r#"{{"format":"mysql-native-identity-v1","kind":"{kind}","instance":"instance","database":"fixture"}}"#).as_bytes());
+        drop(conn);
+        server.join().unwrap();
+    }
+    for (instance, database) in [
+        (Vec::new(), b"db".to_vec()),
+        (vec![b'x'; 257], b"db".to_vec()),
+        (b"id".to_vec(), Vec::new()),
+        (b"id".to_vec(), vec![b'x'; 257]),
+    ] {
+        let (mut conn, server) = fake_server(move |mut stream| {
+            expect_query(&mut stream, "SELECT @@GLOBAL.server_uuid,DATABASE()");
+            text_result(&mut stream, 2, &[vec![Some(&instance), Some(&database)]]);
+        });
+        conn.st.caps = mysql_common::constants::CapabilityFlags::CLIENT_PROTOCOL_41;
+        assert_eq!(
+            run(crate::legacy::native_identity(&mut conn)),
+            Err(crate::legacy::Error::UnknownFormat)
+        );
+        drop(conn);
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn native_identity_rejects_malformed_or_denied_metadata_without_weaker_fallback() {
+    for mode in 0..5 {
+        let (mut conn, server) = fake_server(move |mut stream| {
+            expect_query(&mut stream, "SELECT @@GLOBAL.server_uuid,DATABASE()");
+            match mode {
+                0 => stream.write_all(&packet(1, &[])).unwrap(),
+                1 => sql_error(&mut stream, 1105),
+                2 => text_result(&mut stream, 2, &[]),
+                3 => text_result(&mut stream, 2, &[vec![Some(b"id"), None]]),
+                _ => {
+                    // A managed server may deny the combined SELECT. Its original
+                    // SHOW path must still authorize and supply the exact identity.
+                    sql_error(&mut stream, 1227);
+                    expect_query(&mut stream, "SHOW GLOBAL VARIABLES LIKE 'server_uuid'");
+                    sql_error(&mut stream, 1227);
+                }
+            }
+            let mut extra = [0];
+            assert_eq!(stream.read(&mut extra).unwrap(), 0);
+        });
+        conn.st.caps = mysql_common::constants::CapabilityFlags::CLIENT_PROTOCOL_41;
+        assert!(run(crate::legacy::native_identity(&mut conn)).is_err());
+        drop(conn);
+        server.join().unwrap();
+    }
+}

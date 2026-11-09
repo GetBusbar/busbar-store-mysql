@@ -16,11 +16,7 @@ use crate::mysqlwire::{Conn, Opts};
 busbar_contract::own_seal!(Own);
 pub(super) type OwnSecret = Secret<Vec<u8>, Own>;
 
-pub(super) const INIT: &[&str] = &[
-    "SET SESSION sql_mode = CONCAT(@@sql_mode, ',STRICT_ALL_TABLES')",
-    "SET SESSION time_zone = '+00:00'",
-    "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ",
-];
+pub(super) const INIT: &[&str] = crate::mysqlwire::NATIVE_INIT;
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]

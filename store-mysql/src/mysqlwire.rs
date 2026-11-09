@@ -106,6 +106,21 @@ impl Drop for SecretBytes {
     }
 }
 
+/// Admission posture, also restored after every successful connection reset.
+pub(crate) const NATIVE_INIT: &[&str] = &[
+    "SET SESSION sql_mode = CONCAT(@@sql_mode, ',STRICT_ALL_TABLES')",
+    "SET SESSION time_zone = '+00:00'",
+    "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+];
+const BATCH_NATIVE_INIT: &str = "SET SESSION sql_mode = CONCAT(@@sql_mode, ',STRICT_ALL_TABLES'), time_zone = '+00:00', transaction_isolation = 'REPEATABLE-READ'";
+
+/// Older dialects and managed SQL filters can reject the combined spelling.
+/// Retry only the existing authoritative commands, never a transport/codec fault.
+pub(crate) fn batching_refused(error: &Error) -> bool {
+    matches!(error, Error::MySqlError(error) if matches!(error.code,
+        1064 | 1142 | 1143 | 1193 | 1227))
+}
+
 const MAX_COLUMNS: usize = 4096;
 const MAX_RESULT_ROWS: usize = 1_000_000;
 const MAX_RESULT_BYTES: usize = 256 * 1024 * 1024;
@@ -904,8 +919,19 @@ impl Conn {
         self.handle_ok::<CommonOkPacket>(&packet)?;
         self.st.stmts.clear();
         self.rollback_pending = false;
-        for cmd in init {
-            self.query_drop(cmd).await?;
+        self.initialize(init).await
+    }
+
+    async fn initialize(&mut self, init: &[&str]) -> Result<()> {
+        if init == NATIVE_INIT {
+            match self.query_drop(BATCH_NATIVE_INIT).await {
+                Ok(()) => return Ok(()),
+                Err(error) if batching_refused(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        for command in init {
+            self.query_drop(command).await?;
         }
         Ok(())
     }
@@ -1107,10 +1133,7 @@ impl Conn {
         };
         let max_allowed_packet = checked_packet_ceiling(max_allowed_packet)?;
         self.st.codec.max_allowed_packet = max_allowed_packet;
-        for cmd in init {
-            self.query_drop(cmd).await?;
-        }
-        Ok(())
+        self.initialize(init).await
     }
 
     async fn write_handshake_response(&mut self) -> Result<()> {

@@ -742,6 +742,23 @@ impl Drop for WipingRows {
 /// Canonical server-native identity used by archive export and live fence proof.
 /// MySQL's UUID and MariaDB's native UID are intentionally different identity kinds.
 pub(crate) async fn native_identity(conn: &mut Conn) -> Result<Vec<u8>, Error> {
+    let rows: Vec<(String, Option<String>)> =
+        match conn.query("SELECT @@GLOBAL.server_uuid,DATABASE()").await {
+            Ok(rows) => rows,
+            Err(error) if crate::mysqlwire::batching_refused(&error) => {
+                return native_identity_compat(conn).await;
+            }
+            Err(_) => return Err(Error::Native),
+        };
+    match rows.as_slice() {
+        [(instance, Some(database))] => identity_bytes("mysql-server-uuid", instance, database),
+        [(_, None)] => Err(Error::UnknownFormat),
+        _ => Err(Error::UnknownFormat),
+    }
+}
+
+/// Preserve MariaDB native UID and managed-server SHOW compatibility exactly.
+async fn native_identity_compat(conn: &mut Conn) -> Result<Vec<u8>, Error> {
     let uuid: Vec<(String, String)> = conn
         .query("SHOW GLOBAL VARIABLES LIKE 'server_uuid'")
         .await
@@ -773,6 +790,13 @@ pub(crate) async fn native_identity(conn: &mut Conn) -> Result<Vec<u8>, Error> {
     let database = database
         .filter(|name| !name.is_empty() && name.len() <= 256)
         .ok_or(Error::UnknownFormat)?;
+    identity_bytes(kind, &instance, &database)
+}
+
+fn identity_bytes(kind: &str, instance: &str, database: &str) -> Result<Vec<u8>, Error> {
+    if instance.is_empty() || instance.len() > 256 || database.is_empty() || database.len() > 256 {
+        return Err(Error::UnknownFormat);
+    }
     #[derive(serde::Serialize)]
     struct Identity<'a> {
         format: &'static str,
@@ -783,8 +807,8 @@ pub(crate) async fn native_identity(conn: &mut Conn) -> Result<Vec<u8>, Error> {
     let bytes = serde_json::to_vec(&Identity {
         format: "mysql-native-identity-v1",
         kind,
-        instance: &instance,
-        database: &database,
+        instance,
+        database,
     })
     .map_err(|_| Error::Damaged)?;
     if bytes.len() > 1024 {
