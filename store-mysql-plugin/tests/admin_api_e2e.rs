@@ -81,15 +81,47 @@ fn free_port() -> u16 {
         .port()
 }
 
+fn diagnose_stalled_boot(child: u32, database: &mut mysql::Conn, what: &str) {
+    let tasks = std::fs::read_dir(format!("/proc/{child}/task"));
+    if let Ok(tasks) = tasks {
+        let mut waits = tasks
+            .flatten()
+            .filter_map(|task| {
+                let id = task.file_name().to_str()?.parse::<u32>().ok()?;
+                let name = std::fs::read_to_string(task.path().join("comm")).ok()?;
+                let wait = std::fs::read_to_string(task.path().join("wchan")).ok()?;
+                Some((id, name.trim().to_owned(), wait.trim().to_owned()))
+            })
+            .take(64)
+            .collect::<Vec<_>>();
+        waits.sort_by_key(|row| row.0);
+        eprintln!("{what} child thread wait channels: {waits:?}");
+    }
+    // DIGEST_TEXT normalizes SQL literals. Never emit raw statements, lock data,
+    // record values, credentials, configuration or connection strings.
+    type Statement = (u64, String, String, String, String, u64);
+    let statements: mysql::Result<Vec<Statement>> = database.query(
+        "SELECT /*+ MAX_EXECUTION_TIME(500) */ t.PROCESSLIST_ID,COALESCE(t.PROCESSLIST_STATE,''),LEFT(COALESCE(s.DIGEST_TEXT,''),512),COALESCE(i.TRX_STATE,''),COALESCE(i.TRX_OPERATION_STATE,''),COALESCE(i.TRX_ROWS_LOCKED,0) FROM performance_schema.threads t LEFT JOIN performance_schema.events_statements_current s ON s.THREAD_ID=t.THREAD_ID LEFT JOIN information_schema.INNODB_TRX i ON i.TRX_MYSQL_THREAD_ID=t.PROCESSLIST_ID WHERE t.PROCESSLIST_DB=DATABASE() LIMIT 16",
+    );
+    eprintln!("{what} fixture normalized statements and transaction states: {statements:?}");
+    type WaitEdge = (u64, u64, u64, String, Option<String>, String, String);
+    let waits: mysql::Result<Vec<WaitEdge>> = database.query(
+        "SELECT /*+ MAX_EXECUTION_TIME(500) */ w.REQUESTING_ENGINE_TRANSACTION_ID,w.BLOCKING_ENGINE_TRANSACTION_ID,COALESCE(i.TRX_MYSQL_THREAD_ID,0),l.OBJECT_NAME,l.INDEX_NAME,l.LOCK_MODE,l.LOCK_STATUS FROM performance_schema.data_lock_waits w JOIN performance_schema.data_locks l ON l.ENGINE=w.ENGINE AND l.ENGINE_LOCK_ID=w.REQUESTING_ENGINE_LOCK_ID LEFT JOIN information_schema.INNODB_TRX i ON i.TRX_ID=w.REQUESTING_ENGINE_TRANSACTION_ID WHERE l.OBJECT_SCHEMA=DATABASE() LIMIT 16",
+    );
+    eprintln!("{what} fixture lock wait edges: {waits:?}");
+}
+
 fn wait_for_admin_listener(
     client: &reqwest::blocking::Client,
     admin_base: &str,
     token: &str,
     guard: &mut ChildGuard,
     what: &str,
-    mut database: Option<&mut mysql::Conn>,
+    mut diagnostic_options: Option<mysql::Opts>,
 ) {
     let deadline = Instant::now() + Duration::from_secs(15);
+    let diagnostic_at = Instant::now() + Duration::from_secs(12);
+    let mut diagnosed = false;
     loop {
         if client
             .get(format!("{admin_base}/plugins"))
@@ -106,18 +138,19 @@ fn wait_for_admin_listener(
                 guard.output()
             );
         }
-        if Instant::now() >= deadline {
-            if let Some(database) = database.as_mut() {
-                // Only fixture process states and counts: no SQL, record values,
-                // credentials or connection strings enter failure diagnostics.
-                let states: mysql::Result<Vec<(String, String, u64)>> = database.query(
-                    "SELECT COMMAND,COALESCE(STATE,''),COUNT(*) FROM information_schema.PROCESSLIST WHERE DB=DATABASE() GROUP BY COMMAND,STATE LIMIT 16",
-                );
-                eprintln!("{what} fixture database process states: {states:?}");
-                let waits: mysql::Result<Option<u64>> = database.query_first(
-                    "SELECT COUNT(*) FROM performance_schema.data_lock_waits w JOIN performance_schema.data_locks l ON l.ENGINE=w.ENGINE AND l.ENGINE_LOCK_ID=w.REQUESTING_ENGINE_LOCK_ID WHERE l.OBJECT_SCHEMA=DATABASE()",
-                );
-                eprintln!("{what} fixture database lock wait count: {waits:?}");
+        if !diagnosed && Instant::now() >= diagnostic_at {
+            diagnosed = true;
+            if let Some(options) = diagnostic_options.take() {
+                let child = guard.0.id();
+                let what = what.to_owned();
+                // Never pause the listener poll or join across its original deadline.
+                // This test-process-owned thread has bounded I/O and server queries.
+                let _diagnostic = std::thread::spawn(move || match mysql::Conn::new(options) {
+                    Ok(mut database) => diagnose_stalled_boot(child, &mut database, &what),
+                    Err(error) => {
+                        eprintln!("{what} fixture diagnostic observer unavailable: {error:?}")
+                    }
+                });
             }
         }
         assert!(
@@ -360,7 +393,7 @@ fn install_over_admin_api_then_mint_a_key_and_verify_mysql_directly() {
         admin_token,
         &mut guard2,
         "boot #2",
-        Some(&mut schema_observer),
+        Some(database.diagnostic_options()),
     );
 
     let records_before: u64 = schema_observer

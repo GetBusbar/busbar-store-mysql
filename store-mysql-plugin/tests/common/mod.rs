@@ -329,12 +329,24 @@ pub fn open_native(
 /// A private database for real child-boot proofs; no production constructor creates its schema.
 pub struct ScratchDb {
     root: mysql::Conn,
+    admin_options: mysql::Opts,
     name: String,
     user: String,
     pub url: String,
 }
 
 impl ScratchDb {
+    /// Separate bounded fixture diagnostics; product and schema assertions keep
+    /// their scoped user. These credentials already administer this scratch DB.
+    pub fn diagnostic_options(&self) -> mysql::Opts {
+        mysql::OptsBuilder::from_opts(self.admin_options.clone())
+            .db_name(Some(self.name.clone()))
+            .tcp_connect_timeout(Some(std::time::Duration::from_millis(500)))
+            .read_timeout(Some(std::time::Duration::from_millis(500)))
+            .write_timeout(Some(std::time::Duration::from_millis(500)))
+            .into()
+    }
+
     pub fn new(server: &str) -> Self {
         use mysql::prelude::Queryable;
         let opts = mysql::Opts::from_url(&crate::common::raw_mysql_url(server)).unwrap();
@@ -345,6 +357,7 @@ impl ScratchDb {
             .user(Some("root"))
             .pass(Some(password))
             .db_name(None::<String>);
+        let admin_options = root.clone().into();
         let mut root = mysql::Conn::new(root).unwrap();
         let name = format!("busbar_filedrop_{}", node());
         root.query_drop(format!("CREATE DATABASE {name}")).unwrap();
@@ -360,6 +373,7 @@ impl ScratchDb {
         let url = format!("{scheme}://{authority}/{name}{query}");
         Self {
             root,
+            admin_options,
             name,
             user,
             url,
