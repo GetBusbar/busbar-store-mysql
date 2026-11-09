@@ -174,6 +174,22 @@ pub fn busbar_root() -> PathBuf {
 
 /// Build (once, cached by cargo) and return the path to the real `busbar` binary and the real `busbar-plugin-pack` binary, both from the sibling busbar checkout — never a fixture, never a stub, the exact binaries a real release ships.
 pub fn build_real_binaries() -> (PathBuf, PathBuf) {
+    if let Some(binary) = std::env::var_os("BUSBAR_TEST_HOST_BINARY") {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI must build the admitted host source"
+        );
+        let binary = PathBuf::from(binary);
+        let pack = PathBuf::from(
+            std::env::var_os("BUSBAR_TEST_PACK_BINARY")
+                .expect("local host override also requires BUSBAR_TEST_PACK_BINARY"),
+        );
+        assert!(
+            binary.is_absolute() && binary.is_file() && pack.is_absolute() && pack.is_file(),
+            "local binary overrides must be existing absolute paths"
+        );
+        return (binary, pack);
+    }
     let root = busbar_root();
 
     for args in [

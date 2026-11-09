@@ -161,17 +161,19 @@ fn native_wait(conn: &mut mysql::Conn, at: &Address, statement: &str) -> u64 {
         // in SHOW ENGINE. Its actual lock-wait edge remains explicit here.
         // Match the complete address digest (which includes the namespace),
         // primary index, real wait edge and expected statement together.
+        // THREAD_ID belongs to the lock structure's creator, which can be a
+        // purge thread after reuse. INNODB_TRX identifies its current requester.
         let waits: Vec<(String, u64, String)> = conn
             .query(
-                "SELECT l.LOCK_DATA,t.PROCESSLIST_ID,t.PROCESSLIST_INFO \
+                "SELECT l.LOCK_DATA,i.TRX_MYSQL_THREAD_ID,i.TRX_QUERY \
              FROM performance_schema.data_lock_waits w \
              JOIN performance_schema.data_locks l \
                ON l.ENGINE=w.ENGINE AND l.ENGINE_LOCK_ID=w.REQUESTING_ENGINE_LOCK_ID \
-             JOIN performance_schema.threads t ON t.THREAD_ID=l.THREAD_ID \
+             JOIN information_schema.INNODB_TRX i ON i.TRX_ID=w.REQUESTING_ENGINE_TRANSACTION_ID \
              WHERE l.OBJECT_SCHEMA=DATABASE() AND l.OBJECT_NAME='busbar_v4_records' \
                AND l.INDEX_NAME='PRIMARY' AND l.LOCK_TYPE='RECORD' \
                AND l.LOCK_STATUS='WAITING' AND l.LOCK_DATA IS NOT NULL \
-               AND t.PROCESSLIST_ID IS NOT NULL AND t.PROCESSLIST_INFO IS NOT NULL",
+               AND i.TRX_MYSQL_THREAD_ID IS NOT NULL AND i.TRX_QUERY IS NOT NULL",
             )
             .unwrap();
         for (data, thread, query) in waits {

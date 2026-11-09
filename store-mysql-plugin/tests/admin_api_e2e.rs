@@ -87,6 +87,7 @@ fn wait_for_admin_listener(
     token: &str,
     guard: &mut ChildGuard,
     what: &str,
+    mut database: Option<&mut mysql::Conn>,
 ) {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
@@ -104,6 +105,20 @@ fn wait_for_admin_listener(
                  --- {what} output ---\n{}",
                 guard.output()
             );
+        }
+        if Instant::now() >= deadline {
+            if let Some(database) = database.as_mut() {
+                // Only fixture process states and counts: no SQL, record values,
+                // credentials or connection strings enter failure diagnostics.
+                let states: mysql::Result<Vec<(String, String, u64)>> = database.query(
+                    "SELECT COMMAND,COALESCE(STATE,''),COUNT(*) FROM information_schema.PROCESSLIST WHERE DB=DATABASE() GROUP BY COMMAND,STATE LIMIT 16",
+                );
+                eprintln!("{what} fixture database process states: {states:?}");
+                let waits: mysql::Result<Option<u64>> = database.query_first(
+                    "SELECT COUNT(*) FROM performance_schema.data_lock_waits w JOIN performance_schema.data_locks l ON l.ENGINE=w.ENGINE AND l.ENGINE_LOCK_ID=w.REQUESTING_ENGINE_LOCK_ID WHERE l.OBJECT_SCHEMA=DATABASE()",
+                );
+                eprintln!("{what} fixture database lock wait count: {waits:?}");
+            }
         }
         assert!(
             Instant::now() < deadline,
@@ -219,7 +234,14 @@ fn install_over_admin_api_then_mint_a_key_and_verify_mysql_directly() {
         work.join("boot1.log"),
         "boot #1 (memory store, admin listener up)",
     );
-    wait_for_admin_listener(&client, &admin_base, admin_token, &mut guard1, "boot #1");
+    wait_for_admin_listener(
+        &client,
+        &admin_base,
+        admin_token,
+        &mut guard1,
+        "boot #1",
+        None,
+    );
 
     let install_body = serde_json::json!({
         "file": file,
@@ -332,7 +354,14 @@ fn install_over_admin_api_then_mint_a_key_and_verify_mysql_directly() {
         "boot #2, restarted onto the admin-installed mysql plugin, must admit the native primitive \
          table within 15s -- proof the real dlopen+connect path executed"
     );
-    wait_for_admin_listener(&client, &admin_base, admin_token, &mut guard2, "boot #2");
+    wait_for_admin_listener(
+        &client,
+        &admin_base,
+        admin_token,
+        &mut guard2,
+        "boot #2",
+        Some(&mut schema_observer),
+    );
 
     let records_before: u64 = schema_observer
         .query_first("SELECT COUNT(*) FROM busbar_v4_records")
