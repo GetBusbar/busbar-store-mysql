@@ -505,7 +505,7 @@ dependencies = [
 [[package]]
 name = "busbar-transport-tcp"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar-transport-tcp?rev=1d93867534bbe5e727454d338e47acbb731f85e8#1d93867534bbe5e727454d338e47acbb731f85e8"
+source = "git+https://github.com/GetBusbar/busbar-transport-tcp?rev=022538c0010bd1f1e527b9da91065586f9675053#022538c0010bd1f1e527b9da91065586f9675053"
 dependencies = [
  "busbar-contract",
 ]
