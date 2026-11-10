@@ -41,7 +41,12 @@ fn open(url: &str) -> Arc<LoadedPersistence> {
             max_inflight_cap: 64,
             sink: Arc::new(NoSink),
             dispatcher: dispatcher.adopter(),
-            conns: ConnTable::Host(conns.clone()),
+            conns: ConnTable::Host(
+                busbar_contract::conn::admissions::AdmissionAuthority::issue(
+                    &busbar_contract::caps::KernelSeal::acquire_for_kernel(),
+                    conns.clone(),
+                ),
+            ),
         },
     )
     .unwrap();

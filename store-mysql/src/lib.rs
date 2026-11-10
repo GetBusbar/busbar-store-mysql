@@ -13,6 +13,7 @@ pub(crate) const KEPT_CONNECTIONS: usize = 8;
 /// MySQL duplicate-key error, interpreted by the physical transport.
 pub(crate) const ER_DUP_ENTRY: u16 = 1062;
 
+mod credentials;
 pub(crate) mod legacy;
 pub(crate) mod mysqlwire;
 /// Native primitive persistence door and implementation.
@@ -24,3 +25,5 @@ mod settings_schema_tests;
 #[cfg(test)]
 #[path = "../tests-support/mysql_io.rs"]
 mod test_mysql_io;
+
+mod source_interpretation;

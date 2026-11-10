@@ -353,7 +353,13 @@ fn max_allowed_packet_outside_mysqls_range_is_refused_at_parse() {
 fn a_url_parses_as_the_driver_parsed_it() {
     let o = Opts::from_url("mysql://u%40x:p%3Ass@db.internal:3307/busbar?compress=true").unwrap();
     assert_eq!(o.user.as_deref(), Some("u@x"));
-    assert_eq!(o.credential_url.credential().len(), 4);
+    assert_eq!(
+        o.credential_url
+            .password()
+            .expect("captured password")
+            .len(),
+        4
+    );
     assert!(!o.credential_url.public().contains("p%3Ass"));
     assert_eq!(o.target(), "db.internal:3307");
     assert_eq!(o.db_name.as_deref(), Some("busbar"));

@@ -32,8 +32,8 @@ pub use mysql_common::params::Params;
 pub use mysql_common::row::Row;
 pub use mysql_common::value::Value;
 
-use busbar_contract::abi::sdk::chip::{MysqlAuth, MysqlHandshake};
-use busbar_contract::abi::sdk::cred::{CredUrl, PasswordAt, Seal};
+use crate::credentials::{CredUrl, MysqlAuth, MysqlHandshake, PasswordAt};
+use busbar_contract::abi::sdk::cred::Seal;
 use busbar_contract::abi::sdk::store::wire::Wire;
 
 struct SecretParams(Params);
@@ -1147,7 +1147,6 @@ impl Conn {
             .st
             .opts
             .credential_url
-            .credential()
             .mysql_handshake_response(&MysqlHandshake {
                 seq,
                 capabilities: self.st.caps.bits(),
@@ -1278,7 +1277,7 @@ impl Conn {
                 }
 
                 Some(0x04) => {
-                    let credential = self.st.opts.credential_url.credential();
+                    let credential = self.st.opts.credential_url.clone();
                     if self.st.socket {
                         let seq = self.next_auth_seq()?;
                         let seal = credential.mysql_clear_packet(seq).map_err(auth_refused)?;
@@ -1337,7 +1336,6 @@ impl Conn {
                 .st
                 .opts
                 .credential_url
-                .credential()
                 .mysql_auth_switch_response(seq, self.mysql_auth()?, &self.st.nonce)
                 .map_err(auth_refused)?;
             self.write_auth(seal).await?;

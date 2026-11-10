@@ -42,6 +42,10 @@ sha2 = { workspace = true }
 getrandom = { workspace = true }
 
 [dev-dependencies]
+# Protocol recipe regression vectors transferred from the shared SDK.
+base64 = { workspace = true }
+hex = { workspace = true }
+num-bigint = { workspace = true }
 jsonschema = { workspace = true }
 # The live tests open the store the way the host does: its door through the REAL loader on a
 # dispatcher (`load_linked`, `LoadedPersistence`) and the actual connector/TCP carrier. The 1.5.5 `mysql` driver verifies what landed INDEPENDENTLY of the

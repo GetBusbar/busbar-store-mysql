@@ -21,7 +21,7 @@ pub(super) const INIT: &[&str] = crate::mysqlwire::NATIVE_INIT;
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Settings {
-    url: busbar_contract::abi::sdk::cred::MysqlUrl,
+    url: crate::credentials::MysqlUrl,
     input_budget: usize,
 }
 

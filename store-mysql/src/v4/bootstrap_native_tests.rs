@@ -74,7 +74,12 @@ fn prepared(url: &str) -> LoadedPrepared {
             max_inflight_cap: 64,
             sink: Arc::new(NoSink),
             dispatcher: dispatcher.adopter(),
-            conns: ConnTable::Host(conns),
+            conns: ConnTable::Host(
+                busbar_contract::conn::admissions::AdmissionAuthority::issue(
+                    &busbar_contract::caps::KernelSeal::acquire_for_kernel(),
+                    conns,
+                ),
+            ),
         },
     )
     .unwrap();
@@ -116,7 +121,7 @@ fn native_preopen_channels_snapshot_target_and_phase_proofs() {
             let l::Response::Inspected(inspected) = inspected.as_ref() else {
                 panic!("inspection response");
             };
-            assert_eq!(inspected.state, l::InspectionState::Legacy);
+            assert!(matches!(inspected.state, l::InspectionState::Legacy(_)));
             let source = inspected.source.clone().unwrap();
             assert_eq!(source.format.unwrap().physical, 3);
             assert_eq!(prepared.phase(), l::Phase::Prepared);
@@ -524,7 +529,7 @@ fn native_preopen_restart_retains_target_receipt_and_source_cursor() {
             let l::Response::Inspected(inspected) = inspected.as_ref() else {
                 panic!("reinspect");
             };
-            assert_eq!(inspected.state, l::InspectionState::InProgress);
+            assert!(matches!(inspected.state, l::InspectionState::InProgress(_)));
             assert_eq!(inspected.source.as_ref(), Some(&source));
             let resumed = second.bootstrap(begin).await.unwrap();
             let l::Response::Begun(resumed) = resumed.as_ref() else {
