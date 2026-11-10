@@ -45,3 +45,6 @@ base64 = { workspace = true }
 busbar-core-connector = { workspace = true }
 busbar-transport-tcp = { workspace = true }
 busbar-contract = { workspace = true, features = ["test-seal"] }
+
+[package.metadata.busbar.test-artifacts]
+cdylib = ["BUSBAR_TEST_MYSQL_CDYLIB"]
