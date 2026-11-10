@@ -45,6 +45,7 @@ fn open(url: &str) -> Arc<LoadedPersistence> {
                 busbar_contract::conn::admissions::AdmissionAuthority::issue(
                     &busbar_contract::caps::KernelSeal::acquire_for_kernel(),
                     conns.clone(),
+                    Default::default(),
                 ),
             ),
         },
