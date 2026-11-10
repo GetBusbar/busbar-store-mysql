@@ -895,7 +895,7 @@ impl Conn {
             return;
         }
         let reset = match (self.st.server_version, self.st.mariadb_version) {
-            (Some(v), _) if v > (5, 7, 3) => true,
+            (Some(v), _) if v >= (5, 7, 3) => true,
             (_, Some(v)) if v >= (10, 2, 7) => true,
             _ => false,
         };
@@ -992,10 +992,6 @@ impl Conn {
         }
         self.broken = true;
         Err(DriverError::UnexpectedPacket.into())
-    }
-
-    async fn drop_packet(&mut self) -> Result<()> {
-        self.read_packet().await.map(drop)
     }
 
     async fn write_packet(&mut self, payload: &[u8]) -> Result<()> {
@@ -1683,7 +1679,12 @@ impl Conn {
     /// `COM_PING`.
     pub async fn ping(&mut self) -> Result<()> {
         self.write_command(Command::COM_PING, &[]).await?;
-        self.drop_packet().await
+        let packet = self.read_packet().await?;
+        if packet.first() != Some(&0x00) {
+            self.broken = true;
+            return Err(DriverError::UnexpectedPacket.into());
+        }
+        Ok(())
     }
 
     /// `START TRANSACTION` (the driver's `TxOpts::default()`: the server's isolation level).

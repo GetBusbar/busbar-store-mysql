@@ -466,10 +466,11 @@ pub(super) async fn commit(
         return Err(Failure::Refused);
     }
     schema::posture(conn).await?;
+    // No write has happened yet; a failed START TRANSACTION is not indeterminate.
     let mut tx = conn
         .start_transaction()
         .await
-        .map_err(|_| Failure::Unknown)?;
+        .map_err(|_| Failure::Unavailable)?;
     let result = apply(&mut tx, info, request).await;
     match result {
         Ok(answer) => {

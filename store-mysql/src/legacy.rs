@@ -655,6 +655,9 @@ async fn catalogue_inner(conn: &mut Conn, guarded: bool) -> Result<Vec<Table>, E
     if !result.iter().any(|t| t.name == "store_meta") {
         return Err(Error::UnknownFormat);
     }
+    // Sort by Rust byte order; SQL ORDER BY TABLE_NAME uses the server's
+    // collation which may differ (e.g. utf8_general_ci sorts '_' after letters).
+    result.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(result)
 }
 

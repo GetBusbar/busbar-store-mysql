@@ -408,8 +408,11 @@ async fn guard_exists(
     }
 }
 async fn check_guards(conn: &mut Conn, row: &Upgrade, complete: bool) -> Result<(), Error> {
-    let names: Vec<String> = conn.query("SELECT TRIGGER_NAME FROM information_schema.triggers WHERE TRIGGER_SCHEMA=DATABASE() ORDER BY TRIGGER_NAME LIMIT 97")
+    let mut names: Vec<String> = conn.query("SELECT TRIGGER_NAME FROM information_schema.triggers WHERE TRIGGER_SCHEMA=DATABASE() ORDER BY TRIGGER_NAME LIMIT 97")
         .await.map_err(native)?;
+    // Re-sort by Rust byte order; SQL ORDER BY uses the server's collation
+    // which may differ (e.g. utf8_general_ci sorts '_' after letters).
+    names.sort();
     if names.len() > row.catalogue.len() * EVENTS.len() {
         return Err(Error::SourceChanged);
     }
