@@ -48,8 +48,10 @@ fn the_url_is_not_declared_secret() {
 #[test]
 fn a_reference_at_the_url_resolves_as_the_kernel_resolves_it() {
     let (p, _d) = linked();
-    let mut v: serde_json::Value =
-        serde_json::from_slice(br#"{"url":{"env":"REFCAP_URL_FOR_TEST"}}"#).unwrap();
+    let mut v: serde_json::Value = serde_json::from_slice(
+        br#"{"url":{"module":"env","settings":{"key":"REFCAP_URL_FOR_TEST"}}}"#,
+    )
+    .unwrap();
     resolve_declared_fields(
         &mut v,
         p.secret_refs(),
