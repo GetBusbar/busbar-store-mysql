@@ -79,10 +79,16 @@ struct SecretBytes(BytesMut);
 
 fn reserve_wiping(buf: &mut BytesMut, additional: usize) {
     if additional > buf.capacity() - buf.len() {
-        let capacity = buf
+        let required = buf
             .len()
             .checked_add(additional)
             .expect("buffer capacity overflow");
+        // Geometric growth avoids quadratic copying on repeated small appends.
+        let capacity = buf
+            .capacity()
+            .checked_mul(2)
+            .unwrap_or(required)
+            .max(required);
         let mut replacement = BytesMut::with_capacity(capacity);
         replacement.extend_from_slice(buf);
         buf.as_mut().zeroize();
@@ -1008,6 +1014,9 @@ impl Conn {
     }
 
     async fn write_command_raw<T: MySerialize>(&mut self, cmd: &T) -> Result<()> {
+        if self.broken {
+            return Err(Error::IoError("connection is broken".into()));
+        }
         let mut buf = Zeroizing::new(Vec::new());
         cmd.serialize(&mut buf);
         self.st.codec.reset_seq_id();
@@ -1015,6 +1024,9 @@ impl Conn {
     }
 
     async fn write_command(&mut self, cmd: Command, data: &[u8]) -> Result<()> {
+        if self.broken {
+            return Err(Error::IoError("connection is broken".into()));
+        }
         let mut buf = Zeroizing::new(Vec::with_capacity(1 + data.len()));
         buf.push(cmd as u8);
         buf.extend_from_slice(data);
@@ -1121,9 +1133,7 @@ impl Conn {
                 let v: Option<Row> = self.query_first("SELECT @@max_allowed_packet").await?;
                 v.and_then(|mut r| r.take_opt::<usize, _>(0))
                     .and_then(std::result::Result::ok)
-                    .ok_or_else(|| {
-                        Error::IoError("server max_allowed_packet is missing or invalid".into())
-                    })?
+                    .ok_or(Error::DriverError(DriverError::SetupError))?
                     .min(MAX_DEFAULT_PACKET)
             }
         };
@@ -1462,6 +1472,9 @@ impl Conn {
 
     /// Roll back a transaction dropped uncommitted.
     async fn settle(&mut self) -> Result<()> {
+        if self.broken {
+            return Err(Error::IoError("connection is broken".into()));
+        }
         if self.rollback_pending {
             if let Err(error) = self.query_raw("ROLLBACK").await {
                 self.broken = true;
@@ -1514,9 +1527,11 @@ impl Conn {
         });
         if self.st.opts.stmt_cache_size > 0 {
             if self.st.stmts.len() >= self.st.opts.stmt_cache_size {
-                let old: Vec<u32> = self.st.stmts.drain().map(|(_, s)| s.id).collect();
-                for id in old {
-                    self.write_command_raw(&ComStmtClose::new(id)).await?;
+                if let Some(key) = self.st.stmts.keys().next().cloned() {
+                    if let Some(evicted) = self.st.stmts.remove(&key) {
+                        self.write_command_raw(&ComStmtClose::new(evicted.id))
+                            .await?;
+                    }
                 }
             }
             self.st.stmts.insert(query.to_vec(), s.clone());
@@ -1561,7 +1576,9 @@ impl Conn {
                 let cap = self.st.opts.stmt_cache_size;
                 if cap > 0 {
                     if self.st.parsed.len() >= cap {
-                        self.st.parsed.clear();
+                        if let Some(key) = self.st.parsed.keys().next().cloned() {
+                            self.st.parsed.remove(&key);
+                        }
                     }
                     self.st.parsed.insert(query.to_owned(), parsed.clone());
                 }

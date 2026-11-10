@@ -37,7 +37,7 @@ pub(super) async fn owned(conn: &mut Conn) -> Result<bool> {
     let rows: Vec<(Vec<u8>, Vec<u8>)> = conn
         .query("SELECT k,v FROM store_meta LIMIT 2")
         .await
-        .map_err(|_| Failure::Refused)?;
+        .map_err(|_| Failure::Unavailable)?;
     if !matches!(rows.as_slice(),[(key,value)]if key==b"schema_version"&&value==TAG) {
         return Ok(false);
     }

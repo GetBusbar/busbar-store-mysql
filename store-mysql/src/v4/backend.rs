@@ -164,7 +164,7 @@ impl Backend for MysqlV4 {
         let request = request.clone();
         let info = self.info();
         let horizons = self.horizons.clone();
-        on_conn!(self, op, Failure::Unknown, |conn| {
+        on_conn!(self, op, Failure::Unavailable, |conn| {
             let result = native::commit(&mut conn, info, &request).await;
             // Receipt maintenance is a separate transaction and must never replace Applied.
             if matches!(

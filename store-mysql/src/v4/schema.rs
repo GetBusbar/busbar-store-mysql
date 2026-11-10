@@ -5,6 +5,17 @@ use busbar_contract::abi::sdk::store::v4::metadata;
 use busbar_contract::persistence::{BackendInfo, DatasetId, Durability, Failure};
 use mysql_common::params;
 
+fn lifecycle_failure(error: crate::legacy::lifecycle::Error) -> Failure {
+    match error {
+        crate::legacy::lifecycle::Error::Busy | crate::legacy::lifecycle::Error::Pending => {
+            Failure::Unavailable
+        }
+        crate::legacy::lifecycle::Error::MissingCapability
+        | crate::legacy::lifecycle::Error::SourceChanged => Failure::Refused,
+        crate::legacy::lifecycle::Error::Corrupt => Failure::Corrupt,
+    }
+}
+
 const META: &str = "busbar_v4_meta";
 const RECORDS: &str = "busbar_v4_records";
 const RECEIPTS: &str = "busbar_v4_receipts";
@@ -29,14 +40,14 @@ pub(super) async fn open(conn: &mut Conn) -> Result<BackendInfo, Failure> {
     posture(conn).await?;
     if let Some(upgrade) = crate::legacy::lifecycle::load(conn)
         .await
-        .map_err(|_| Failure::Refused)?
+        .map_err(lifecycle_failure)?
     {
         if upgrade.completed.is_none() {
             return Err(Failure::Refused);
         }
         crate::legacy::lifecycle::verify_snapshot(conn, &upgrade)
             .await
-            .map_err(|_| Failure::Refused)?;
+            .map_err(lifecycle_failure)?;
         let info = inspect_current(conn).await?;
         if info.dataset.0 != upgrade.target {
             return Err(Failure::Refused);

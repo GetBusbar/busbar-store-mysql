@@ -155,6 +155,16 @@ fn source_error(error: legacy::Error) -> l::Error {
         legacy::Error::Cursor => l::Error::SourceChanged,
     }
 }
+fn failure_error(error: p::Failure) -> l::Error {
+    match error {
+        p::Failure::Refused => l::Error::Refused,
+        p::Failure::Overloaded => l::Error::Bounds,
+        p::Failure::Unknown => l::Error::Unknown,
+        p::Failure::Unavailable => l::Error::Unavailable,
+        p::Failure::Corrupt => l::Error::Corrupt,
+        p::Failure::StaleScan => l::Error::SourceChanged,
+    }
+}
 fn layouts(tables: &[legacy::Table]) -> Result<Vec<p::archive::Table>, l::Error> {
     tables
         .iter()
@@ -232,13 +242,11 @@ impl State {
                 if count != Some(0)
                     && !super::empty_origin::empty(control)
                         .await
-                        .map_err(|_| l::Error::SourceChanged)?
+                        .map_err(failure_error)?
                 {
                     return Err(l::Error::SourceChanged);
                 }
-                super::schema::open(control)
-                    .await
-                    .map_err(|_| l::Error::Unavailable)?
+                super::schema::open(control).await.map_err(failure_error)?
             }
             l::OpenBinding::Current {
                 source,
@@ -264,7 +272,7 @@ impl State {
                 }
                 super::schema::inspect_current(control)
                     .await
-                    .map_err(|_| l::Error::Corrupt)?
+                    .map_err(failure_error)?
             }
             l::OpenBinding::Recovery(expected) => {
                 native::acquire(control).await.map_err(native_error)?;
@@ -279,7 +287,7 @@ impl State {
                 self.upgrade = Some(row);
                 super::schema::inspect_current(control)
                     .await
-                    .map_err(|_| l::Error::Corrupt)?
+                    .map_err(failure_error)?
             }
         };
         if let Some(prior) = info.get() {
@@ -356,11 +364,11 @@ impl State {
                 }
                 let origin = super::empty_origin::owned(control)
                     .await
-                    .map_err(|_| l::Error::Corrupt)?;
+                    .map_err(failure_error)?;
                 if origin
                     && super::empty_origin::empty(control)
                         .await
-                        .map_err(|_| l::Error::Corrupt)?
+                        .map_err(failure_error)?
                 {
                     self.inspected_empty = true;
                     return Ok(l::Response::Inspected(l::Inspection {
@@ -862,11 +870,11 @@ async fn current_source(
     if native::load(conn).await.map_err(native_error)?.is_none() {
         super::empty_origin::check(conn)
             .await
-            .map_err(|_| l::Error::SourceChanged)?;
+            .map_err(failure_error)?;
     }
     let info = super::schema::inspect_current(conn)
         .await
-        .map_err(|_| l::Error::Corrupt)?;
+        .map_err(failure_error)?;
     let identity = legacy::native_identity(conn).await.map_err(source_error)?;
     let names:Vec<String>=conn.query("SELECT TABLE_NAME FROM information_schema.tables WHERE TABLE_SCHEMA=DATABASE() ORDER BY TABLE_NAME LIMIT 34").await.map_err(|_|l::Error::Unavailable)?;
     if names.len() > 32 {
