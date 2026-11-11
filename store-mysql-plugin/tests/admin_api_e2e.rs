@@ -168,6 +168,11 @@ fn install_over_admin_api_then_mint_a_key_and_verify_mysql_directly() {
     let Some(server_url) = mysql_url() else {
         return;
     };
+    // Locked host builds can outlast the fixture relay's idle-stream limit.
+    // Finish them before opening either the scratch owner or schema observer.
+    let so_path = plugin_path();
+    let (busbar_bin, pack_bin) = build_real_binaries();
+
     let database = common::ScratchDb::new(&server_url);
     let url = database.url.clone();
     let mut schema_observer =
@@ -181,10 +186,6 @@ fn install_over_admin_api_then_mint_a_key_and_verify_mysql_directly() {
         initial_tables, 0,
         "only boot #2 may initialize this private schema"
     );
-    let so_path = plugin_path();
-
-    let (busbar_bin, pack_bin) = build_real_binaries();
-
     let work = std::env::temp_dir().join(format!(
         "busbar-mysql-adminapi-{}-{}",
         std::process::id(),
