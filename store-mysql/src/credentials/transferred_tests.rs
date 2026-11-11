@@ -135,16 +135,7 @@ mod rsa_tests {
     use super::cred;
     use super::{sha1, WireInspect};
 
-    /// A throwaway 1024-bit test key (generated for this test only): its public half as MySQL sends
-    const PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----
-MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDAeGNPEkihhFwx9XuiW0X6VMAp
-LuC5WLdzvwnpZSXfmzok6brqc60v9bnBiCl/T9O5m7/eLcck0usOyQ9eV5p9T4Y4
-ijJ7b5W7pYuuReJdv9h481JKwwV75KY1M6dRf7kpYFOCA4Zo8xgdso69qxPTVUXL
-9WgH5N2PTtsNkF6eCwIDAQAB
------END PUBLIC KEY-----
-";
-    const D: &str = "24bd56479bb7dd8d04844cd5c2d2257379860cd673f32d6a27600a2651367f8e83f4d3e0e82c189d150cd652858955d59692927778c990cfea2ab25a8aa9b2457089a877e2b4980c55432d3cef569412f502c3d1a9a8e5b0f9e5ebb2a527b31b6a24a2ce35e7a7b47d74b1c07adacfcbd28b83dc30fa6614f9bf6bf19da166f1";
-    const N: &str = "c078634f1248a1845c31f57ba25b45fa54c0292ee0b958b773bf09e96525df9b3a24e9baea73ad2ff5b9c188297f4fd3b99bbfde2dc724d2eb0ec90f5e579a7d4f86388a327b6f95bba58bae45e25dbfd878f3524ac3057be4a63533a7517fb929605382038668f3181db28ebdab13d35545cbf56807e4dd8f4edb0d905e9e0b";
+    use crate::test_rsa_key::{D, N, PEM, PIN, WEAK_PEM};
 
     fn mgf1(seed: &[u8], len: usize) -> Vec<u8> {
         let mut out = Vec::new();
@@ -171,25 +162,25 @@ ijJ7b5W7pYuuReJdv9h481JKwwV75KY1M6dRf7kpYFOCA4Zo8xgdso69qxPTVUXL
             )
             .unwrap();
 
-        assert_eq!(&der[..4], &[0x30, 0x81, 0x9f, 0x30]);
-        assert_eq!(&der[18..22], &[0x03, 0x81, 0x8d, 0x00]);
+        assert_eq!(&der[..4], &[0x30, 0x82, 0x01, 0x22]);
+        assert_eq!(&der[19..24], &[0x03, 0x82, 0x01, 0x0f, 0x00]);
         let pem = |body: &[u8]| {
             format!(
                 "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n",
                 b64.encode(body)
             )
         };
-        let direct = pem(&der[22..]);
+        let direct = pem(&der[24..]);
         assert!(cred("pw")
             .mysql_rsa_packet(1, b"nonce", direct.as_bytes())
             .is_ok());
         assert!(cred("pw").mysql_rsa_packet(1, b"nonce", PEM).is_ok());
 
-        let mut nested = vec![0x30, 0x81, 0xb5];
-        nested.extend_from_slice(&der[3..18]);
-        nested.extend_from_slice(&[0x03, 0x81, 0xa3, 0x00]);
+        let mut nested = vec![0x30, 0x82, 0x01, 0x3a];
+        nested.extend_from_slice(&der[4..19]);
+        nested.extend_from_slice(&[0x03, 0x82, 0x01, 0x27, 0x00]);
         nested.extend_from_slice(&der);
-        assert_eq!(nested.len(), 184);
+        assert_eq!(nested.len(), 318);
         assert!(cred("pw")
             .mysql_rsa_packet(1, b"nonce", pem(&nested).as_bytes())
             .is_err());
@@ -207,7 +198,7 @@ ijJ7b5W7pYuuReJdv9h481JKwwV75KY1M6dRf7kpYFOCA4Zo8xgdso69qxPTVUXL
     fn decrypt(ct: &[u8]) -> Vec<u8> {
         let n = BigUint::parse_bytes(N.as_bytes(), 16).expect("n");
         let d = BigUint::parse_bytes(D.as_bytes(), 16).expect("d");
-        let k = 128;
+        let k = 256;
         let mut em = BigUint::from_bytes_be(ct).modpow(&d, &n).to_bytes_be();
         while em.len() < k {
             em.insert(0, 0);
@@ -241,7 +232,7 @@ ijJ7b5W7pYuuReJdv9h481JKwwV75KY1M6dRf7kpYFOCA4Zo8xgdso69qxPTVUXL
             .mysql_rsa_packet(4, &nonce, PEM)
             .expect("encrypts");
         let w = seal.wire();
-        assert_eq!(&w[..4], &[128, 0, 0, 4]);
+        assert_eq!(&w[..4], &[0, 1, 0, 4]);
         let plain = decrypt(&w[4..]);
         let want: Vec<u8> = b"s3cr3t-pw\0"
             .iter()
@@ -259,10 +250,8 @@ ijJ7b5W7pYuuReJdv9h481JKwwV75KY1M6dRf7kpYFOCA4Zo8xgdso69qxPTVUXL
     fn a_bad_key_or_an_empty_nonce_is_refused() {
         assert!(cred("pw").mysql_rsa_packet(4, b"n", b"not a key").is_err());
         assert!(cred("pw").mysql_rsa_packet(4, b"", PEM).is_err());
+        assert!(cred("pw").mysql_rsa_packet(4, b"n", WEAK_PEM).is_err());
     }
-
-    /// `openssl pkey -pubin -outform der | sha256` of [`PEM`].
-    const PIN: &str = "6ddde6e6398722551e6dd73f2c62f247560990a999022d11fc55198facec8e98";
 
     /// RULING S5: RSA full authentication goes to a server key the operator pinned, or over a unix
     #[test]

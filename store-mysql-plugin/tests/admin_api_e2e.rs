@@ -8,7 +8,7 @@
 mod common;
 
 use base64::Engine as _;
-use common::{build_real_binaries, plugin_path, E2E_RELEASE_PRIVKEY};
+use common::{build_real_binaries, plugin_path, E2E_RELEASE_PRIVKEY, E2E_RELEASE_PUBKEY};
 use mysql::prelude::*;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -258,6 +258,7 @@ fn install_over_admin_api_then_mint_a_key_and_verify_mysql_directly() {
 
     let mut guard1 = spawn_busbar(
         Command::new(&busbar_bin)
+            .env("BUSBAR_TEST_HARNESS_FIRST_PARTY_KEY", E2E_RELEASE_PUBKEY)
             .env("BUSBAR_CONFIG", &config1)
             .env("BUSBAR_PROVIDERS", &providers)
             .env("BUSBAR_ADMIN_TOKEN", admin_token)
@@ -347,6 +348,7 @@ fn install_over_admin_api_then_mint_a_key_and_verify_mysql_directly() {
 
     let mut guard2 = spawn_busbar(
         Command::new(&busbar_bin)
+            .env("BUSBAR_TEST_HARNESS_FIRST_PARTY_KEY", E2E_RELEASE_PUBKEY)
             .env("BUSBAR_CONFIG", &config2)
             .env("BUSBAR_PROVIDERS", &providers)
             .env("BUSBAR_ADMIN_TOKEN", admin_token)

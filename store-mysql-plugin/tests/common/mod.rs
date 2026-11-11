@@ -172,70 +172,30 @@ pub fn busbar_root() -> PathBuf {
     root
 }
 
-/// Build (once, cached by cargo) and return the path to the real `busbar` binary and the real `busbar-plugin-pack` binary, both from the sibling busbar checkout — never a fixture, never a stub, the exact binaries a real release ships.
+/// Build the admitted host and packer through the same owner preparation hook used before
+/// nextest. Cargo rechecks the locked sources even when native CI already prepared the binaries.
 pub fn build_real_binaries() -> (PathBuf, PathBuf) {
-    if let Some(binary) = std::env::var_os("BUSBAR_TEST_HOST_BINARY") {
-        assert!(
-            std::env::var_os("CI").is_none(),
-            "CI must build the admitted host source"
-        );
-        let binary = PathBuf::from(binary);
-        let pack = PathBuf::from(
-            std::env::var_os("BUSBAR_TEST_PACK_BINARY")
-                .expect("local host override also requires BUSBAR_TEST_PACK_BINARY"),
-        );
-        assert!(
-            binary.is_absolute() && binary.is_file() && pack.is_absolute() && pack.is_file(),
-            "local binary overrides must be existing absolute paths"
-        );
-        return (binary, pack);
-    }
     let root = busbar_root();
-
-    for args in [
-        &[
-            "build",
-            "--release",
-            "--locked",
-            "--manifest-path",
-            "dist/default/Cargo.toml",
-            "--bin",
-            "busbar",
-        ][..],
-        &[
-            "build",
-            "--release",
-            "--locked",
-            "-p",
-            "busbar-plugin-loader",
-            "--features",
-            "pack",
-            "--bin",
-            "busbar-plugin-pack",
-        ][..],
-    ] {
-        let status = Command::new("cargo")
-            .env(
-                "RUSTUP_TOOLCHAIN",
-                std::env::var_os("RUSTUP_TOOLCHAIN").unwrap_or_else(|| "1.98".into()),
-            )
-            .args(args)
-            .arg("--target-dir")
-            .arg(root.join("target"))
-            .env("BUSBAR_RELEASE_PUBKEY", E2E_RELEASE_PUBKEY)
-            .env_remove("CARGO_TARGET_DIR")
-            .current_dir(&root)
-            .status()
-            .expect("run cargo build for busbar + busbar-plugin-pack");
-        assert!(
-            status.success(),
-            "building the real busbar + busbar-plugin-pack binaries must succeed ({args:?})"
-        );
-    }
-    let target = root.join("target");
+    let target = PathBuf::from(
+        std::env::var_os("CARGO_TARGET_DIR")
+            .expect("CARGO_TARGET_DIR must name the assigned native target directory"),
+    );
+    let prepare = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("testing/native/prepare.sh");
+    let status = Command::new("bash")
+        .arg(prepare)
+        .env("BUSBAR_CHECKOUT", root)
+        .status()
+        .expect("run the owner preparation hook for the actual busbar binaries");
+    assert!(
+        status.success(),
+        "building the actual busbar binaries failed"
+    );
     (
-        target.join("release/busbar"),
-        target.join("release/busbar-plugin-pack"),
+        target.join("debug/busbar"),
+        target.join("debug/busbar-plugin-pack"),
     )
 }
 

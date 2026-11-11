@@ -27,3 +27,7 @@ mod settings_schema_tests;
 mod test_mysql_io;
 
 mod source_interpretation;
+
+#[cfg(test)]
+#[path = "../tests-support/rsa_key.rs"]
+mod test_rsa_key;

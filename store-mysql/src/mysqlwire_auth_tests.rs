@@ -584,14 +584,7 @@ fn cancelling_or_failing_a_partial_sealed_handshake_closes_it_and_reopen_starts_
     SCRIPT.with(|state| assert_eq!(state.borrow().opens, 1));
 }
 
-const PUBLIC_KEY: &[u8] = b"-----BEGIN PUBLIC KEY-----
-MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDAeGNPEkihhFwx9XuiW0X6VMAp
-LuC5WLdzvwnpZSXfmzok6brqc60v9bnBiCl/T9O5m7/eLcck0usOyQ9eV5p9T4Y4
-ijJ7b5W7pYuuReJdv9h481JKwwV75KY1M6dRf7kpYFOCA4Zo8xgdso69qxPTVUXL
-9WgH5N2PTtsNkF6eCwIDAQAB
------END PUBLIC KEY-----
-";
-const KEY_PIN: &str = "6ddde6e6398722551e6dd73f2c62f247560990a999022d11fc55198facec8e98";
+use crate::test_rsa_key::{PEM as PUBLIC_KEY, PIN as KEY_PIN};
 
 #[test]
 fn full_sha2_auth_checks_the_operator_pin_and_sequence_before_sending_ciphertext() {
@@ -625,7 +618,7 @@ fn full_sha2_auth_checks_the_operator_pin_and_sequence_before_sending_ciphertext
         );
         if encrypted {
             assert_eq!(out[2].0, 5);
-            assert_eq!(out[2].1.len(), 128);
+            assert_eq!(out[2].1.len(), 256);
             assert!(!out[2]
                 .1
                 .windows(PASSWORD.len())
@@ -658,7 +651,7 @@ fn full_sha2_auth_checks_the_operator_pin_and_sequence_before_sending_ciphertext
     assert_eq!(out[2].0, 5);
     assert_eq!(
         out[2].1.len(),
-        128,
+        256,
         "an observed secured connection accepts the SDK seal without a pin"
     );
     assert_eq!(out[3].0, 0);
