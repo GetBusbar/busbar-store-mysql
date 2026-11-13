@@ -137,23 +137,28 @@ fn run<T>(f: impl std::future::Future<Output = T>) -> T {
 /// The URL password never reaches an error: a server (or a proxy in front of it) whose ERR packet echoes it is scrubbed, and so is `Debug`.
 #[test]
 fn a_server_error_echoing_the_password_is_scrubbed() {
+    let password = test_secret("canary");
+    let echoed = format!("Access denied for u using password {password}");
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let server = std::thread::spawn(move || {
         let mut s = listener.accept().unwrap().0;
         let mut err = vec![0xff, 0x15, 0x04];
-        err.extend_from_slice(b"Access denied for u using password CANARY-my-p4ss");
+        err.extend_from_slice(echoed.as_bytes());
         s.write_all(&packet(0, &err)).unwrap();
     });
     let stream = TcpStream::connect(addr).unwrap();
-    let opts = Opts::from_url("mysql://u:CANARY%2Dmy%2Dp4ss@127.0.0.1:1/d").unwrap();
+    // Percent-encode the dashes so the scrub must match the decoded spelling the server echoes.
+    let url = format!("mysql://u:{}@127.0.0.1:1/d", password.replace('-', "%2D"));
+    let opts = Opts::from_url(&url).unwrap();
     let mut conn = Conn::new(Io::Tcp(stream), Arc::new(opts));
     let Err(err) = run(conn.handshake(&[])) else {
         panic!("the ERR packet refuses");
     };
     server.join().unwrap();
     for out in [err.to_string(), format!("{err:?}"), format!("{conn:?}")] {
-        assert!(!out.contains("CANARY"), "password leaked: {out}");
+        assert!(!out.contains(&password), "password leaked: {out}");
+        assert!(!out.contains("test-only-canary"), "password leaked: {out}");
     }
     assert!(err.to_string().contains("Access denied"), "{err}");
 }
@@ -399,25 +404,34 @@ fn what_the_driver_refused_is_refused_in_its_words() {
     );
 }
 
+/// A clearly synthetic password generated at test time, so no credential-shaped literal sits in
+/// source: `test-only-<tag>-<random hex>`.
+fn test_secret(tag: &str) -> String {
+    use std::hash::BuildHasher;
+    let hex = std::collections::hash_map::RandomState::new().hash_one(tag);
+    format!("test-only-{tag}-{hex:016x}")
+}
+
 /// An unencoded `?` in a password splits the URL there: the tail becomes a "parameter".
 #[test]
 fn a_url_refusal_never_carries_the_password() {
+    let query_password = test_secret("query");
     for url in [
-        "mysql://u:12?abc@h/db",
-        "mysql://u:12?port=zz@h/db",
-        "mysql://u:12?tlsCANARY@h/db",
-        "mysql://u:12?sslCANARY@h/db",
-        "mysql://u:p%40ss%3Fword@h/db?bogus=1",
-        "mysql://u@h/db?password=hunter2&bogus=1",
-        "mysql://u@h/db?password=hunter2&port=zz",
+        "mysql://u:12?abc@h/db".to_owned(),
+        "mysql://u:12?port=zz@h/db".to_owned(),
+        "mysql://u:12?tlsCANARY@h/db".to_owned(),
+        "mysql://u:12?sslCANARY@h/db".to_owned(),
+        "mysql://u:p%40ss%3Fword@h/db?bogus=1".to_owned(),
+        format!("mysql://u@h/db?password={query_password}&bogus=1"),
+        format!("mysql://u@h/db?password={query_password}&port=zz"),
     ] {
-        let e = Opts::from_url(url).unwrap_err().to_string();
+        let e = Opts::from_url(&url).unwrap_err().to_string();
         for secret in [
             "12?abc",
             "abc@h",
             "p@ss?word",
             "p%40ss%3Fword",
-            "hunter2",
+            query_password.as_str(),
             "zz@h",
             "tlsCANARY",
             "sslCANARY",
@@ -631,7 +645,8 @@ fn guarded_rows_parse_text_and_binary_and_reject_partial_secret_rows() {
 #[test]
 #[allow(unsafe_code)]
 fn production_codec_consumed_plaintext_is_erased() {
-    let secret = b"guarded-production-credential";
+    let secret = test_secret("codec");
+    let secret = secret.as_bytes();
     let mut source = bytes::BytesMut::new();
     source.extend_from_slice(&[u8::try_from(secret.len()).unwrap(), 0, 0, 0]);
     source.extend_from_slice(secret);
