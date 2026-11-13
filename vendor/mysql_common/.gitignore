@@ -3,6 +3,3 @@ target/
 Cargo.lock
 .idea
 .vscode
-
-# Preserve the official release lock for source custody and bounded standalone tooling.
-!/Cargo.lock
